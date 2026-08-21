@@ -31,6 +31,7 @@ class MaskConfig:
     residue_scale: tuple[float, float] = (0.15, 0.4)
     min_context_ratio: float = 0.2
     future_context_ratio: float = 0.5
+    future_gap_frames: int = 0
 
 
 @dataclass
@@ -40,6 +41,8 @@ class ModelConfig:
     temporal_depth: int = 0
     predictor_depth: int = 4
     state_predictor_depth: int = 2
+    state_prediction_lags: tuple[int, ...] = ()
+    lag_predictor_depth: int = 2
     num_heads: int = 4
     num_rbf: int = 16
     dropout: float = 0.1
@@ -62,6 +65,7 @@ class OptimizationConfig:
     precision: str = "float32"
     residue_jepa_weight: float = 1.0
     state_jepa_weight: float = 0.0
+    lagged_state_jepa_weight: float = 0.0
     variance_reg: float = 0.0
     state_variance_reg: float = 0.0
     msm_state_weight: float = 0.0

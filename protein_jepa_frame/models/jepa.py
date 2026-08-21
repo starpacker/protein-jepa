@@ -8,7 +8,7 @@ import torch.nn.functional as F
 
 from protein_jepa_frame.config import ModelConfig
 from protein_jepa_frame.models.encoder import ProteinGeometryEncoder
-from protein_jepa_frame.models.predictor import SpatiotemporalPredictor, StatePredictor
+from protein_jepa_frame.models.predictor import LaggedStatePredictor, SpatiotemporalPredictor, StatePredictor
 from protein_jepa_frame.models.temporal import TemporalStateEncoder
 
 
@@ -61,6 +61,16 @@ class ProteinJEPA(nn.Module):
                 max_frames=config.max_frames,
             )
             if self.temporal_encoder is not None
+            else None
+        )
+        self.lagged_state_predictor = (
+            LaggedStatePredictor(
+                latent_dim=config.latent_dim,
+                lags=config.state_prediction_lags,
+                depth=config.lag_predictor_depth,
+                dropout=config.dropout,
+            )
+            if self.temporal_encoder is not None and len(config.state_prediction_lags) > 0
             else None
         )
         self.state_classifiers: nn.ModuleDict = nn.ModuleDict()
@@ -135,6 +145,9 @@ class ProteinJEPA(nn.Module):
                     "target_frame_states": target_frame_states,
                 }
             )
+            if self.lagged_state_predictor is not None:
+                outputs["lagged_state_predictions"] = self.lagged_state_predictor(context_states["frame_states"])
+                outputs["frame_valid_mask"] = residue_mask.any(dim=2)
         return outputs
 
     def encode_states(self, residue_latents: torch.Tensor, residue_mask: torch.Tensor) -> dict[str, torch.Tensor]:
@@ -257,6 +270,27 @@ def state_jepa_loss(outputs: dict, loss_type: str = "smooth_l1") -> torch.Tensor
     pred = outputs["state_predictions"][outputs["state_target_mask"]]
     target = outputs["state_targets"][outputs["state_target_mask"]]
     return _latent_loss(pred, target, loss_type)
+
+
+def lagged_state_jepa_loss(outputs: dict, loss_type: str = "smooth_l1") -> torch.Tensor:
+    if "lagged_state_predictions" not in outputs:
+        return outputs["predictions"].new_tensor(0.0)
+    context_mask = outputs["context_frame_mask"]
+    target_mask = outputs["state_target_mask"]
+    valid_mask = outputs.get("frame_valid_mask", context_mask | target_mask)
+    target_states = outputs["state_targets"]
+    losses = []
+    for lag, pred_all in outputs["lagged_state_predictions"].items():
+        if lag >= pred_all.shape[1]:
+            continue
+        pred = pred_all[:, :-lag]
+        target = target_states[:, lag:]
+        pair_mask = context_mask[:, :-lag] & target_mask[:, lag:] & valid_mask[:, lag:]
+        if pair_mask.any():
+            losses.append(_latent_loss(pred[pair_mask], target[pair_mask], loss_type))
+    if not losses:
+        return outputs["predictions"].new_tensor(0.0)
+    return torch.stack(losses).mean()
 
 
 def jepa_loss(outputs: dict, loss_type: str = "smooth_l1") -> torch.Tensor:

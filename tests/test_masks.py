@@ -37,3 +37,17 @@ def test_future_masks_use_past_context_and_future_targets():
         context_times = context[b].any(dim=1).nonzero(as_tuple=False).flatten()
         target_times = target[b].any(dim=1).nonzero(as_tuple=False).flatten()
         assert context_times.max() < target_times.min()
+
+
+def test_future_masks_can_leave_gap_between_context_and_target():
+    residue_mask = torch.ones(2, 12, 8, dtype=torch.bool)
+    masker = SpatiotemporalBlockMasker(
+        MaskConfig(mode="future", temporal_scale=(0.25, 0.25), future_context_ratio=0.5, future_gap_frames=2)
+    )
+
+    context, target = masker(residue_mask)
+
+    for b in range(residue_mask.shape[0]):
+        context_times = context[b].any(dim=1).nonzero(as_tuple=False).flatten()
+        target_times = target[b].any(dim=1).nonzero(as_tuple=False).flatten()
+        assert int(target_times.min() - context_times.max()) >= 3

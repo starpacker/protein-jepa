@@ -107,3 +107,31 @@ class StatePredictor(nn.Module):
         token_valid = context_frame_mask | target_frame_mask
         x = self.blocks(x, src_key_padding_mask=~token_valid)
         return self.proj(self.norm(x))
+
+
+class LaggedStatePredictor(nn.Module):
+    """Predict EMA target states at several future temporal offsets."""
+
+    def __init__(
+        self,
+        latent_dim: int = 128,
+        lags: tuple[int, ...] = (1, 2, 4, 8),
+        depth: int = 2,
+        dropout: float = 0.1,
+    ):
+        super().__init__()
+        if any(lag <= 0 for lag in lags):
+            raise ValueError("state prediction lags must be positive")
+        self.lags = tuple(int(lag) for lag in lags)
+        hidden = latent_dim * 2
+        layers: list[nn.Module] = [nn.LayerNorm(latent_dim), nn.Linear(latent_dim, hidden), nn.GELU(), nn.Dropout(dropout)]
+        for _ in range(max(0, depth - 1)):
+            layers.extend([nn.Linear(hidden, hidden), nn.GELU(), nn.Dropout(dropout)])
+        self.trunk = nn.Sequential(*layers)
+        self.heads = nn.ModuleDict({str(lag): nn.Linear(hidden, latent_dim) for lag in self.lags})
+
+    def forward(self, frame_states: torch.Tensor) -> dict[int, torch.Tensor]:
+        if frame_states.dim() != 3:
+            raise ValueError("frame_states must be [B,T,D]")
+        h = self.trunk(frame_states)
+        return {lag: self.heads[str(lag)](h) for lag in self.lags}

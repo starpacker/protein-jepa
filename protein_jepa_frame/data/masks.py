@@ -67,16 +67,21 @@ class SpatiotemporalBlockMasker:
         target = torch.zeros_like(residue_mask, dtype=torch.bool)
         min_context_frames = max(1, int(round(T * float(self.config.future_context_ratio))))
         min_context_frames = min(min_context_frames, max(1, T - 1))
+        requested_gap = max(0, int(self.config.future_gap_frames))
         for b in range(B):
             if residue_mask[b].sum() == 0:
                 continue
-            t_span = self._sample_span(T - min_context_frames, self.config.temporal_scale, device)
-            max_start = max(min_context_frames, T - t_span)
-            if max_start <= min_context_frames:
-                t0 = min_context_frames
+            gap = min(requested_gap, max(0, T - min_context_frames - 1))
+            target_start_min = min_context_frames + gap
+            available_target = max(1, T - target_start_min)
+            t_span = self._sample_span(available_target, self.config.temporal_scale, device)
+            max_start = max(target_start_min, T - t_span)
+            if max_start <= target_start_min:
+                t0 = target_start_min
             else:
-                t0 = int(torch.randint(min_context_frames, max_start + 1, (), device=device))
-            context[b, :t0] = residue_mask[b, :t0]
+                t0 = int(torch.randint(target_start_min, max_start + 1, (), device=device))
+            context_end = max(1, t0 - gap)
+            context[b, :context_end] = residue_mask[b, :context_end]
             target[b, t0 : t0 + t_span] = residue_mask[b, t0 : t0 + t_span]
             if target[b].sum() == 0 and t0 < T:
                 target[b, t0:] = residue_mask[b, t0:]
