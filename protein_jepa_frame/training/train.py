@@ -16,6 +16,7 @@ from protein_jepa_frame.data.dataset import build_dataset
 from protein_jepa_frame.data.masks import SpatiotemporalBlockMasker
 from protein_jepa_frame.models.jepa import (
     lagged_state_jepa_loss,
+    linear_dynamics_jepa_loss,
     ProteinJEPA,
     residue_jepa_loss,
     state_jepa_loss,
@@ -99,6 +100,14 @@ def train(config: TrainConfig) -> Path:
         param_groups.append(
             {"params": model.lagged_state_predictor.parameters(), "lr": config.optimization.lr, "base_lr_scale": 1.0}
         )
+    if model.linear_dynamics_predictor is not None:
+        param_groups.append(
+            {
+                "params": model.linear_dynamics_predictor.parameters(),
+                "lr": config.optimization.lr,
+                "base_lr_scale": 1.0,
+            }
+        )
     optimizer = torch.optim.AdamW(param_groups, weight_decay=config.optimization.weight_decay)
     # Pre-register MSM classifiers for all proteins in the training set
     # so they are part of the optimizer from the start
@@ -141,12 +150,14 @@ def train(config: TrainConfig) -> Path:
             residue_loss = residue_jepa_loss(outputs)
             state_loss = state_jepa_loss(outputs)
             lagged_state_loss = lagged_state_jepa_loss(outputs)
+            linear_dynamics_loss = linear_dynamics_jepa_loss(outputs)
             reg = variance_regularizer(outputs)
             state_reg = state_variance_regularizer(outputs)
             total_loss = (
                 config.optimization.residue_jepa_weight * residue_loss
                 + config.optimization.state_jepa_weight * state_loss
                 + config.optimization.lagged_state_jepa_weight * lagged_state_loss
+                + config.optimization.linear_dynamics_weight * linear_dynamics_loss
                 + config.optimization.variance_reg * reg
                 + config.optimization.state_variance_reg * state_reg
             )
@@ -184,6 +195,7 @@ def train(config: TrainConfig) -> Path:
                     "residue_jepa_loss": float(residue_loss.detach().cpu()),
                     "state_jepa_loss": float(state_loss.detach().cpu()),
                     "lagged_state_jepa_loss": float(lagged_state_loss.detach().cpu()),
+                    "linear_dynamics_jepa_loss": float(linear_dynamics_loss.detach().cpu()),
                     "variance_reg": float(reg.detach().cpu()),
                     "state_variance_reg": float(state_reg.detach().cpu()),
                     "msm_state_loss": float(msm_state_loss.detach().cpu()),

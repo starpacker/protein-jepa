@@ -43,6 +43,7 @@ class ModelConfig:
     state_predictor_depth: int = 2
     state_prediction_lags: tuple[int, ...] = ()
     lag_predictor_depth: int = 2
+    linear_dynamics_lags: tuple[int, ...] = ()
     num_heads: int = 4
     num_rbf: int = 16
     dropout: float = 0.1
@@ -66,6 +67,7 @@ class OptimizationConfig:
     residue_jepa_weight: float = 1.0
     state_jepa_weight: float = 0.0
     lagged_state_jepa_weight: float = 0.0
+    linear_dynamics_weight: float = 0.0
     variance_reg: float = 0.0
     state_variance_reg: float = 0.0
     msm_state_weight: float = 0.0

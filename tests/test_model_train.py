@@ -5,7 +5,13 @@ from protein_jepa_frame.config import DataConfig, MaskConfig, ModelConfig, Optim
 from protein_jepa_frame.data.collate import collate_clips
 from protein_jepa_frame.data.dataset import SyntheticProteinDynamicsDataset
 from protein_jepa_frame.data.masks import SpatiotemporalBlockMasker
-from protein_jepa_frame.models.jepa import ProteinJEPA, jepa_loss, lagged_state_jepa_loss, state_jepa_loss
+from protein_jepa_frame.models.jepa import (
+    ProteinJEPA,
+    jepa_loss,
+    lagged_state_jepa_loss,
+    linear_dynamics_jepa_loss,
+    state_jepa_loss,
+)
 from protein_jepa_frame.training.train import train
 
 
@@ -100,6 +106,36 @@ def test_lagged_state_jepa_trains_lag_predictor():
     assert torch.isfinite(loss)
     assert loss.item() > 0
     assert any(g is not None and torch.isfinite(g).all() and g.abs().sum() > 0 for g in lag_grads)
+
+
+def test_linear_dynamics_jepa_trains_linear_transition_heads():
+    data_cfg = DataConfig(batch_size=2, num_frames=8, synthetic_size=4, synthetic_residues=16)
+    dataset = SyntheticProteinDynamicsDataset(data_cfg)
+    batch = next(iter(DataLoader(dataset, batch_size=2, collate_fn=collate_clips)))
+    context, target = SpatiotemporalBlockMasker(
+        MaskConfig(mode="future", temporal_scale=(0.5, 0.5), future_context_ratio=0.5)
+    )(batch["residue_mask"])
+    model = ProteinJEPA(
+        ModelConfig(
+            latent_dim=32,
+            encoder_depth=1,
+            temporal_depth=1,
+            predictor_depth=1,
+            state_predictor_depth=1,
+            linear_dynamics_lags=(1, 2, 4),
+            num_heads=4,
+            num_rbf=8,
+        )
+    )
+
+    outputs = model(batch, context, target)
+    loss = linear_dynamics_jepa_loss(outputs)
+    loss.backward()
+    dyn_grads = [p.grad for p in model.linear_dynamics_predictor.parameters() if p.requires_grad]
+
+    assert torch.isfinite(loss)
+    assert loss.item() > 0
+    assert any(g is not None and torch.isfinite(g).all() and g.abs().sum() > 0 for g in dyn_grads)
 
 
 def test_smoke_training_writes_checkpoint(tmp_path):

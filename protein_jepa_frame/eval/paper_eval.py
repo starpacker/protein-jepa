@@ -1036,6 +1036,11 @@ def run_pipeline(args: argparse.Namespace) -> dict:
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     linear_window_stride = args.linear_window_stride or args.window_stride
+    if args.require_contextual:
+        if args.sequence_frames <= 1:
+            raise ValueError("--require-contextual needs --sequence-frames > 1")
+        if args.readout == "mean":
+            raise ValueError("--require-contextual needs --readout state or --readout clip_state")
     common = {
         "checkpoint": args.checkpoint,
         "manifest": args.manifest,
@@ -1103,6 +1108,8 @@ def run_pipeline(args: argparse.Namespace) -> dict:
             "checkpoints": args.checkpoint,
             "output_dir": str(output_dir),
             "readout": args.readout,
+            "contextual_protocol": args.sequence_frames > 1 and args.readout in {"state", "clip_state"},
+            "require_contextual": args.require_contextual,
             "sequence_frames": args.sequence_frames,
             "window_stride": args.window_stride,
             "window_overlap_ratio": _window_overlap_ratio(args.sequence_frames, args.window_stride),
@@ -1194,6 +1201,11 @@ def build_parser() -> argparse.ArgumentParser:
     pipe.add_argument("--linear-window-stride", type=int, default=None)
     pipe.add_argument("--sequence-frames", type=int, default=1)
     pipe.add_argument("--readout", choices=["mean", "state", "clip_state"], default="mean")
+    pipe.add_argument(
+        "--require-contextual",
+        action="store_true",
+        help="Fail if the pipeline is not using a multi-frame temporal-state readout.",
+    )
     pipe.add_argument("--max-trajs", type=int, default=None)
     pipe.add_argument("--max-clips", type=int, default=None)
     pipe.add_argument("--lags", type=int, nargs="+", default=None)

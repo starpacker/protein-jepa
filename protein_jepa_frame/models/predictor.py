@@ -135,3 +135,22 @@ class LaggedStatePredictor(nn.Module):
             raise ValueError("frame_states must be [B,T,D]")
         h = self.trunk(frame_states)
         return {lag: self.heads[str(lag)](h) for lag in self.lags}
+
+
+class LaggedLinearDynamicsPredictor(nn.Module):
+    """Linear multi-lag state transition heads for Koopman-friendly latents."""
+
+    def __init__(self, latent_dim: int = 128, lags: tuple[int, ...] = (1, 2, 4, 8)):
+        super().__init__()
+        if any(lag <= 0 for lag in lags):
+            raise ValueError("linear dynamics lags must be positive")
+        self.lags = tuple(int(lag) for lag in lags)
+        self.heads = nn.ModuleDict({str(lag): nn.Linear(latent_dim, latent_dim) for lag in self.lags})
+        for head in self.heads.values():
+            nn.init.eye_(head.weight)
+            nn.init.zeros_(head.bias)
+
+    def forward(self, frame_states: torch.Tensor) -> dict[int, torch.Tensor]:
+        if frame_states.dim() != 3:
+            raise ValueError("frame_states must be [B,T,D]")
+        return {lag: self.heads[str(lag)](frame_states) for lag in self.lags}

@@ -1,0 +1,61 @@
+seed: 2
+device: auto
+output_dir: artifacts/mdcath_state_jepa_longhorizon_msm
+log_every: 20
+save_every: 1
+
+data:
+  manifest_path: /liuyutian/protein_jepa/artifacts/manifests/mdcath.train.jsonl
+  msm_labels_path: /liuyutian/protein_jepa/artifacts/msm_state_labels/mdcath.deeptime_lcc_pcca_v2.full_lag1.train.filtered_labels.json
+  batch_size: 4
+  num_workers: 0
+  num_frames: 32
+  frame_stride: 2
+  window_stride: 8
+  max_residues: 384
+
+mask:
+  mode: future
+  num_blocks: 2
+  temporal_scale: [0.25, 0.5]
+  residue_scale: [0.15, 0.4]
+  min_context_ratio: 0.2
+  future_context_ratio: 0.5
+  future_gap_frames: 4
+
+model:
+  latent_dim: 128
+  encoder_depth: 4
+  temporal_depth: 2
+  predictor_depth: 4
+  state_predictor_depth: 2
+  state_prediction_lags: [1, 2, 4, 8, 12, 16]
+  lag_predictor_depth: 2
+  linear_dynamics_lags: [1, 2, 4, 8, 12, 16]
+  num_heads: 4
+  num_rbf: 16
+  dropout: 0.1
+  max_frames: 64
+  max_residues: 4096
+  feature_norm: true
+
+optimization:
+  epochs: 10
+  steps_per_epoch:
+  lr: 0.0003
+  encoder_lr_scale: 0.2
+  weight_decay: 0.05
+  warmup_steps: 1000
+  ema_start: 0.996
+  ema_end: 1.0
+  grad_clip: 1.0
+  precision: float32
+  residue_jepa_weight: 0.10
+  state_jepa_weight: 1.0
+  lagged_state_jepa_weight: 0.5
+  linear_dynamics_weight: 0.35
+  variance_reg: 0.0
+  state_variance_reg: 0.01
+  msm_state_weight: 0.02
+  vamp2_weight: 0.0
+  vamp2_lag: 1
