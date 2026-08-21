@@ -220,6 +220,7 @@ def train(config: TrainConfig) -> Path:
                     "config": config_to_dict(config),
                 }
                 torch.save(ckpt, output_dir / "checkpoint_latest.pt")
+                torch.save(ckpt, output_dir / f"checkpoint_step{global_step}.pt")
                 print(f"Checkpoint saved at step {global_step}", flush=True)
             global_step += 1
 
