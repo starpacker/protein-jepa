@@ -929,6 +929,8 @@ def run_msm_probe(args: argparse.Namespace) -> dict:
             "max_clips": args.max_clips,
             "lambdas": args.lambdas,
             "readout": args.readout,
+            "num_frames": getattr(args, "num_frames", None),
+            "window_stride": getattr(args, "window_stride", None),
         },
         "models": {},
     }
@@ -938,8 +940,8 @@ def run_msm_probe(args: argparse.Namespace) -> dict:
         data_cfg = _data_cfg_from_artifact(
             spec.artifact_dir,
             batch_size=args.batch_size,
-            num_frames=cfg["data"]["num_frames"],
-            window_stride=cfg["data"]["window_stride"],
+            num_frames=getattr(args, "num_frames", None) or cfg["data"]["num_frames"],
+            window_stride=getattr(args, "window_stride", None) or cfg["data"]["window_stride"],
         )
         rows = extract_clip_latents_with_labels(model, records, data_cfg, labels, device, args.max_clips, readout=args.readout)
         results["models"][spec.name] = {
@@ -1072,6 +1074,8 @@ def run_pipeline(args: argparse.Namespace) -> dict:
                 output=output_dir / "msm_probe.json",
                 max_clips=preset["max_clips"],
                 lambdas=args.lambdas,
+                num_frames=args.sequence_frames,
+                window_stride=args.window_stride,
             )
         )
     if not args.skip_linear:
@@ -1147,6 +1151,8 @@ def build_parser() -> argparse.ArgumentParser:
     probe.add_argument("--device", default="auto")
     probe.add_argument("--batch-size", type=int, default=8)
     probe.add_argument("--max-clips", type=int, default=8000)
+    probe.add_argument("--num-frames", type=int, default=None)
+    probe.add_argument("--window-stride", type=int, default=None)
     probe.add_argument("--readout", choices=["mean", "state", "clip_state"], default="mean")
     probe.add_argument("--lambdas", type=float, nargs="+", default=[0.01, 0.1, 1.0, 10.0, 100.0])
     probe.set_defaults(func=run_msm_probe)
