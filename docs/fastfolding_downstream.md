@@ -70,6 +70,26 @@ PYTHONPATH=/liuyutian/protein_jepa_frame \
   --max-scan-entries-per-protein 200
 ```
 
+## Run Contextual Latent Probes
+
+```bash
+PYTHONPATH=/liuyutian/protein_jepa_frame \
+/liuyutian/protein_jepa/.venv/bin/python -m protein_jepa_frame.cli fastfolding-probe \
+  --checkpoint state_jepa_20k=artifacts/mdcath_state_jepa_future/checkpoint_step20000.pt \
+  --labels artifacts/fastfolding/labels.cln025.smoke.jsonl \
+  --output artifacts/fastfolding/probe.cln025.smoke.json \
+  --num-frames 8 \
+  --readout state \
+  --max-samples 200
+```
+
+The probe builds temporal PDB windows ending at labeled frames, extracts model
+latents from the chosen readout, and evaluates:
+
+- progress regression for `q_native`, `rmsd_to_ref`, and `radius_of_gyration`.
+- direction classification for folding vs unfolding frames.
+- committor proxy classification when future basin labels are available.
+
 These labels are intended for downstream probes:
 
 - folding progress regression: RMSD, Q, and Rg.

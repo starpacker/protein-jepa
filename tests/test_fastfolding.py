@@ -4,6 +4,7 @@ import json
 
 from protein_jepa_frame.fastfolding.manifest import build_manifest, load_fastfolding_manifest
 from protein_jepa_frame.fastfolding.tasks import derive_labels
+from protein_jepa_frame.fastfolding.downstream import build_window_samples, load_label_rows, read_backbone_frame
 
 
 def _pdb_text(offset: float = 0.0) -> str:
@@ -47,3 +48,27 @@ def test_fastfolding_manifest_and_labels_are_derived_outside_source(tmp_path: Pa
     assert {"rmsd_to_ref", "q_native", "direction", "committor_proxy"} <= set(rows[0])
     assert not (source / "manifest.jsonl").exists()
     assert not (source / "labels.jsonl").exists()
+
+
+def test_fastfolding_downstream_builds_context_windows(tmp_path: Path):
+    source = tmp_path / "FastFolding"
+    protein = source / "Toy-0-protein"
+    complex_dir = protein / "complex"
+    complex_dir.mkdir(parents=True)
+    (protein / "Toy-0-protein_ref.pdb").write_text(_pdb_text(0.0))
+    for frame, offset in [(0, 0.0), (10, 0.2), (20, 4.0), (30, 0.1), (40, 0.0)]:
+        (complex_dir / f"Toy-0-protein_frame{frame}.pdb").write_text(_pdb_text(offset))
+    manifest_path = tmp_path / "artifacts" / "manifest.jsonl"
+    labels_path = tmp_path / "artifacts" / "labels.jsonl"
+    build_manifest(source, manifest_path)
+    derive_labels(manifest_path, labels_path, stride=1, max_frames_per_protein=10, committor_horizon=2)
+
+    rows = load_label_rows(labels_path)
+    windows = build_window_samples(rows, num_frames=3)
+    frame = read_backbone_frame(windows[0]["window"][0]["pdb_path"])
+
+    assert len(rows) == 5
+    assert len(windows) == 3
+    assert [row["frame"] for row in windows[0]["window"]] == [0, 10, 20]
+    assert frame.coords.shape == (6, 4, 3)
+    assert frame.atom_mask.all()

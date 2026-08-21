@@ -34,6 +34,19 @@ def main(argv: list[str] | None = None) -> None:
     ff_labels.add_argument("--direction-threshold", type=float, default=0.02)
     ff_labels.add_argument("--committor-horizon", type=int, default=20)
 
+    ff_probe = sub.add_parser("fastfolding-probe")
+    ff_probe.add_argument("--checkpoint", required=True)
+    ff_probe.add_argument("--labels", default="artifacts/fastfolding/frame_labels.jsonl")
+    ff_probe.add_argument("--output", default="artifacts/fastfolding/downstream_probe.json")
+    ff_probe.add_argument("--num-frames", type=int, default=8)
+    ff_probe.add_argument("--readout", choices=["mean", "state", "clip_state"], default="state")
+    ff_probe.add_argument("--batch-size", type=int, default=4)
+    ff_probe.add_argument("--max-samples", type=int, default=200)
+    ff_probe.add_argument("--max-residues", type=int, default=384)
+    ff_probe.add_argument("--split-gap", type=int, default=1)
+    ff_probe.add_argument("--device", default="auto")
+    ff_probe.add_argument("--lambdas", type=float, nargs="+", default=[0.01, 0.1, 1.0, 10.0, 100.0])
+
     args = parser.parse_args(argv)
     if args.cmd == "train":
         from protein_jepa_frame.config import load_config
@@ -75,6 +88,24 @@ def main(argv: list[str] | None = None) -> None:
             committor_horizon=args.committor_horizon,
         )
         print(summary, flush=True)
+        return
+    if args.cmd == "fastfolding-probe":
+        from protein_jepa_frame.fastfolding.downstream import run_probes
+
+        out = run_probes(
+            args.checkpoint,
+            args.labels,
+            args.output,
+            num_frames=args.num_frames,
+            readout=args.readout,
+            batch_size=args.batch_size,
+            max_samples=args.max_samples,
+            max_residues=args.max_residues,
+            split_gap=args.split_gap,
+            device=args.device,
+            lambdas=args.lambdas,
+        )
+        print({"output": args.output, "n_windows": out["n_windows"], "tasks": out["tasks"]}, flush=True)
         return
     raise AssertionError(args.cmd)
 
