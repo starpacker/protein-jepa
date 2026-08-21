@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "protein-jepa-frame"
+version = "0.1.0"
+description = "A clean V-JEPA-style latent prediction framework for protein dynamics."
+requires-python = ">=3.10"
+dependencies = [
+  "numpy",
+  "torch",
+  "pyyaml",
+  "h5py",
+]
+
+[project.scripts]
+protein-jepa-frame = "protein_jepa_frame.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["protein_jepa_frame*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
