@@ -9,6 +9,7 @@ import torch.nn.functional as F
 from protein_jepa_frame.config import ModelConfig
 from protein_jepa_frame.models.encoder import ProteinGeometryEncoder
 from protein_jepa_frame.models.predictor import (
+    KineticReadoutHead,
     LaggedLinearDynamicsPredictor,
     LaggedPhyschemPredictor,
     LaggedStatePredictor,
@@ -50,6 +51,8 @@ class ProteinJEPA(nn.Module):
                 num_heads=config.num_heads,
                 dropout=config.dropout,
                 max_frames=config.max_frames,
+                frame_pooling=config.frame_pooling,
+                frame_pool_queries=config.frame_pool_queries,
             )
             if config.temporal_depth > 0
             else None
@@ -92,6 +95,16 @@ class ProteinJEPA(nn.Module):
                 dropout=config.dropout,
             )
             if self.temporal_encoder is not None and len(config.physchem_prediction_lags) > 0
+            else None
+        )
+        self.kinetic_readout = (
+            KineticReadoutHead(
+                latent_dim=config.latent_dim,
+                output_dim=config.kinetic_readout_dim,
+                depth=config.kinetic_readout_depth,
+                dropout=config.dropout,
+            )
+            if self.temporal_encoder is not None and config.kinetic_readout_dim > 0
             else None
         )
         self.state_classifiers: nn.ModuleDict = nn.ModuleDict()
@@ -186,6 +199,9 @@ class ProteinJEPA(nn.Module):
                 outputs["physchem_targets"] = targets
                 outputs["physchem_target_masks"] = target_masks
                 outputs["frame_valid_mask"] = residue_mask.any(dim=2)
+            if self.kinetic_readout is not None:
+                outputs["kinetic_readout"] = self.kinetic_readout(context_states["frame_states"])
+                outputs["kinetic_readout_mask"] = context_frame_mask
         return outputs
 
     def encode_states(self, residue_latents: torch.Tensor, residue_mask: torch.Tensor) -> dict[str, torch.Tensor]:
@@ -197,6 +213,12 @@ class ProteinJEPA(nn.Module):
         clip_valid = residue_mask.any(dim=2).unsqueeze(-1).float()
         clip_state = (frame_states * clip_valid).sum(dim=1) / clip_valid.sum(dim=1).clamp(min=1)
         return {"frame_states": frame_states, "clip_state": clip_state}
+
+    def encode_kinetic_readout(self, residue_latents: torch.Tensor, residue_mask: torch.Tensor) -> torch.Tensor:
+        if self.kinetic_readout is None:
+            raise ValueError("kinetic_readout is not configured for this model")
+        states = self.encode_states(residue_latents, residue_mask)["frame_states"]
+        return self.kinetic_readout(states)
 
     def compute_msm_state_loss(self, outputs: dict, batch: dict) -> torch.Tensor:
         """Per-protein MSM state classification loss on context latents."""
@@ -418,6 +440,43 @@ def linear_dynamics_jepa_loss(outputs: dict, loss_type: str = "smooth_l1") -> to
     if not losses:
         return outputs["predictions"].new_tensor(0.0)
     return torch.stack(losses).mean()
+
+
+def kinetic_vampnet_loss(outputs: dict, lag: int = 1, eps: float = 1.0e-3) -> torch.Tensor:
+    if "kinetic_readout" not in outputs:
+        return outputs["predictions"].new_tensor(0.0)
+    if lag <= 0:
+        raise ValueError("lag must be positive")
+    z = outputs["kinetic_readout"]
+    mask = outputs.get("kinetic_readout_mask")
+    if mask is None:
+        mask = torch.ones(z.shape[:2], dtype=torch.bool, device=z.device)
+    if lag >= z.shape[1]:
+        return z.new_tensor(0.0)
+    pair_mask = mask[:, :-lag] & mask[:, lag:]
+    if not pair_mask.any():
+        return z.new_tensor(0.0)
+    x0 = z[:, :-lag][pair_mask]
+    x1 = z[:, lag:][pair_mask]
+    n, dim = x0.shape
+    if n < dim + 2 or dim < 2:
+        return z.new_tensor(0.0)
+
+    x0 = x0 - x0.mean(dim=0, keepdim=True)
+    x1 = x1 - x1.mean(dim=0, keepdim=True)
+    eye = torch.eye(dim, device=z.device, dtype=z.dtype)
+    with torch.no_grad():
+        c00 = x0.T @ x0 / (n - 1) + eps * eye
+        c11 = x1.T @ x1 / (n - 1) + eps * eye
+        s0, u0 = torch.linalg.eigh(c00)
+        s1, u1 = torch.linalg.eigh(c11)
+        inv0 = torch.where(s0 > eps, s0.rsqrt(), torch.zeros_like(s0))
+        inv1 = torch.where(s1 > eps, s1.rsqrt(), torch.zeros_like(s1))
+        c00_inv_half = (u0 * inv0[None, :]) @ u0.T
+        c11_inv_half = (u1 * inv1[None, :]) @ u1.T
+    koopman = (x0 @ c00_inv_half).T @ (x1 @ c11_inv_half) / (n - 1)
+    vamp2 = koopman.pow(2).sum()
+    return 1.0 - vamp2 / float(dim)
 
 
 def jepa_loss(outputs: dict, loss_type: str = "smooth_l1") -> torch.Tensor:

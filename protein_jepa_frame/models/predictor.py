@@ -184,3 +184,23 @@ class LaggedPhyschemPredictor(nn.Module):
             raise ValueError("frame_states must be [B,T,D]")
         h = self.trunk(frame_states)
         return {lag: self.heads[str(lag)](h) for lag in self.lags}
+
+
+class KineticReadoutHead(nn.Module):
+    """Low-dimensional VAMPNet-style readout from temporal frame states."""
+
+    def __init__(self, latent_dim: int = 128, output_dim: int = 8, depth: int = 2, dropout: float = 0.1):
+        super().__init__()
+        if output_dim <= 0:
+            raise ValueError("output_dim must be positive")
+        hidden = latent_dim * 2
+        layers: list[nn.Module] = [nn.LayerNorm(latent_dim), nn.Linear(latent_dim, hidden), nn.GELU(), nn.Dropout(dropout)]
+        for _ in range(max(0, depth - 1)):
+            layers.extend([nn.Linear(hidden, hidden), nn.GELU(), nn.Dropout(dropout)])
+        layers.extend([nn.Linear(hidden, output_dim), nn.LayerNorm(output_dim)])
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, frame_states: torch.Tensor) -> torch.Tensor:
+        if frame_states.dim() != 3:
+            raise ValueError("frame_states must be [B,T,D]")
+        return self.net(frame_states)

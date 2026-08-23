@@ -45,6 +45,7 @@ MODEL_READOUT_CHOICES = [
     "state_clip_delta",
     "state_mean",
     "state_clip_delta_mean",
+    "kinetic",
 ]
 
 
@@ -143,6 +144,9 @@ def _model_readout(model: ProteinJEPA, latents: torch.Tensor, residue_mask: torc
     frame_states = states["frame_states"]
     last_state = frame_states[:, -1]
     clip_state = states["clip_state"]
+    if readout == "kinetic":
+        kinetic = model.encode_kinetic_readout(latents, residue_mask)
+        return kinetic[:, -1]
     if frame_states.shape[1] > 1:
         delta_state = frame_states[:, -1] - frame_states[:, -2]
     else:
@@ -856,6 +860,10 @@ def extract_clip_latents_with_labels(
             clip_latents = (states * clip_valid).sum(dim=1) / clip_valid.sum(dim=1).clamp(min=1)
         elif readout == "clip_state":
             clip_latents = model.encode_states(latents, batch["residue_mask"])["clip_state"]
+        elif readout == "kinetic":
+            kinetic = model.encode_kinetic_readout(latents, batch["residue_mask"])
+            clip_valid = batch["residue_mask"].any(dim=2).unsqueeze(-1).float()
+            clip_latents = (kinetic * clip_valid).sum(dim=1) / clip_valid.sum(dim=1).clamp(min=1)
         elif readout in {"state_clip", "state_delta", "state_clip_delta", "state_mean", "state_clip_delta_mean"}:
             clip_latents = _model_readout(model, latents, batch["residue_mask"], readout)
         else:

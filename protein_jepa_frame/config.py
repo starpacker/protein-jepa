@@ -42,11 +42,15 @@ class ModelConfig:
     predictor_depth: int = 4
     state_predictor_depth: int = 2
     state_prediction_lags: tuple[int, ...] = ()
+    frame_pooling: str = "mean"
+    frame_pool_queries: int = 4
     lag_predictor_depth: int = 2
     linear_dynamics_lags: tuple[int, ...] = ()
     physchem_prediction_lags: tuple[int, ...] = ()
     physchem_predictor_depth: int = 2
     physchem_contact_cutoff: float = 8.0
+    kinetic_readout_dim: int = 0
+    kinetic_readout_depth: int = 2
     num_heads: int = 4
     num_rbf: int = 16
     dropout: float = 0.1
@@ -80,6 +84,8 @@ class OptimizationConfig:
     msm_state_weight: float = 0.0
     vamp2_weight: float = 0.0
     vamp2_lag: int = 1
+    kinetic_vamp_weight: float = 0.0
+    kinetic_vamp_lag: int = 1
 
 
 @dataclass
