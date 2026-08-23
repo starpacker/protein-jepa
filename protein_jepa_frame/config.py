@@ -52,6 +52,7 @@ class ModelConfig:
     physchem_contact_cutoff: float = 8.0
     kinetic_readout_dim: int = 0
     kinetic_readout_depth: int = 2
+    kinetic_readout_stopgrad: bool = False
     num_heads: int = 4
     num_rbf: int = 16
     dropout: float = 0.1

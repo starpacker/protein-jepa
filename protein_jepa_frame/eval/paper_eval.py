@@ -46,6 +46,9 @@ MODEL_READOUT_CHOICES = [
     "state_mean",
     "state_clip_delta_mean",
     "kinetic",
+    "state_kinetic",
+    "state_clip_kinetic",
+    "state_clip_delta_kinetic",
 ]
 
 
@@ -165,6 +168,13 @@ def _model_readout(model: ProteinJEPA, latents: torch.Tensor, residue_mask: torc
         return torch.cat([last_state, last_mean], dim=-1)
     if readout == "state_clip_delta_mean":
         return torch.cat([last_state, clip_state, delta_state, last_mean], dim=-1)
+    if readout in {"state_kinetic", "state_clip_kinetic", "state_clip_delta_kinetic"}:
+        kinetic = model.encode_kinetic_readout(latents, residue_mask)[:, -1]
+        if readout == "state_kinetic":
+            return torch.cat([last_state, kinetic], dim=-1)
+        if readout == "state_clip_kinetic":
+            return torch.cat([last_state, clip_state, kinetic], dim=-1)
+        return torch.cat([last_state, clip_state, delta_state, kinetic], dim=-1)
     raise ValueError(f"unknown model readout {readout}")
 
 
@@ -864,7 +874,30 @@ def extract_clip_latents_with_labels(
             kinetic = model.encode_kinetic_readout(latents, batch["residue_mask"])
             clip_valid = batch["residue_mask"].any(dim=2).unsqueeze(-1).float()
             clip_latents = (kinetic * clip_valid).sum(dim=1) / clip_valid.sum(dim=1).clamp(min=1)
-        elif readout in {"state_clip", "state_delta", "state_clip_delta", "state_mean", "state_clip_delta_mean"}:
+        elif readout in {"state_kinetic", "state_clip_kinetic", "state_clip_delta_kinetic"}:
+            states_block = model.encode_states(latents, batch["residue_mask"])
+            states = states_block["frame_states"]
+            kinetic = model.encode_kinetic_readout(latents, batch["residue_mask"])
+            clip_valid = batch["residue_mask"].any(dim=2).unsqueeze(-1).float()
+            state_avg = (states * clip_valid).sum(dim=1) / clip_valid.sum(dim=1).clamp(min=1)
+            kinetic_avg = (kinetic * clip_valid).sum(dim=1) / clip_valid.sum(dim=1).clamp(min=1)
+            if states.shape[1] > 1:
+                delta_state = states[:, -1] - states[:, -2]
+            else:
+                delta_state = torch.zeros_like(state_avg)
+            if readout == "state_kinetic":
+                clip_latents = torch.cat([state_avg, kinetic_avg], dim=-1)
+            elif readout == "state_clip_kinetic":
+                clip_latents = torch.cat([state_avg, states_block["clip_state"], kinetic_avg], dim=-1)
+            else:
+                clip_latents = torch.cat([state_avg, states_block["clip_state"], delta_state, kinetic_avg], dim=-1)
+        elif readout in {
+            "state_clip",
+            "state_delta",
+            "state_clip_delta",
+            "state_mean",
+            "state_clip_delta_mean",
+        }:
             clip_latents = _model_readout(model, latents, batch["residue_mask"], readout)
         else:
             raise ValueError(f"unknown model readout {readout}")

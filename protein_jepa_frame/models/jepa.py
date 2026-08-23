@@ -201,7 +201,12 @@ class ProteinJEPA(nn.Module):
                 outputs["physchem_target_masks"] = target_masks
                 outputs["frame_valid_mask"] = residue_mask.any(dim=2)
             if self.kinetic_readout is not None:
-                outputs["kinetic_readout"] = self.kinetic_readout(context_states["frame_states"])
+                kinetic_states = (
+                    context_states["frame_states"].detach()
+                    if self.config.kinetic_readout_stopgrad
+                    else context_states["frame_states"]
+                )
+                outputs["kinetic_readout"] = self.kinetic_readout(kinetic_states)
                 outputs["kinetic_readout_mask"] = context_frame_mask
         return outputs
 

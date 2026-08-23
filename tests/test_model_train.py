@@ -370,6 +370,39 @@ def test_kinetic_vampnet_loss_trains_readout_head():
     assert any(g is not None and torch.isfinite(g).all() and g.abs().sum() > 0 for g in readout_grads)
 
 
+def test_stopgrad_kinetic_vampnet_loss_only_trains_readout_head():
+    data_cfg = DataConfig(batch_size=3, num_frames=8, synthetic_size=6, synthetic_residues=16)
+    dataset = SyntheticProteinDynamicsDataset(data_cfg)
+    batch = next(iter(DataLoader(dataset, batch_size=3, collate_fn=collate_clips)))
+    context, target = SpatiotemporalBlockMasker(
+        MaskConfig(mode="future", temporal_scale=(0.25, 0.25), future_context_ratio=0.75)
+    )(batch["residue_mask"])
+    model = ProteinJEPA(
+        ModelConfig(
+            latent_dim=32,
+            encoder_depth=1,
+            temporal_depth=1,
+            predictor_depth=1,
+            state_predictor_depth=1,
+            kinetic_readout_dim=4,
+            kinetic_readout_depth=1,
+            kinetic_readout_stopgrad=True,
+            num_heads=4,
+            num_rbf=8,
+        )
+    )
+
+    outputs = model(batch, context, target)
+    loss = kinetic_vampnet_loss(outputs, lag=1)
+    loss.backward()
+    readout_grads = [p.grad for p in model.kinetic_readout.parameters() if p.requires_grad]
+    temporal_grads = [p.grad for p in model.temporal_encoder.parameters() if p.requires_grad]
+
+    assert torch.isfinite(loss)
+    assert any(g is not None and torch.isfinite(g).all() and g.abs().sum() > 0 for g in readout_grads)
+    assert all(g is None or g.abs().sum() == 0 for g in temporal_grads)
+
+
 def test_smoke_training_writes_checkpoint(tmp_path):
     cfg = TrainConfig(
         output_dir=str(tmp_path),
