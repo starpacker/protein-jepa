@@ -87,6 +87,51 @@ def test_kinetic_query_pooling_trains_pooler():
     assert any(g is not None and torch.isfinite(g).all() and g.abs().sum() > 0 for g in pooler_grads)
 
 
+def test_residual_kinetic_pooling_starts_as_mean_pooling():
+    data_cfg = DataConfig(batch_size=2, num_frames=6, synthetic_size=4, synthetic_residues=16)
+    dataset = SyntheticProteinDynamicsDataset(data_cfg)
+    batch = next(iter(DataLoader(dataset, batch_size=2, collate_fn=collate_clips)))
+    mean_model = ProteinJEPA(
+        ModelConfig(
+            latent_dim=32, encoder_depth=1, temporal_depth=1, predictor_depth=1, num_heads=4, num_rbf=8, dropout=0.0
+        )
+    )
+    residual_model = ProteinJEPA(
+        ModelConfig(
+            latent_dim=32,
+            encoder_depth=1,
+            temporal_depth=1,
+            predictor_depth=1,
+            frame_pooling="mean_kinetic_query",
+            frame_pool_queries=2,
+            num_heads=4,
+            num_rbf=8,
+            dropout=0.0,
+        )
+    )
+    mean_model.eval()
+    residual_model.eval()
+    residual_model.context_encoder.load_state_dict(mean_model.context_encoder.state_dict())
+    residual_model.temporal_encoder.time_embed.load_state_dict(mean_model.temporal_encoder.time_embed.state_dict())
+    residual_model.temporal_encoder.blocks.load_state_dict(mean_model.temporal_encoder.blocks.state_dict())
+    residual_model.temporal_encoder.norm.load_state_dict(mean_model.temporal_encoder.norm.state_dict())
+    residual_model.temporal_encoder.cls_token.data.copy_(mean_model.temporal_encoder.cls_token.data)
+
+    latents = mean_model.context_encoder(
+        coords=batch["coords"],
+        residue_mask=batch["residue_mask"],
+        aatype=batch["aatype"],
+        residue_index=batch["residue_index"],
+        chain_id=batch["chain_id"],
+        token_mask=None,
+    )
+    mean_states = mean_model.encode_states(latents, batch["residue_mask"])["frame_states"]
+    residual_states = residual_model.encode_states(latents, batch["residue_mask"])["frame_states"]
+
+    assert torch.allclose(mean_states, residual_states, atol=1e-6)
+    assert torch.count_nonzero(residual_model.temporal_encoder.frame_pool_gate).item() == 0
+
+
 def test_state_jepa_trains_temporal_modules():
     data_cfg = DataConfig(batch_size=2, num_frames=6, synthetic_size=4, synthetic_residues=16)
     dataset = SyntheticProteinDynamicsDataset(data_cfg)

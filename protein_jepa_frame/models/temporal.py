@@ -55,8 +55,13 @@ class TemporalStateEncoder(nn.Module):
         self.frame_pooling = frame_pooling
         if frame_pooling == "mean":
             self.frame_pooler = None
+            self.frame_pool_gate = None
         elif frame_pooling == "kinetic_query":
             self.frame_pooler = KineticQueryFramePooler(latent_dim, num_heads, frame_pool_queries, dropout)
+            self.frame_pool_gate = None
+        elif frame_pooling == "mean_kinetic_query":
+            self.frame_pooler = KineticQueryFramePooler(latent_dim, num_heads, frame_pool_queries, dropout)
+            self.frame_pool_gate = nn.Parameter(torch.zeros(latent_dim))
         else:
             raise ValueError(f"unknown frame_pooling {frame_pooling}")
         self.time_embed = nn.Embedding(max_frames, latent_dim)
@@ -78,11 +83,15 @@ class TemporalStateEncoder(nn.Module):
         if residue_latents.dim() != 4:
             raise ValueError("residue_latents must be [B,T,L,D]")
         B, T, _, D = residue_latents.shape
+        valid = residue_mask.unsqueeze(-1).float()
+        mean_latents = (residue_latents * valid).sum(dim=2) / valid.sum(dim=2).clamp(min=1)
         if self.frame_pooler is None:
-            valid = residue_mask.unsqueeze(-1).float()
-            frame_latents = (residue_latents * valid).sum(dim=2) / valid.sum(dim=2).clamp(min=1)
-        else:
+            frame_latents = mean_latents
+        elif self.frame_pool_gate is None:
             frame_latents = self.frame_pooler(residue_latents, residue_mask)
+        else:
+            update = self.frame_pooler(residue_latents, residue_mask)
+            frame_latents = mean_latents + self.frame_pool_gate.view(1, 1, D) * update
         time_pos = torch.arange(T, device=residue_latents.device).clamp(max=self.time_embed.num_embeddings - 1)
         x = frame_latents + self.time_embed(time_pos).view(1, T, D)
         cls = self.cls_token.expand(B, 1, D)
