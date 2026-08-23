@@ -36,6 +36,16 @@ DEFAULT_MANIFESTS = Path("/liuyutian/protein_jepa/artifacts/manifests")
 DEFAULT_LABELS = Path("/liuyutian/protein_jepa/artifacts/msm_state_labels")
 DEFAULT_VAL_MANIFEST = DEFAULT_MANIFESTS / "mdcath.deeptime_lcc_pcca_v2.full_lag1.validation.filtered.jsonl"
 DEFAULT_VAL_LABELS = DEFAULT_LABELS / "mdcath.deeptime_lcc_pcca_v2.full_lag1.validation.filtered_labels.json"
+MODEL_READOUT_CHOICES = [
+    "mean",
+    "state",
+    "clip_state",
+    "state_clip",
+    "state_delta",
+    "state_clip_delta",
+    "state_mean",
+    "state_clip_delta_mean",
+]
 
 
 @dataclass(frozen=True)
@@ -126,13 +136,31 @@ def _move_tensor_batch(batch: dict, device: torch.device) -> dict:
 def _model_readout(model: ProteinJEPA, latents: torch.Tensor, residue_mask: torch.Tensor, readout: str) -> torch.Tensor:
     valid = residue_mask.unsqueeze(-1).float()
     frame_mean = (latents * valid).sum(dim=2) / valid.sum(dim=2).clamp(min=1)
+    last_mean = frame_mean[:, -1]
     if readout == "mean":
-        return frame_mean[:, -1]
+        return last_mean
     states = model.encode_states(latents, residue_mask)
+    frame_states = states["frame_states"]
+    last_state = frame_states[:, -1]
+    clip_state = states["clip_state"]
+    if frame_states.shape[1] > 1:
+        delta_state = frame_states[:, -1] - frame_states[:, -2]
+    else:
+        delta_state = torch.zeros_like(last_state)
     if readout == "state":
-        return states["frame_states"][:, -1]
+        return last_state
     if readout == "clip_state":
-        return states["clip_state"]
+        return clip_state
+    if readout == "state_clip":
+        return torch.cat([last_state, clip_state], dim=-1)
+    if readout == "state_delta":
+        return torch.cat([last_state, delta_state], dim=-1)
+    if readout == "state_clip_delta":
+        return torch.cat([last_state, clip_state, delta_state], dim=-1)
+    if readout == "state_mean":
+        return torch.cat([last_state, last_mean], dim=-1)
+    if readout == "state_clip_delta_mean":
+        return torch.cat([last_state, clip_state, delta_state, last_mean], dim=-1)
     raise ValueError(f"unknown model readout {readout}")
 
 
@@ -828,6 +856,8 @@ def extract_clip_latents_with_labels(
             clip_latents = (states * clip_valid).sum(dim=1) / clip_valid.sum(dim=1).clamp(min=1)
         elif readout == "clip_state":
             clip_latents = model.encode_states(latents, batch["residue_mask"])["clip_state"]
+        elif readout in {"state_clip", "state_delta", "state_clip_delta", "state_mean", "state_clip_delta_mean"}:
+            clip_latents = _model_readout(model, latents, batch["residue_mask"], readout)
         else:
             raise ValueError(f"unknown model readout {readout}")
         for b in range(clip_latents.shape[0]):
@@ -1040,7 +1070,7 @@ def run_pipeline(args: argparse.Namespace) -> dict:
         if args.sequence_frames <= 1:
             raise ValueError("--require-contextual needs --sequence-frames > 1")
         if args.readout == "mean":
-            raise ValueError("--require-contextual needs --readout state or --readout clip_state")
+            raise ValueError("--require-contextual needs a temporal-state readout")
     common = {
         "checkpoint": args.checkpoint,
         "manifest": args.manifest,
@@ -1108,7 +1138,7 @@ def run_pipeline(args: argparse.Namespace) -> dict:
             "checkpoints": args.checkpoint,
             "output_dir": str(output_dir),
             "readout": args.readout,
-            "contextual_protocol": args.sequence_frames > 1 and args.readout in {"state", "clip_state"},
+            "contextual_protocol": args.sequence_frames > 1 and args.readout != "mean",
             "require_contextual": args.require_contextual,
             "sequence_frames": args.sequence_frames,
             "window_stride": args.window_stride,
@@ -1140,7 +1170,7 @@ def build_parser() -> argparse.ArgumentParser:
     vamp.add_argument("--batch-size", type=int, default=16)
     vamp.add_argument("--window-stride", type=int, default=5)
     vamp.add_argument("--sequence-frames", type=int, default=1)
-    vamp.add_argument("--readout", choices=["mean", "state", "clip_state"], default="mean")
+    vamp.add_argument("--readout", choices=MODEL_READOUT_CHOICES, default="mean")
     vamp.add_argument("--lags", type=int, nargs="+", default=[1, 2, 5, 10, 20])
     vamp.add_argument("--dims", type=int, nargs="+", default=[2, 5, 10, 20])
     vamp.add_argument("--folds", type=int, default=5)
@@ -1160,7 +1190,7 @@ def build_parser() -> argparse.ArgumentParser:
     probe.add_argument("--max-clips", type=int, default=8000)
     probe.add_argument("--num-frames", type=int, default=None)
     probe.add_argument("--window-stride", type=int, default=None)
-    probe.add_argument("--readout", choices=["mean", "state", "clip_state"], default="mean")
+    probe.add_argument("--readout", choices=MODEL_READOUT_CHOICES, default="mean")
     probe.add_argument("--lambdas", type=float, nargs="+", default=[0.01, 0.1, 1.0, 10.0, 100.0])
     probe.set_defaults(func=run_msm_probe)
 
@@ -1174,7 +1204,7 @@ def build_parser() -> argparse.ArgumentParser:
     dyn.add_argument("--batch-size", type=int, default=16)
     dyn.add_argument("--window-stride", type=int, default=5)
     dyn.add_argument("--sequence-frames", type=int, default=1)
-    dyn.add_argument("--readout", choices=["mean", "state", "clip_state"], default="mean")
+    dyn.add_argument("--readout", choices=MODEL_READOUT_CHOICES, default="mean")
     dyn.add_argument("--lags", type=int, nargs="+", default=[1, 2, 5, 10, 20])
     dyn.add_argument("--folds", type=int, default=5)
     dyn.add_argument("--gap", type=int, default=20)
@@ -1200,7 +1230,7 @@ def build_parser() -> argparse.ArgumentParser:
     pipe.add_argument("--window-stride", type=int, default=5)
     pipe.add_argument("--linear-window-stride", type=int, default=None)
     pipe.add_argument("--sequence-frames", type=int, default=1)
-    pipe.add_argument("--readout", choices=["mean", "state", "clip_state"], default="mean")
+    pipe.add_argument("--readout", choices=MODEL_READOUT_CHOICES, default="mean")
     pipe.add_argument(
         "--require-contextual",
         action="store_true",

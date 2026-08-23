@@ -44,6 +44,9 @@ class ModelConfig:
     state_prediction_lags: tuple[int, ...] = ()
     lag_predictor_depth: int = 2
     linear_dynamics_lags: tuple[int, ...] = ()
+    physchem_prediction_lags: tuple[int, ...] = ()
+    physchem_predictor_depth: int = 2
+    physchem_contact_cutoff: float = 8.0
     num_heads: int = 4
     num_rbf: int = 16
     dropout: float = 0.1
@@ -64,9 +67,13 @@ class OptimizationConfig:
     ema_end: float = 1.0
     grad_clip: float | None = 1.0
     precision: str = "float32"
+    auxiliary_warmup_steps: int = 0
     residue_jepa_weight: float = 1.0
     state_jepa_weight: float = 0.0
     lagged_state_jepa_weight: float = 0.0
+    semigroup_weight: float = 0.0
+    state_transition_weight: float = 0.0
+    physchem_weight: float = 0.0
     linear_dynamics_weight: float = 0.0
     variance_reg: float = 0.0
     state_variance_reg: float = 0.0
@@ -84,6 +91,8 @@ class TrainConfig:
     seed: int = 0
     device: str = "auto"
     output_dir: str = "artifacts/run"
+    init_checkpoint: str | None = None
+    strict_init: bool = True
     log_every: int = 20
     save_every: int = 1
 

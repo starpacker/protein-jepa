@@ -10,6 +10,7 @@ from protein_jepa_frame.config import ModelConfig
 from protein_jepa_frame.models.encoder import ProteinGeometryEncoder
 from protein_jepa_frame.models.predictor import (
     LaggedLinearDynamicsPredictor,
+    LaggedPhyschemPredictor,
     LaggedStatePredictor,
     SpatiotemporalPredictor,
     StatePredictor,
@@ -81,6 +82,16 @@ class ProteinJEPA(nn.Module):
         self.linear_dynamics_predictor = (
             LaggedLinearDynamicsPredictor(latent_dim=config.latent_dim, lags=config.linear_dynamics_lags)
             if self.temporal_encoder is not None and len(config.linear_dynamics_lags) > 0
+            else None
+        )
+        self.physchem_predictor = (
+            LaggedPhyschemPredictor(
+                latent_dim=config.latent_dim,
+                lags=config.physchem_prediction_lags,
+                depth=config.physchem_predictor_depth,
+                dropout=config.dropout,
+            )
+            if self.temporal_encoder is not None and len(config.physchem_prediction_lags) > 0
             else None
         )
         self.state_classifiers: nn.ModuleDict = nn.ModuleDict()
@@ -160,6 +171,20 @@ class ProteinJEPA(nn.Module):
                 outputs["frame_valid_mask"] = residue_mask.any(dim=2)
             if self.linear_dynamics_predictor is not None:
                 outputs["linear_dynamics_predictions"] = self.linear_dynamics_predictor(context_states["frame_states"])
+                outputs["frame_valid_mask"] = residue_mask.any(dim=2)
+            if self.physchem_predictor is not None:
+                outputs["physchem_predictions"] = self.physchem_predictor(context_states["frame_states"])
+                targets, target_masks = compute_physchem_targets(
+                    coords=coords,
+                    atom_mask=batch["atom_mask"],
+                    residue_mask=residue_mask,
+                    residue_index=residue_index,
+                    chain_id=chain_id,
+                    lags=self.config.physchem_prediction_lags,
+                    contact_cutoff=self.config.physchem_contact_cutoff,
+                )
+                outputs["physchem_targets"] = targets
+                outputs["physchem_target_masks"] = target_masks
                 outputs["frame_valid_mask"] = residue_mask.any(dim=2)
         return outputs
 
@@ -285,6 +310,55 @@ def state_jepa_loss(outputs: dict, loss_type: str = "smooth_l1") -> torch.Tensor
     return _latent_loss(pred, target, loss_type)
 
 
+def state_transition_jepa_loss(outputs: dict, loss_type: str = "smooth_l1") -> torch.Tensor:
+    if "state_predictions" not in outputs:
+        return outputs["predictions"].new_tensor(0.0)
+    pred_delta = outputs["state_predictions"][:, 1:] - outputs["state_predictions"][:, :-1]
+    target_delta = outputs["state_targets"][:, 1:] - outputs["state_targets"][:, :-1]
+    frame_mask = outputs["state_target_mask"]
+    valid_mask = outputs.get("frame_valid_mask", frame_mask)
+    pair_mask = frame_mask[:, 1:] & frame_mask[:, :-1] & valid_mask[:, 1:] & valid_mask[:, :-1]
+    if not pair_mask.any():
+        return outputs["predictions"].new_tensor(0.0)
+    return _latent_loss(pred_delta[pair_mask], target_delta[pair_mask], loss_type)
+
+
+def lagged_state_semigroup_loss(
+    outputs: dict,
+    lagged_state_predictor: LaggedStatePredictor | None,
+    loss_type: str = "smooth_l1",
+) -> torch.Tensor:
+    if "lagged_state_predictions" not in outputs or lagged_state_predictor is None:
+        return outputs["predictions"].new_tensor(0.0)
+    predictions = outputs["lagged_state_predictions"]
+    lags = sorted(predictions)
+    available = set(lags)
+    context_mask = outputs["context_frame_mask"]
+    target_mask = outputs["state_target_mask"]
+    valid_mask = outputs.get("frame_valid_mask", context_mask | target_mask)
+    losses = []
+    for first_lag in lags:
+        first_pred = predictions[first_lag]
+        composed_predictions = lagged_state_predictor(first_pred)
+        for second_lag in lags:
+            total_lag = first_lag + second_lag
+            if total_lag not in available or total_lag >= first_pred.shape[1]:
+                continue
+            direct = predictions[total_lag][:, :-total_lag].detach()
+            composed = composed_predictions[second_lag][:, :-total_lag]
+            pair_mask = (
+                context_mask[:, :-total_lag]
+                & target_mask[:, total_lag:]
+                & valid_mask[:, first_lag:-second_lag]
+                & valid_mask[:, total_lag:]
+            )
+            if pair_mask.any():
+                losses.append(_latent_loss(composed[pair_mask], direct[pair_mask], loss_type))
+    if not losses:
+        return outputs["predictions"].new_tensor(0.0)
+    return torch.stack(losses).mean()
+
+
 def lagged_state_jepa_loss(outputs: dict, loss_type: str = "smooth_l1") -> torch.Tensor:
     if "lagged_state_predictions" not in outputs:
         return outputs["predictions"].new_tensor(0.0)
@@ -301,6 +375,25 @@ def lagged_state_jepa_loss(outputs: dict, loss_type: str = "smooth_l1") -> torch
         pair_mask = context_mask[:, :-lag] & target_mask[:, lag:] & valid_mask[:, lag:]
         if pair_mask.any():
             losses.append(_latent_loss(pred[pair_mask], target[pair_mask], loss_type))
+    if not losses:
+        return outputs["predictions"].new_tensor(0.0)
+    return torch.stack(losses).mean()
+
+
+def physchem_prediction_loss(outputs: dict, loss_type: str = "smooth_l1") -> torch.Tensor:
+    if "physchem_predictions" not in outputs:
+        return outputs["predictions"].new_tensor(0.0)
+    context_mask = outputs["context_frame_mask"]
+    target_mask = outputs["state_target_mask"]
+    losses = []
+    for lag, pred_all in outputs["physchem_predictions"].items():
+        if lag >= pred_all.shape[1]:
+            continue
+        target_all = outputs["physchem_targets"][lag]
+        physchem_mask = outputs["physchem_target_masks"][lag]
+        pair_mask = context_mask[:, :-lag] & target_mask[:, lag:] & physchem_mask[:, :-lag]
+        if pair_mask.any():
+            losses.append(_latent_loss(pred_all[:, :-lag][pair_mask], target_all[:, :-lag][pair_mask], loss_type))
     if not losses:
         return outputs["predictions"].new_tensor(0.0)
     return torch.stack(losses).mean()
@@ -347,3 +440,114 @@ def state_variance_regularizer(outputs: dict) -> torch.Tensor:
         return pred.new_tensor(0.0)
     std = torch.sqrt(pred.var(dim=0, unbiased=False) + 1.0e-4)
     return torch.relu(1.0 - std).mean()
+
+
+def _dihedral(a: torch.Tensor, b: torch.Tensor, c: torch.Tensor, d: torch.Tensor) -> torch.Tensor:
+    b0 = a - b
+    b1 = c - b
+    b2 = d - c
+    b1 = F.normalize(b1, dim=-1, eps=1.0e-8)
+    v = b0 - (b0 * b1).sum(dim=-1, keepdim=True) * b1
+    w = b2 - (b2 * b1).sum(dim=-1, keepdim=True) * b1
+    x = (v * w).sum(dim=-1)
+    y = (torch.cross(b1, v, dim=-1) * w).sum(dim=-1)
+    return torch.atan2(y, x)
+
+
+@torch.no_grad()
+def _backbone_torsions(
+    coords: torch.Tensor,
+    atom_mask: torch.Tensor,
+    residue_mask: torch.Tensor,
+    chain_id: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    B, T, L = residue_mask.shape
+    angles = coords.new_zeros(B, T, L, 3)
+    masks = torch.zeros(B, T, L, 3, dtype=torch.bool, device=coords.device)
+    if L < 2:
+        return angles, masks
+
+    n = coords[:, :, :, 0]
+    ca = coords[:, :, :, 1]
+    c = coords[:, :, :, 2]
+    valid_n = atom_mask[:, :, :, 0] & residue_mask
+    valid_ca = atom_mask[:, :, :, 1] & residue_mask
+    valid_c = atom_mask[:, :, :, 2] & residue_mask
+    same_chain_prev = chain_id[:, 1:] == chain_id[:, :-1]
+    same_chain_next = same_chain_prev
+
+    phi_mask = valid_c[:, :, :-1] & valid_n[:, :, 1:] & valid_ca[:, :, 1:] & valid_c[:, :, 1:]
+    phi_mask = phi_mask & same_chain_prev[:, None, :]
+    angles[:, :, 1:, 0] = _dihedral(c[:, :, :-1], n[:, :, 1:], ca[:, :, 1:], c[:, :, 1:])
+    masks[:, :, 1:, 0] = phi_mask
+
+    psi_mask = valid_n[:, :, :-1] & valid_ca[:, :, :-1] & valid_c[:, :, :-1] & valid_n[:, :, 1:]
+    psi_mask = psi_mask & same_chain_next[:, None, :]
+    angles[:, :, :-1, 1] = _dihedral(n[:, :, :-1], ca[:, :, :-1], c[:, :, :-1], n[:, :, 1:])
+    masks[:, :, :-1, 1] = psi_mask
+
+    omega_mask = valid_ca[:, :, :-1] & valid_c[:, :, :-1] & valid_n[:, :, 1:] & valid_ca[:, :, 1:]
+    omega_mask = omega_mask & same_chain_next[:, None, :]
+    angles[:, :, :-1, 2] = _dihedral(ca[:, :, :-1], c[:, :, :-1], n[:, :, 1:], ca[:, :, 1:])
+    masks[:, :, :-1, 2] = omega_mask
+    return angles, masks
+
+
+@torch.no_grad()
+def compute_physchem_targets(
+    coords: torch.Tensor,
+    atom_mask: torch.Tensor,
+    residue_mask: torch.Tensor,
+    residue_index: torch.Tensor,
+    chain_id: torch.Tensor,
+    lags: tuple[int, ...],
+    contact_cutoff: float = 8.0,
+) -> tuple[dict[int, torch.Tensor], dict[int, torch.Tensor]]:
+    B, T, L = residue_mask.shape
+    device = coords.device
+    ca = coords[:, :, :, 1]
+    ca_valid = atom_mask[:, :, :, 1] & residue_mask
+    pair_valid = ca_valid[:, :, :, None] & ca_valid[:, :, None, :]
+    same_chain = chain_id[:, :, None] == chain_id[:, None, :]
+    seq_sep = (residue_index[:, :, None] - residue_index[:, None, :]).abs() > 2
+    pair_valid = pair_valid & same_chain[:, None] & seq_sep[:, None]
+    flat_ca = ca.reshape(B * T, L, 3)
+    distances = torch.cdist(flat_ca, flat_ca).reshape(B, T, L, L)
+    contacts = (distances < contact_cutoff) & pair_valid
+
+    torsions, torsion_mask = _backbone_torsions(coords, atom_mask, residue_mask, chain_id)
+    targets: dict[int, torch.Tensor] = {}
+    masks: dict[int, torch.Tensor] = {}
+    for lag in lags:
+        target = coords.new_zeros(B, T, 4)
+        valid = torch.zeros(B, T, dtype=torch.bool, device=device)
+        if lag >= T:
+            targets[int(lag)] = target
+            masks[int(lag)] = valid
+            continue
+
+        current_contacts = contacts[:, :-lag]
+        future_contacts = contacts[:, lag:]
+        contact_count = current_contacts.sum(dim=(-1, -2))
+        persisted = (current_contacts & future_contacts).sum(dim=(-1, -2))
+        contact_persistence = persisted.float() / contact_count.float().clamp(min=1.0)
+        contact_valid = contact_count > 0
+
+        torsion_current = torsions[:, :-lag]
+        torsion_future = torsions[:, lag:]
+        torsion_pair_mask = torsion_mask[:, :-lag] & torsion_mask[:, lag:]
+        torsion_delta = (
+            (torch.sin(torsion_future) - torch.sin(torsion_current)).pow(2)
+            + (torch.cos(torsion_future) - torch.cos(torsion_current)).pow(2)
+        )
+        torsion_sum = (torsion_delta * torsion_pair_mask.float()).sum(dim=2)
+        torsion_count = torsion_pair_mask.sum(dim=2)
+        torsion_mean = torsion_sum / torsion_count.float().clamp(min=1.0)
+        torsion_valid = torsion_count > 0
+
+        target[:, :-lag, 0] = contact_persistence
+        target[:, :-lag, 1:] = torsion_mean
+        valid[:, :-lag] = contact_valid & torsion_valid.all(dim=-1)
+        targets[int(lag)] = target
+        masks[int(lag)] = valid
+    return targets, masks

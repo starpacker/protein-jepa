@@ -9,8 +9,11 @@ from protein_jepa_frame.models.jepa import (
     ProteinJEPA,
     jepa_loss,
     lagged_state_jepa_loss,
+    lagged_state_semigroup_loss,
     linear_dynamics_jepa_loss,
+    physchem_prediction_loss,
     state_jepa_loss,
+    state_transition_jepa_loss,
 )
 from protein_jepa_frame.training.train import train
 
@@ -108,6 +111,97 @@ def test_lagged_state_jepa_trains_lag_predictor():
     assert any(g is not None and torch.isfinite(g).all() and g.abs().sum() > 0 for g in lag_grads)
 
 
+def test_state_transition_jepa_trains_state_predictor():
+    data_cfg = DataConfig(batch_size=2, num_frames=8, synthetic_size=4, synthetic_residues=16)
+    dataset = SyntheticProteinDynamicsDataset(data_cfg)
+    batch = next(iter(DataLoader(dataset, batch_size=2, collate_fn=collate_clips)))
+    context, target = SpatiotemporalBlockMasker(
+        MaskConfig(mode="future", temporal_scale=(0.5, 0.5), future_context_ratio=0.5)
+    )(batch["residue_mask"])
+    model = ProteinJEPA(
+        ModelConfig(
+            latent_dim=32,
+            encoder_depth=1,
+            temporal_depth=1,
+            predictor_depth=1,
+            state_predictor_depth=1,
+            num_heads=4,
+            num_rbf=8,
+        )
+    )
+
+    outputs = model(batch, context, target)
+    loss = state_transition_jepa_loss(outputs)
+    loss.backward()
+    predictor_grads = [p.grad for p in model.state_predictor.parameters() if p.requires_grad]
+
+    assert torch.isfinite(loss)
+    assert loss.item() > 0
+    assert any(g is not None and torch.isfinite(g).all() and g.abs().sum() > 0 for g in predictor_grads)
+
+
+def test_lagged_semigroup_loss_trains_lag_predictor():
+    data_cfg = DataConfig(batch_size=2, num_frames=8, synthetic_size=4, synthetic_residues=16)
+    dataset = SyntheticProteinDynamicsDataset(data_cfg)
+    batch = next(iter(DataLoader(dataset, batch_size=2, collate_fn=collate_clips)))
+    context, target = SpatiotemporalBlockMasker(
+        MaskConfig(mode="future", temporal_scale=(0.5, 0.5), future_context_ratio=0.5)
+    )(batch["residue_mask"])
+    model = ProteinJEPA(
+        ModelConfig(
+            latent_dim=32,
+            encoder_depth=1,
+            temporal_depth=1,
+            predictor_depth=1,
+            state_predictor_depth=1,
+            state_prediction_lags=(1, 2, 3, 4),
+            lag_predictor_depth=1,
+            num_heads=4,
+            num_rbf=8,
+        )
+    )
+
+    outputs = model(batch, context, target)
+    loss = lagged_state_semigroup_loss(outputs, model.lagged_state_predictor)
+    loss.backward()
+    lag_grads = [p.grad for p in model.lagged_state_predictor.parameters() if p.requires_grad]
+
+    assert torch.isfinite(loss)
+    assert loss.item() > 0
+    assert any(g is not None and torch.isfinite(g).all() and g.abs().sum() > 0 for g in lag_grads)
+
+
+def test_physchem_prediction_loss_trains_physchem_head():
+    data_cfg = DataConfig(batch_size=2, num_frames=8, synthetic_size=4, synthetic_residues=16)
+    dataset = SyntheticProteinDynamicsDataset(data_cfg)
+    batch = next(iter(DataLoader(dataset, batch_size=2, collate_fn=collate_clips)))
+    context, target = SpatiotemporalBlockMasker(
+        MaskConfig(mode="future", temporal_scale=(0.5, 0.5), future_context_ratio=0.5)
+    )(batch["residue_mask"])
+    model = ProteinJEPA(
+        ModelConfig(
+            latent_dim=32,
+            encoder_depth=1,
+            temporal_depth=1,
+            predictor_depth=1,
+            state_predictor_depth=1,
+            physchem_prediction_lags=(1, 2),
+            physchem_predictor_depth=1,
+            num_heads=4,
+            num_rbf=8,
+        )
+    )
+
+    outputs = model(batch, context, target)
+    loss = physchem_prediction_loss(outputs)
+    loss.backward()
+    physchem_grads = [p.grad for p in model.physchem_predictor.parameters() if p.requires_grad]
+
+    assert torch.isfinite(loss)
+    assert loss.item() > 0
+    assert any(g is not None and torch.isfinite(g).all() and g.abs().sum() > 0 for g in physchem_grads)
+
+
 def test_linear_dynamics_jepa_trains_linear_transition_heads():
     data_cfg = DataConfig(batch_size=2, num_frames=8, synthetic_size=4, synthetic_residues=16)
     dataset = SyntheticProteinDynamicsDataset(data_cfg)
@@ -148,8 +242,11 @@ def test_smoke_training_writes_checkpoint(tmp_path):
             epochs=1,
             steps_per_epoch=2,
             warmup_steps=1,
+            auxiliary_warmup_steps=2,
             residue_jepa_weight=0.25,
             state_jepa_weight=1.0,
+            semigroup_weight=0.01,
+            state_transition_weight=0.05,
         ),
         log_every=1,
     )

@@ -154,3 +154,33 @@ class LaggedLinearDynamicsPredictor(nn.Module):
         if frame_states.dim() != 3:
             raise ValueError("frame_states must be [B,T,D]")
         return {lag: self.heads[str(lag)](frame_states) for lag in self.lags}
+
+
+class LaggedPhyschemPredictor(nn.Module):
+    """Predict low-dimensional physicochemical frame-pair events at multiple lags."""
+
+    def __init__(
+        self,
+        latent_dim: int = 128,
+        lags: tuple[int, ...] = (1, 2, 4, 8),
+        output_dim: int = 4,
+        depth: int = 2,
+        dropout: float = 0.1,
+    ):
+        super().__init__()
+        if any(lag <= 0 for lag in lags):
+            raise ValueError("physchem prediction lags must be positive")
+        self.lags = tuple(int(lag) for lag in lags)
+        self.output_dim = int(output_dim)
+        hidden = latent_dim * 2
+        layers: list[nn.Module] = [nn.LayerNorm(latent_dim), nn.Linear(latent_dim, hidden), nn.GELU(), nn.Dropout(dropout)]
+        for _ in range(max(0, depth - 1)):
+            layers.extend([nn.Linear(hidden, hidden), nn.GELU(), nn.Dropout(dropout)])
+        self.trunk = nn.Sequential(*layers)
+        self.heads = nn.ModuleDict({str(lag): nn.Linear(hidden, self.output_dim) for lag in self.lags})
+
+    def forward(self, frame_states: torch.Tensor) -> dict[int, torch.Tensor]:
+        if frame_states.dim() != 3:
+            raise ValueError("frame_states must be [B,T,D]")
+        h = self.trunk(frame_states)
+        return {lag: self.heads[str(lag)](h) for lag in self.lags}

@@ -16,10 +16,13 @@ from protein_jepa_frame.data.dataset import build_dataset
 from protein_jepa_frame.data.masks import SpatiotemporalBlockMasker
 from protein_jepa_frame.models.jepa import (
     lagged_state_jepa_loss,
+    lagged_state_semigroup_loss,
     linear_dynamics_jepa_loss,
+    physchem_prediction_loss,
     ProteinJEPA,
     residue_jepa_loss,
     state_jepa_loss,
+    state_transition_jepa_loss,
     state_variance_regularizer,
     variance_regularizer,
 )
@@ -53,6 +56,30 @@ def _lr_scale(step: int, total_steps: int, warmup_steps: int) -> float:
     return 0.5 * (1.0 + math.cos(math.pi * progress))
 
 
+def _warmup_scale(step: int, warmup_steps: int) -> float:
+    if warmup_steps <= 0:
+        return 1.0
+    return min(1.0, (step + 1) / float(warmup_steps))
+
+
+def _load_init_checkpoint(model: ProteinJEPA, checkpoint_path: str, device: torch.device, strict: bool) -> None:
+    ckpt = torch.load(checkpoint_path, map_location=device)
+    state = ckpt.get("model", ckpt) if isinstance(ckpt, dict) else ckpt
+    incompatible = model.load_state_dict(state, strict=strict)
+    if not strict:
+        print(
+            json.dumps(
+                {
+                    "event": "loaded_init_checkpoint",
+                    "checkpoint": checkpoint_path,
+                    "missing_keys": list(incompatible.missing_keys),
+                    "unexpected_keys": list(incompatible.unexpected_keys),
+                }
+            ),
+            flush=True,
+        )
+
+
 def train(config: TrainConfig) -> Path:
     random.seed(config.seed)
     np.random.seed(config.seed)
@@ -80,6 +107,8 @@ def train(config: TrainConfig) -> Path:
     total_steps = steps_per_epoch * config.optimization.epochs
 
     model = ProteinJEPA(config.model).to(device)
+    if config.init_checkpoint:
+        _load_init_checkpoint(model, config.init_checkpoint, device, config.strict_init)
     param_groups = [
         {
             "params": model.context_encoder.parameters(),
@@ -107,6 +136,10 @@ def train(config: TrainConfig) -> Path:
                 "lr": config.optimization.lr,
                 "base_lr_scale": 1.0,
             }
+        )
+    if model.physchem_predictor is not None:
+        param_groups.append(
+            {"params": model.physchem_predictor.parameters(), "lr": config.optimization.lr, "base_lr_scale": 1.0}
         )
     optimizer = torch.optim.AdamW(param_groups, weight_decay=config.optimization.weight_decay)
     # Pre-register MSM classifiers for all proteins in the training set
@@ -150,27 +183,42 @@ def train(config: TrainConfig) -> Path:
             residue_loss = residue_jepa_loss(outputs)
             state_loss = state_jepa_loss(outputs)
             lagged_state_loss = lagged_state_jepa_loss(outputs)
+            semigroup_loss = lagged_state_semigroup_loss(outputs, model.lagged_state_predictor)
+            state_transition_loss = state_transition_jepa_loss(outputs)
+            physchem_loss = physchem_prediction_loss(outputs)
             linear_dynamics_loss = linear_dynamics_jepa_loss(outputs)
             reg = variance_regularizer(outputs)
             state_reg = state_variance_regularizer(outputs)
+            aux_mult = _warmup_scale(global_step, config.optimization.auxiliary_warmup_steps)
+            semigroup_weight = config.optimization.semigroup_weight * aux_mult
+            state_transition_weight = config.optimization.state_transition_weight * aux_mult
+            physchem_weight = config.optimization.physchem_weight * aux_mult
+            linear_dynamics_weight = config.optimization.linear_dynamics_weight * aux_mult
+            variance_weight = config.optimization.variance_reg * aux_mult
+            state_variance_weight = config.optimization.state_variance_reg * aux_mult
+            msm_state_weight = config.optimization.msm_state_weight * aux_mult
+            vamp2_weight = config.optimization.vamp2_weight * aux_mult
             total_loss = (
                 config.optimization.residue_jepa_weight * residue_loss
                 + config.optimization.state_jepa_weight * state_loss
                 + config.optimization.lagged_state_jepa_weight * lagged_state_loss
-                + config.optimization.linear_dynamics_weight * linear_dynamics_loss
-                + config.optimization.variance_reg * reg
-                + config.optimization.state_variance_reg * state_reg
+                + semigroup_weight * semigroup_loss
+                + state_transition_weight * state_transition_loss
+                + physchem_weight * physchem_loss
+                + linear_dynamics_weight * linear_dynamics_loss
+                + variance_weight * reg
+                + state_variance_weight * state_reg
             )
 
-            if config.optimization.msm_state_weight > 0:
+            if msm_state_weight > 0:
                 msm_state_loss = model.compute_msm_state_loss(outputs, batch)
-                total_loss = total_loss + config.optimization.msm_state_weight * msm_state_loss
+                total_loss = total_loss + msm_state_weight * msm_state_loss
             else:
                 msm_state_loss = total_loss.new_tensor(0.0)
 
-            if config.optimization.vamp2_weight > 0:
+            if vamp2_weight > 0:
                 vamp2_loss = model.compute_vamp2_loss(outputs, batch, lag=config.optimization.vamp2_lag)
-                total_loss = total_loss + config.optimization.vamp2_weight * vamp2_loss
+                total_loss = total_loss + vamp2_weight * vamp2_loss
             else:
                 vamp2_loss = total_loss.new_tensor(0.0)
 
@@ -195,11 +243,15 @@ def train(config: TrainConfig) -> Path:
                     "residue_jepa_loss": float(residue_loss.detach().cpu()),
                     "state_jepa_loss": float(state_loss.detach().cpu()),
                     "lagged_state_jepa_loss": float(lagged_state_loss.detach().cpu()),
+                    "semigroup_loss": float(semigroup_loss.detach().cpu()),
+                    "state_transition_jepa_loss": float(state_transition_loss.detach().cpu()),
+                    "physchem_loss": float(physchem_loss.detach().cpu()),
                     "linear_dynamics_jepa_loss": float(linear_dynamics_loss.detach().cpu()),
                     "variance_reg": float(reg.detach().cpu()),
                     "state_variance_reg": float(state_reg.detach().cpu()),
                     "msm_state_loss": float(msm_state_loss.detach().cpu()),
                     "vamp2_loss": float(vamp2_loss.detach().cpu()),
+                    "auxiliary_warmup": aux_mult,
                     "lr": optimizer.param_groups[-1]["lr"],
                     "ema": momentum,
                     "target_tokens": int(target_mask.sum().detach().cpu()),
