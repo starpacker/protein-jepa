@@ -118,11 +118,19 @@ class LaggedStatePredictor(nn.Module):
         lags: tuple[int, ...] = (1, 2, 4, 8),
         depth: int = 2,
         dropout: float = 0.1,
+        conditioning: str = "none",
     ):
         super().__init__()
         if any(lag <= 0 for lag in lags):
             raise ValueError("state prediction lags must be positive")
         self.lags = tuple(int(lag) for lag in lags)
+        self.conditioning = conditioning
+        if conditioning == "none":
+            self.lag_embed = None
+        elif conditioning == "embedding":
+            self.lag_embed = nn.Embedding(max(self.lags) + 1, latent_dim)
+        else:
+            raise ValueError(f"unknown lag conditioning {conditioning}")
         hidden = latent_dim * 2
         layers: list[nn.Module] = [nn.LayerNorm(latent_dim), nn.Linear(latent_dim, hidden), nn.GELU(), nn.Dropout(dropout)]
         for _ in range(max(0, depth - 1)):
@@ -133,8 +141,15 @@ class LaggedStatePredictor(nn.Module):
     def forward(self, frame_states: torch.Tensor) -> dict[int, torch.Tensor]:
         if frame_states.dim() != 3:
             raise ValueError("frame_states must be [B,T,D]")
-        h = self.trunk(frame_states)
-        return {lag: self.heads[str(lag)](h) for lag in self.lags}
+        if self.lag_embed is None:
+            h = self.trunk(frame_states)
+            return {lag: self.heads[str(lag)](h) for lag in self.lags}
+        out = {}
+        for lag in self.lags:
+            lag_id = torch.tensor(lag, device=frame_states.device, dtype=torch.long)
+            conditioned = frame_states + self.lag_embed(lag_id).view(1, 1, -1)
+            out[lag] = self.heads[str(lag)](self.trunk(conditioned))
+        return out
 
 
 class LaggedLinearDynamicsPredictor(nn.Module):

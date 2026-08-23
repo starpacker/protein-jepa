@@ -78,6 +78,7 @@ class ProteinJEPA(nn.Module):
                 lags=config.state_prediction_lags,
                 depth=config.lag_predictor_depth,
                 dropout=config.dropout,
+                conditioning=config.lag_conditioning,
             )
             if self.temporal_encoder is not None and len(config.state_prediction_lags) > 0
             else None

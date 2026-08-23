@@ -187,6 +187,38 @@ def test_lagged_state_jepa_trains_lag_predictor():
     assert any(g is not None and torch.isfinite(g).all() and g.abs().sum() > 0 for g in lag_grads)
 
 
+def test_time_conditioned_lagged_state_jepa_trains_lag_embedding():
+    data_cfg = DataConfig(batch_size=2, num_frames=8, synthetic_size=4, synthetic_residues=16)
+    dataset = SyntheticProteinDynamicsDataset(data_cfg)
+    batch = next(iter(DataLoader(dataset, batch_size=2, collate_fn=collate_clips)))
+    context, target = SpatiotemporalBlockMasker(
+        MaskConfig(mode="future", temporal_scale=(0.5, 0.5), future_context_ratio=0.5)
+    )(batch["residue_mask"])
+    model = ProteinJEPA(
+        ModelConfig(
+            latent_dim=32,
+            encoder_depth=1,
+            temporal_depth=1,
+            predictor_depth=1,
+            state_predictor_depth=1,
+            state_prediction_lags=(1, 2, 4),
+            lag_predictor_depth=1,
+            lag_conditioning="embedding",
+            num_heads=4,
+            num_rbf=8,
+        )
+    )
+
+    outputs = model(batch, context, target)
+    loss = lagged_state_jepa_loss(outputs)
+    loss.backward()
+
+    assert torch.isfinite(loss)
+    assert model.lagged_state_predictor.lag_embed.weight.grad is not None
+    assert torch.isfinite(model.lagged_state_predictor.lag_embed.weight.grad).all()
+    assert model.lagged_state_predictor.lag_embed.weight.grad.abs().sum() > 0
+
+
 def test_state_transition_jepa_trains_state_predictor():
     data_cfg = DataConfig(batch_size=2, num_frames=8, synthetic_size=4, synthetic_residues=16)
     dataset = SyntheticProteinDynamicsDataset(data_cfg)
