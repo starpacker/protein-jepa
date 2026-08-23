@@ -49,7 +49,22 @@ MODEL_READOUT_CHOICES = [
     "state_kinetic",
     "state_clip_kinetic",
     "state_clip_delta_kinetic",
+    "state_geom",
+    "state_clip_geom",
+    "state_clip_delta_geom",
 ]
+
+GEOMETRY_FUSION_READOUTS = {"state_geom", "state_clip_geom", "state_clip_delta_geom"}
+
+
+def _geometry_fusion_base_readout(readout: str) -> str:
+    if readout == "state_geom":
+        return "state"
+    if readout == "state_clip_geom":
+        return "state_clip"
+    if readout == "state_clip_delta_geom":
+        return "state_clip_delta"
+    raise ValueError(f"not a geometry fusion readout: {readout}")
 
 
 @dataclass(frozen=True)
@@ -204,6 +219,13 @@ def extract_model_frame_sequences(
     buffers: dict[str, list[tuple[int, np.ndarray]]] = defaultdict(list)
     offset = 0
     for batch in loader:
+        geom_features = None
+        if readout in GEOMETRY_FUSION_READOUTS:
+            geom_features = torch.as_tensor(
+                _baseline_features(batch, "geometry_stats", fixed_residues=data_cfg.max_residues),
+                device=device,
+                dtype=torch.float32,
+            )
         batch = _move_tensor_batch(batch, device)
         latents = model.context_encoder(
             coords=batch["coords"],
@@ -213,7 +235,14 @@ def extract_model_frame_sequences(
             chain_id=batch["chain_id"],
             token_mask=None,
         )
-        pooled = _model_readout(model, latents, batch["residue_mask"], readout)
+        pooled = _model_readout(
+            model,
+            latents,
+            batch["residue_mask"],
+            _geometry_fusion_base_readout(readout) if readout in GEOMETRY_FUSION_READOUTS else readout,
+        )
+        if geom_features is not None:
+            pooled = torch.cat([pooled, geom_features.to(dtype=pooled.dtype)], dim=-1)
         B = pooled.shape[0]
         for b in range(B):
             tid, frame = index_map[offset + b]
@@ -850,7 +879,14 @@ def extract_clip_latents_with_labels(
     rows = []
     offset = 0
     for batch in loader:
+        geom_features = None
+        if readout in GEOMETRY_FUSION_READOUTS:
+            geom_features = torch.as_tensor(
+                _baseline_features(batch, "geometry_stats", fixed_residues=data_cfg.max_residues), dtype=torch.float32
+            )
         batch = _move_tensor_batch(batch, device)
+        if geom_features is not None:
+            geom_features = geom_features.to(device=device)
         latents = model.context_encoder(
             coords=batch["coords"],
             residue_mask=batch["residue_mask"],
@@ -891,6 +927,22 @@ def extract_clip_latents_with_labels(
                 clip_latents = torch.cat([state_avg, states_block["clip_state"], kinetic_avg], dim=-1)
             else:
                 clip_latents = torch.cat([state_avg, states_block["clip_state"], delta_state, kinetic_avg], dim=-1)
+        elif readout in GEOMETRY_FUSION_READOUTS:
+            states_block = model.encode_states(latents, batch["residue_mask"])
+            states = states_block["frame_states"]
+            clip_valid = batch["residue_mask"].any(dim=2).unsqueeze(-1).float()
+            state_avg = (states * clip_valid).sum(dim=1) / clip_valid.sum(dim=1).clamp(min=1)
+            if states.shape[1] > 1:
+                delta_state = states[:, -1] - states[:, -2]
+            else:
+                delta_state = torch.zeros_like(state_avg)
+            geom = geom_features.to(dtype=state_avg.dtype)
+            if readout == "state_geom":
+                clip_latents = torch.cat([state_avg, geom], dim=-1)
+            elif readout == "state_clip_geom":
+                clip_latents = torch.cat([state_avg, states_block["clip_state"], geom], dim=-1)
+            else:
+                clip_latents = torch.cat([state_avg, states_block["clip_state"], delta_state, geom], dim=-1)
         elif readout in {
             "state_clip",
             "state_delta",
