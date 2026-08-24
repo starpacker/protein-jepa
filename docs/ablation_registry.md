@@ -39,12 +39,12 @@ Only variants that improve the aligned evaluation metrics should be promoted.
 | Scratch linear dynamics auxiliary 20k, state readout | VAMP dim5 0.5701, but MSM 0.5405 and linear R2 0.3659 | Do not promote |
 | Scratch linear dynamics auxiliary 20k, state+clip readout | VAMP dim5 0.5583, MSM 0.5148, linear R2 0.5325 | Do not promote |
 | ATLAS-PILOT300 mixed-data scratch 20k | Paired eval: VAMP dim5 0.5370 vs baseline 0.5757, MSM 0.5614 vs 0.5646, linear R2 0.4019 vs 0.5378 | Do not promote |
+| ATLAS-PILOT300 physical-time mixed-data scratch 20k | Paired eval: VAMP dim5 0.5559 vs baseline 0.5757, MSM 0.5698 vs 0.5646, linear R2 0.4502 vs 0.5378; improves over plain ATLAS mixed but not champion | Do not promote |
 
 ## Active Candidates
 
 | ID | Change | Config | Status | Decision |
 | --- | --- | --- | --- | --- |
-| ATLAS-PILOT300-PHYSICAL-TIME | From-scratch champion architecture trained on mdCATH plus ATLAS pilot300 with physical ps-scale time conditioning in temporal/state/lagged predictors | `configs/mdcath_atlas_pilot300_state_jepa_multilag_physical_time_scratch20k.yaml` | Launching | Pending eval |
 
 ## Promotion Rule
 
