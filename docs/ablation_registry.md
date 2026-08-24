@@ -44,7 +44,7 @@ Only variants that improve the aligned evaluation metrics should be promoted.
 
 | ID | Change | Config | Status | Decision |
 | --- | --- | --- | --- | --- |
-| None | - | - | - | - |
+| ATLAS-PILOT300-PHYSICAL-TIME | From-scratch champion architecture trained on mdCATH plus ATLAS pilot300 with physical ps-scale time conditioning in temporal/state/lagged predictors | `configs/mdcath_atlas_pilot300_state_jepa_multilag_physical_time_scratch20k.yaml` | Launching | Pending eval |
 
 ## Promotion Rule
 

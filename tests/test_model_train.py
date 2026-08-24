@@ -219,6 +219,49 @@ def test_time_conditioned_lagged_state_jepa_trains_lag_embedding():
     assert model.lagged_state_predictor.lag_embed.weight.grad.abs().sum() > 0
 
 
+def test_physical_time_conditioning_trains_time_embeddings():
+    data_cfg = DataConfig(batch_size=2, num_frames=8, synthetic_size=4, synthetic_residues=16)
+    dataset = SyntheticProteinDynamicsDataset(data_cfg)
+    batch = next(iter(DataLoader(dataset, batch_size=2, collate_fn=collate_clips)))
+    batch["time_ps"][0] = batch["time_ps"][0] * 10.0
+    batch["time_ps"][1] = batch["time_ps"][1] * 1000.0
+    context, target = SpatiotemporalBlockMasker(
+        MaskConfig(mode="future", temporal_scale=(0.5, 0.5), future_context_ratio=0.5)
+    )(batch["residue_mask"])
+    model = ProteinJEPA(
+        ModelConfig(
+            latent_dim=32,
+            encoder_depth=1,
+            temporal_depth=1,
+            predictor_depth=1,
+            state_predictor_depth=1,
+            state_prediction_lags=(1, 2, 4),
+            lag_predictor_depth=1,
+            time_conditioning="physical",
+            num_heads=4,
+            num_rbf=8,
+        )
+    )
+
+    outputs = model(batch, context, target)
+    loss = state_jepa_loss(outputs) + lagged_state_jepa_loss(outputs)
+    loss.backward()
+
+    temporal_grad = model.temporal_encoder.physical_time_embed.proj[0].weight.grad
+    state_predictor_grad = model.state_predictor.physical_time_embed.proj[0].weight.grad
+    lag_predictor_grad = model.lagged_state_predictor.physical_lag_embed.proj[0].weight.grad
+
+    assert torch.isfinite(loss)
+    assert temporal_grad is not None and torch.isfinite(temporal_grad).all() and temporal_grad.abs().sum() > 0
+    assert (
+        state_predictor_grad is not None
+        and torch.isfinite(state_predictor_grad).all()
+        and state_predictor_grad.abs().sum() > 0
+    )
+    assert lag_predictor_grad is not None and torch.isfinite(lag_predictor_grad).all()
+    assert lag_predictor_grad.abs().sum() > 0
+
+
 def test_state_transition_jepa_trains_state_predictor():
     data_cfg = DataConfig(batch_size=2, num_frames=8, synthetic_size=4, synthetic_residues=16)
     dataset = SyntheticProteinDynamicsDataset(data_cfg)

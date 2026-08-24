@@ -46,6 +46,7 @@ class ModelConfig:
     frame_pool_queries: int = 4
     lag_predictor_depth: int = 2
     lag_conditioning: str = "none"
+    time_conditioning: str = "none"
     linear_dynamics_lags: tuple[int, ...] = ()
     physchem_prediction_lags: tuple[int, ...] = ()
     physchem_predictor_depth: int = 2

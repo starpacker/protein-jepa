@@ -43,6 +43,7 @@ class ProteinJEPA(nn.Module):
             dropout=config.dropout,
             max_frames=config.max_frames,
             max_residues=config.max_residues,
+            time_conditioning=config.time_conditioning,
         )
         self.temporal_encoder = (
             TemporalStateEncoder(
@@ -53,6 +54,7 @@ class ProteinJEPA(nn.Module):
                 max_frames=config.max_frames,
                 frame_pooling=config.frame_pooling,
                 frame_pool_queries=config.frame_pool_queries,
+                time_conditioning=config.time_conditioning,
             )
             if config.temporal_depth > 0
             else None
@@ -68,6 +70,7 @@ class ProteinJEPA(nn.Module):
                 num_heads=config.num_heads,
                 dropout=config.dropout,
                 max_frames=config.max_frames,
+                time_conditioning=config.time_conditioning,
             )
             if self.temporal_encoder is not None
             else None
@@ -79,6 +82,7 @@ class ProteinJEPA(nn.Module):
                 depth=config.lag_predictor_depth,
                 dropout=config.dropout,
                 conditioning=config.lag_conditioning,
+                time_conditioning=config.time_conditioning,
             )
             if self.temporal_encoder is not None and len(config.state_prediction_lags) > 0
             else None
@@ -124,6 +128,7 @@ class ProteinJEPA(nn.Module):
         aatype = batch["aatype"]
         residue_index = batch["residue_index"]
         chain_id = batch["chain_id"]
+        time_ps = batch.get("time_ps")
         context_latents = self.context_encoder(
             coords=coords,
             residue_mask=residue_mask,
@@ -149,6 +154,7 @@ class ProteinJEPA(nn.Module):
             target_mask=target_mask,
             residue_index=residue_index,
             chain_id=chain_id,
+            time_ps=time_ps,
         )
         outputs = {
             "predictions": predictions,
@@ -157,10 +163,10 @@ class ProteinJEPA(nn.Module):
             "context_latents": context_latents,
         }
         if self.temporal_encoder is not None:
-            context_states = self.temporal_encoder(context_latents, context_mask)
+            context_states = self.temporal_encoder(context_latents, context_mask, time_ps=time_ps)
             outputs.update(context_states)
             with torch.no_grad():
-                target_states = self.target_temporal_encoder(target_latents, residue_mask)
+                target_states = self.target_temporal_encoder(target_latents, residue_mask, time_ps=time_ps)
                 target_frame_states = target_states["frame_states"]
                 if self.config.feature_norm:
                     target_frame_states = F.layer_norm(target_frame_states, (target_frame_states.shape[-1],))
@@ -170,6 +176,7 @@ class ProteinJEPA(nn.Module):
                 context_states=context_states["frame_states"],
                 context_frame_mask=context_frame_mask,
                 target_frame_mask=target_frame_mask,
+                time_ps=time_ps,
             )
             outputs.update(
                 {
@@ -181,8 +188,12 @@ class ProteinJEPA(nn.Module):
                 }
             )
             if self.lagged_state_predictor is not None:
-                outputs["lagged_state_predictions"] = self.lagged_state_predictor(context_states["frame_states"])
+                outputs["lagged_state_predictions"] = self.lagged_state_predictor(
+                    context_states["frame_states"],
+                    time_ps=time_ps,
+                )
                 outputs["frame_valid_mask"] = residue_mask.any(dim=2)
+                outputs["time_ps"] = time_ps
             if self.linear_dynamics_predictor is not None:
                 outputs["linear_dynamics_predictions"] = self.linear_dynamics_predictor(context_states["frame_states"])
                 outputs["frame_valid_mask"] = residue_mask.any(dim=2)
@@ -210,20 +221,30 @@ class ProteinJEPA(nn.Module):
                 outputs["kinetic_readout_mask"] = context_frame_mask
         return outputs
 
-    def encode_states(self, residue_latents: torch.Tensor, residue_mask: torch.Tensor) -> dict[str, torch.Tensor]:
+    def encode_states(
+        self,
+        residue_latents: torch.Tensor,
+        residue_mask: torch.Tensor,
+        time_ps: torch.Tensor | None = None,
+    ) -> dict[str, torch.Tensor]:
         """Return frame-level and clip-level state latents for dynamics readouts."""
         if self.temporal_encoder is not None:
-            return self.temporal_encoder(residue_latents, residue_mask)
+            return self.temporal_encoder(residue_latents, residue_mask, time_ps=time_ps)
         valid = residue_mask.unsqueeze(-1).float()
         frame_states = (residue_latents * valid).sum(dim=2) / valid.sum(dim=2).clamp(min=1)
         clip_valid = residue_mask.any(dim=2).unsqueeze(-1).float()
         clip_state = (frame_states * clip_valid).sum(dim=1) / clip_valid.sum(dim=1).clamp(min=1)
         return {"frame_states": frame_states, "clip_state": clip_state}
 
-    def encode_kinetic_readout(self, residue_latents: torch.Tensor, residue_mask: torch.Tensor) -> torch.Tensor:
+    def encode_kinetic_readout(
+        self,
+        residue_latents: torch.Tensor,
+        residue_mask: torch.Tensor,
+        time_ps: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         if self.kinetic_readout is None:
             raise ValueError("kinetic_readout is not configured for this model")
-        states = self.encode_states(residue_latents, residue_mask)["frame_states"]
+        states = self.encode_states(residue_latents, residue_mask, time_ps=time_ps)["frame_states"]
         return self.kinetic_readout(states)
 
     def compute_msm_state_loss(self, outputs: dict, batch: dict) -> torch.Tensor:
@@ -232,7 +253,11 @@ class ProteinJEPA(nn.Module):
             return torch.tensor(0.0, device=next(self.parameters()).device)
         pooled = outputs.get("frame_states")
         if pooled is None:
-            pooled = self.encode_states(outputs["context_latents"], batch["residue_mask"])["frame_states"]
+            pooled = self.encode_states(
+                outputs["context_latents"],
+                batch["residue_mask"],
+                time_ps=batch.get("time_ps"),
+            )["frame_states"]
         labels = batch["msm_state_labels"]  # [B, T], -1 = unlabeled
         protein_ids = batch["protein_id"]  # list of str
         D = pooled.shape[-1]
@@ -265,7 +290,7 @@ class ProteinJEPA(nn.Module):
             aatype=aatype, residue_index=residue_index, chain_id=chain_id,
             token_mask=residue_mask,
         )
-        pooled = self.encode_states(full_latents, residue_mask)["frame_states"]  # [B, T, D]
+        pooled = self.encode_states(full_latents, residue_mask, time_ps=batch.get("time_ps"))["frame_states"]  # [B, T, D]
         D = pooled.shape[-1]
         eps = 1e-3
         total_vamp2 = torch.tensor(0.0, device=pooled.device)
@@ -364,10 +389,19 @@ def lagged_state_semigroup_loss(
     context_mask = outputs["context_frame_mask"]
     target_mask = outputs["state_target_mask"]
     valid_mask = outputs.get("frame_valid_mask", context_mask | target_mask)
+    time_ps = outputs.get("time_ps")
     losses = []
     for first_lag in lags:
         first_pred = predictions[first_lag]
-        composed_predictions = lagged_state_predictor(first_pred)
+        if time_ps is not None and first_lag < time_ps.shape[1]:
+            shifted_time = time_ps[:, first_lag:]
+            if shifted_time.shape[1] < first_pred.shape[1]:
+                pad = shifted_time[:, -1:].expand(-1, first_pred.shape[1] - shifted_time.shape[1])
+                shifted_time = torch.cat([shifted_time, pad], dim=1)
+            shifted_time = shifted_time[:, : first_pred.shape[1]]
+        else:
+            shifted_time = None
+        composed_predictions = lagged_state_predictor(first_pred, time_ps=shifted_time)
         for second_lag in lags:
             total_lag = first_lag + second_lag
             if total_lag not in available or total_lag >= first_pred.shape[1]:

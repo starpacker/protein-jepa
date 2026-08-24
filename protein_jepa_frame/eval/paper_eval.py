@@ -152,18 +152,24 @@ def _move_tensor_batch(batch: dict, device: torch.device) -> dict:
     return out
 
 
-def _model_readout(model: ProteinJEPA, latents: torch.Tensor, residue_mask: torch.Tensor, readout: str) -> torch.Tensor:
+def _model_readout(
+    model: ProteinJEPA,
+    latents: torch.Tensor,
+    residue_mask: torch.Tensor,
+    readout: str,
+    time_ps: torch.Tensor | None = None,
+) -> torch.Tensor:
     valid = residue_mask.unsqueeze(-1).float()
     frame_mean = (latents * valid).sum(dim=2) / valid.sum(dim=2).clamp(min=1)
     last_mean = frame_mean[:, -1]
     if readout == "mean":
         return last_mean
-    states = model.encode_states(latents, residue_mask)
+    states = model.encode_states(latents, residue_mask, time_ps=time_ps)
     frame_states = states["frame_states"]
     last_state = frame_states[:, -1]
     clip_state = states["clip_state"]
     if readout == "kinetic":
-        kinetic = model.encode_kinetic_readout(latents, residue_mask)
+        kinetic = model.encode_kinetic_readout(latents, residue_mask, time_ps=time_ps)
         return kinetic[:, -1]
     if frame_states.shape[1] > 1:
         delta_state = frame_states[:, -1] - frame_states[:, -2]
@@ -184,7 +190,7 @@ def _model_readout(model: ProteinJEPA, latents: torch.Tensor, residue_mask: torc
     if readout == "state_clip_delta_mean":
         return torch.cat([last_state, clip_state, delta_state, last_mean], dim=-1)
     if readout in {"state_kinetic", "state_clip_kinetic", "state_clip_delta_kinetic"}:
-        kinetic = model.encode_kinetic_readout(latents, residue_mask)[:, -1]
+        kinetic = model.encode_kinetic_readout(latents, residue_mask, time_ps=time_ps)[:, -1]
         if readout == "state_kinetic":
             return torch.cat([last_state, kinetic], dim=-1)
         if readout == "state_clip_kinetic":
@@ -240,6 +246,7 @@ def extract_model_frame_sequences(
             latents,
             batch["residue_mask"],
             _geometry_fusion_base_readout(readout) if readout in GEOMETRY_FUSION_READOUTS else readout,
+            time_ps=batch.get("time_ps"),
         )
         if geom_features is not None:
             pooled = torch.cat([pooled, geom_features.to(dtype=pooled.dtype)], dim=-1)
@@ -901,19 +908,19 @@ def extract_clip_latents_with_labels(
             clip_valid = batch["residue_mask"].any(dim=2).unsqueeze(-1).float()
             clip_latents = (pooled * clip_valid).sum(dim=1) / clip_valid.sum(dim=1).clamp(min=1)
         elif readout == "state":
-            states = model.encode_states(latents, batch["residue_mask"])["frame_states"]
+            states = model.encode_states(latents, batch["residue_mask"], time_ps=batch.get("time_ps"))["frame_states"]
             clip_valid = batch["residue_mask"].any(dim=2).unsqueeze(-1).float()
             clip_latents = (states * clip_valid).sum(dim=1) / clip_valid.sum(dim=1).clamp(min=1)
         elif readout == "clip_state":
-            clip_latents = model.encode_states(latents, batch["residue_mask"])["clip_state"]
+            clip_latents = model.encode_states(latents, batch["residue_mask"], time_ps=batch.get("time_ps"))["clip_state"]
         elif readout == "kinetic":
-            kinetic = model.encode_kinetic_readout(latents, batch["residue_mask"])
+            kinetic = model.encode_kinetic_readout(latents, batch["residue_mask"], time_ps=batch.get("time_ps"))
             clip_valid = batch["residue_mask"].any(dim=2).unsqueeze(-1).float()
             clip_latents = (kinetic * clip_valid).sum(dim=1) / clip_valid.sum(dim=1).clamp(min=1)
         elif readout in {"state_kinetic", "state_clip_kinetic", "state_clip_delta_kinetic"}:
-            states_block = model.encode_states(latents, batch["residue_mask"])
+            states_block = model.encode_states(latents, batch["residue_mask"], time_ps=batch.get("time_ps"))
             states = states_block["frame_states"]
-            kinetic = model.encode_kinetic_readout(latents, batch["residue_mask"])
+            kinetic = model.encode_kinetic_readout(latents, batch["residue_mask"], time_ps=batch.get("time_ps"))
             clip_valid = batch["residue_mask"].any(dim=2).unsqueeze(-1).float()
             state_avg = (states * clip_valid).sum(dim=1) / clip_valid.sum(dim=1).clamp(min=1)
             kinetic_avg = (kinetic * clip_valid).sum(dim=1) / clip_valid.sum(dim=1).clamp(min=1)
@@ -928,7 +935,7 @@ def extract_clip_latents_with_labels(
             else:
                 clip_latents = torch.cat([state_avg, states_block["clip_state"], delta_state, kinetic_avg], dim=-1)
         elif readout in GEOMETRY_FUSION_READOUTS:
-            states_block = model.encode_states(latents, batch["residue_mask"])
+            states_block = model.encode_states(latents, batch["residue_mask"], time_ps=batch.get("time_ps"))
             states = states_block["frame_states"]
             clip_valid = batch["residue_mask"].any(dim=2).unsqueeze(-1).float()
             state_avg = (states * clip_valid).sum(dim=1) / clip_valid.sum(dim=1).clamp(min=1)
@@ -950,7 +957,7 @@ def extract_clip_latents_with_labels(
             "state_mean",
             "state_clip_delta_mean",
         }:
-            clip_latents = _model_readout(model, latents, batch["residue_mask"], readout)
+            clip_latents = _model_readout(model, latents, batch["residue_mask"], readout, time_ps=batch.get("time_ps"))
         else:
             raise ValueError(f"unknown model readout {readout}")
         for b in range(clip_latents.shape[0]):

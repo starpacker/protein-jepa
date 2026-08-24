@@ -3,6 +3,8 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
+from protein_jepa_frame.models.time_features import LogTimeEmbedding, lag_delta_time, relative_clip_time
+
 
 class SpatiotemporalPredictor(nn.Module):
     """Transformer predictor over visible and target `[time, residue]` tokens."""
@@ -15,12 +17,20 @@ class SpatiotemporalPredictor(nn.Module):
         dropout: float = 0.1,
         max_frames: int = 256,
         max_residues: int = 4096,
+        time_conditioning: str = "none",
     ):
         super().__init__()
+        self.time_conditioning = time_conditioning
         self.mask_token = nn.Parameter(torch.zeros(1, 1, 1, latent_dim))
         self.time_embed = nn.Embedding(max_frames, latent_dim)
         self.residue_embed = nn.Embedding(max_residues, latent_dim)
         self.chain_embed = nn.Embedding(128, latent_dim)
+        if time_conditioning == "none":
+            self.physical_time_embed = None
+        elif time_conditioning == "physical":
+            self.physical_time_embed = LogTimeEmbedding(latent_dim)
+        else:
+            raise ValueError(f"unknown time_conditioning {time_conditioning}")
         layer = nn.TransformerEncoderLayer(
             d_model=latent_dim,
             nhead=num_heads,
@@ -42,6 +52,7 @@ class SpatiotemporalPredictor(nn.Module):
         target_mask: torch.Tensor,
         residue_index: torch.Tensor,
         chain_id: torch.Tensor,
+        time_ps: torch.Tensor | None = None,
     ) -> torch.Tensor:
         B, T, L, D = context_latents.shape
         time_pos = torch.arange(T, device=context_latents.device).clamp(max=self.time_embed.num_embeddings - 1)
@@ -52,6 +63,9 @@ class SpatiotemporalPredictor(nn.Module):
             + self.residue_embed(residue_pos).view(B, 1, L, D)
             + self.chain_embed(chain_pos).view(B, 1, L, D)
         )
+        relative_time = relative_clip_time(time_ps)
+        if self.physical_time_embed is not None and relative_time is not None:
+            pos = pos + self.physical_time_embed(relative_time).view(B, T, 1, D)
         x = context_latents * context_mask.unsqueeze(-1).float()
         x = x + self.mask_token * target_mask.unsqueeze(-1).float()
         x = x + pos
@@ -73,10 +87,18 @@ class StatePredictor(nn.Module):
         num_heads: int = 4,
         dropout: float = 0.1,
         max_frames: int = 256,
+        time_conditioning: str = "none",
     ):
         super().__init__()
+        self.time_conditioning = time_conditioning
         self.mask_token = nn.Parameter(torch.zeros(1, 1, latent_dim))
         self.time_embed = nn.Embedding(max_frames, latent_dim)
+        if time_conditioning == "none":
+            self.physical_time_embed = None
+        elif time_conditioning == "physical":
+            self.physical_time_embed = LogTimeEmbedding(latent_dim)
+        else:
+            raise ValueError(f"unknown time_conditioning {time_conditioning}")
         layer = nn.TransformerEncoderLayer(
             d_model=latent_dim,
             nhead=num_heads,
@@ -96,6 +118,7 @@ class StatePredictor(nn.Module):
         context_states: torch.Tensor,
         context_frame_mask: torch.Tensor,
         target_frame_mask: torch.Tensor,
+        time_ps: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if context_states.dim() != 3:
             raise ValueError("context_states must be [B,T,D]")
@@ -104,6 +127,9 @@ class StatePredictor(nn.Module):
         x = context_states * context_frame_mask.unsqueeze(-1).float()
         x = x + self.mask_token * target_frame_mask.unsqueeze(-1).float()
         x = x + self.time_embed(time_pos).view(1, T, D)
+        relative_time = relative_clip_time(time_ps)
+        if self.physical_time_embed is not None and relative_time is not None:
+            x = x + self.physical_time_embed(relative_time)
         token_valid = context_frame_mask | target_frame_mask
         x = self.blocks(x, src_key_padding_mask=~token_valid)
         return self.proj(self.norm(x))
@@ -119,18 +145,26 @@ class LaggedStatePredictor(nn.Module):
         depth: int = 2,
         dropout: float = 0.1,
         conditioning: str = "none",
+        time_conditioning: str = "none",
     ):
         super().__init__()
         if any(lag <= 0 for lag in lags):
             raise ValueError("state prediction lags must be positive")
         self.lags = tuple(int(lag) for lag in lags)
         self.conditioning = conditioning
+        self.time_conditioning = time_conditioning
         if conditioning == "none":
             self.lag_embed = None
         elif conditioning == "embedding":
             self.lag_embed = nn.Embedding(max(self.lags) + 1, latent_dim)
         else:
             raise ValueError(f"unknown lag conditioning {conditioning}")
+        if time_conditioning == "none":
+            self.physical_lag_embed = None
+        elif time_conditioning == "physical":
+            self.physical_lag_embed = LogTimeEmbedding(latent_dim)
+        else:
+            raise ValueError(f"unknown time_conditioning {time_conditioning}")
         hidden = latent_dim * 2
         layers: list[nn.Module] = [nn.LayerNorm(latent_dim), nn.Linear(latent_dim, hidden), nn.GELU(), nn.Dropout(dropout)]
         for _ in range(max(0, depth - 1)):
@@ -138,16 +172,21 @@ class LaggedStatePredictor(nn.Module):
         self.trunk = nn.Sequential(*layers)
         self.heads = nn.ModuleDict({str(lag): nn.Linear(hidden, latent_dim) for lag in self.lags})
 
-    def forward(self, frame_states: torch.Tensor) -> dict[int, torch.Tensor]:
+    def forward(self, frame_states: torch.Tensor, time_ps: torch.Tensor | None = None) -> dict[int, torch.Tensor]:
         if frame_states.dim() != 3:
             raise ValueError("frame_states must be [B,T,D]")
-        if self.lag_embed is None:
-            h = self.trunk(frame_states)
-            return {lag: self.heads[str(lag)](h) for lag in self.lags}
         out = {}
+        B, T, _ = frame_states.shape
         for lag in self.lags:
-            lag_id = torch.tensor(lag, device=frame_states.device, dtype=torch.long)
-            conditioned = frame_states + self.lag_embed(lag_id).view(1, 1, -1)
+            conditioned = frame_states
+            if self.lag_embed is not None:
+                lag_id = torch.tensor(lag, device=frame_states.device, dtype=torch.long)
+                conditioned = conditioned + self.lag_embed(lag_id).view(1, 1, -1)
+            if self.physical_lag_embed is not None:
+                delta_time = lag_delta_time(time_ps, lag, T, frame_states.device)
+                if delta_time.shape[0] == 1 and B > 1:
+                    delta_time = delta_time.expand(B, -1)
+                conditioned = conditioned + self.physical_lag_embed(delta_time)
             out[lag] = self.heads[str(lag)](self.trunk(conditioned))
         return out
 

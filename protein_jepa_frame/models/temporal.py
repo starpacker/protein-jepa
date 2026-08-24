@@ -3,6 +3,8 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
+from protein_jepa_frame.models.time_features import LogTimeEmbedding, relative_clip_time
+
 
 class KineticQueryFramePooler(nn.Module):
     """Per-frame residue attention pooler for local kinetic signals."""
@@ -50,8 +52,10 @@ class TemporalStateEncoder(nn.Module):
         max_frames: int = 256,
         frame_pooling: str = "mean",
         frame_pool_queries: int = 4,
+        time_conditioning: str = "none",
     ):
         super().__init__()
+        self.time_conditioning = time_conditioning
         self.frame_pooling = frame_pooling
         if frame_pooling == "mean":
             self.frame_pooler = None
@@ -64,6 +68,12 @@ class TemporalStateEncoder(nn.Module):
             self.frame_pool_gate = nn.Parameter(torch.zeros(latent_dim))
         else:
             raise ValueError(f"unknown frame_pooling {frame_pooling}")
+        if time_conditioning == "none":
+            self.physical_time_embed = None
+        elif time_conditioning == "physical":
+            self.physical_time_embed = LogTimeEmbedding(latent_dim)
+        else:
+            raise ValueError(f"unknown time_conditioning {time_conditioning}")
         self.time_embed = nn.Embedding(max_frames, latent_dim)
         self.cls_token = nn.Parameter(torch.zeros(1, 1, latent_dim))
         layer = nn.TransformerEncoderLayer(
@@ -79,7 +89,12 @@ class TemporalStateEncoder(nn.Module):
         self.norm = nn.LayerNorm(latent_dim)
         nn.init.normal_(self.cls_token, std=0.02)
 
-    def forward(self, residue_latents: torch.Tensor, residue_mask: torch.Tensor) -> dict[str, torch.Tensor]:
+    def forward(
+        self,
+        residue_latents: torch.Tensor,
+        residue_mask: torch.Tensor,
+        time_ps: torch.Tensor | None = None,
+    ) -> dict[str, torch.Tensor]:
         if residue_latents.dim() != 4:
             raise ValueError("residue_latents must be [B,T,L,D]")
         B, T, _, D = residue_latents.shape
@@ -94,6 +109,9 @@ class TemporalStateEncoder(nn.Module):
             frame_latents = mean_latents + self.frame_pool_gate.view(1, 1, D) * update
         time_pos = torch.arange(T, device=residue_latents.device).clamp(max=self.time_embed.num_embeddings - 1)
         x = frame_latents + self.time_embed(time_pos).view(1, T, D)
+        relative_time = relative_clip_time(time_ps)
+        if self.physical_time_embed is not None and relative_time is not None:
+            x = x + self.physical_time_embed(relative_time)
         cls = self.cls_token.expand(B, 1, D)
         x = torch.cat([cls, x], dim=1)
         frame_valid = residue_mask.any(dim=2)
