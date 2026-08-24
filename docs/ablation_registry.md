@@ -38,12 +38,13 @@ Only variants that improve the aligned evaluation metrics should be promoted.
 | Scratch stop-gradient kinetic head 20k, state+clip+kinetic readout | VAMP dim5 0.5512, MSM 0.5267, linear R2 0.4949 | Do not promote |
 | Scratch linear dynamics auxiliary 20k, state readout | VAMP dim5 0.5701, but MSM 0.5405 and linear R2 0.3659 | Do not promote |
 | Scratch linear dynamics auxiliary 20k, state+clip readout | VAMP dim5 0.5583, MSM 0.5148, linear R2 0.5325 | Do not promote |
+| ATLAS-PILOT300 mixed-data scratch 20k | Paired eval: VAMP dim5 0.5370 vs baseline 0.5757, MSM 0.5614 vs 0.5646, linear R2 0.4019 vs 0.5378 | Do not promote |
 
 ## Active Candidates
 
 | ID | Change | Config | Status | Decision |
 | --- | --- | --- | --- | --- |
-| ATLAS-PILOT300 | From-scratch champion architecture trained on mdCATH train plus 300 materialized ATLAS replicas | `configs/mdcath_atlas_pilot300_state_jepa_multilag_scratch20k.yaml` | Launching | Pending eval |
+| None | - | - | - | - |
 
 ## Promotion Rule
 
