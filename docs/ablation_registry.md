@@ -27,14 +27,14 @@ Only variants that improve the aligned evaluation metrics should be promoted.
 | Residual kinetic-query pooling warm-start | No clear gain over mean continue control | Do not promote |
 | Kinetic-query pooling from scratch 20k | VAMP dim5 0.5649, MSM 0.5251, linear R2 0.3678 | Do not promote |
 | Kinetic readout only | Kinetic readout improves VAMP but hurts MSM/linear dynamics | Keep as diagnostic, not champion |
+| Time-scale conditioned multi-lag predictor 10k | VAMP dim5 0.5650 and MSM 0.5649, but linear R2 drops to 0.4846 | Do not promote |
 
 ## Active Candidates
 
 | ID | Change | Config | Status | Decision |
 | --- | --- | --- | --- | --- |
-| TSC-ML | Time-scale conditioned multi-lag predictor | `configs/mdcath_state_jepa_multilag_time_conditioned_10k.yaml` | Implementing | Pending eval |
-| SG-KIN-FUSE | Stop-gradient VAMPNet kinetic head with `state_kinetic` fusion readout | `configs/mdcath_state_jepa_multilag_stopgrad_kinetic_readout_5k.yaml` | Implemented, queued after TSC-ML | Pending eval |
-| STATE-GEOM | Concatenate temporal state with deterministic geometry/physchem statistics | eval readouts `state_geom`, `state_clip_geom`, `state_clip_delta_geom` | Implemented, queued after SG-KIN-FUSE | Pending eval |
+| SG-KIN-FUSE | Stop-gradient VAMPNet kinetic head with `state_kinetic` fusion readout | `configs/mdcath_state_jepa_multilag_stopgrad_kinetic_readout_5k.yaml` | Training | Pending eval |
+| STATE-GEOM | Concatenate temporal state with deterministic geometry/physchem statistics | eval readouts `state_geom`, `state_clip_geom`, `state_clip_delta_geom` | Queued after SG-KIN-FUSE | Pending eval |
 
 ## Promotion Rule
 
