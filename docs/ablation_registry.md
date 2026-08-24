@@ -38,8 +38,8 @@ Only variants that improve the aligned evaluation metrics should be promoted.
 
 | ID | Change | Config | Status | Decision |
 | --- | --- | --- | --- | --- |
-| SG-KIN-FUSE | Stop-gradient VAMPNet kinetic head with `state_kinetic` fusion readout | `configs/mdcath_state_jepa_multilag_stopgrad_kinetic_readout_5k.yaml` | Evaluated | Not promoted |
-| STATE-GEOM | Concatenate temporal state with deterministic geometry/physchem statistics | eval readouts `state_geom`, `state_clip_geom`, `state_clip_delta_geom` | Evaluated | Not promoted |
+| SCRATCH-SG-KIN | From-scratch multi-lag JEPA with stop-gradient VAMPNet kinetic readout | `configs/mdcath_state_jepa_multilag_scratch_sg_kinetic_balanced20k.yaml` | Implemented | Pending eval |
+| SCRATCH-LIN | From-scratch multi-lag JEPA with low-weight linear dynamics auxiliary | `configs/mdcath_state_jepa_multilag_scratch_linear_balanced20k.yaml` | Implemented | Pending eval |
 
 ## Promotion Rule
 
