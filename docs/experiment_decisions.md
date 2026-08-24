@@ -1,5 +1,14 @@
 # Experiment Decisions
 
+## Phase 1 Freeze
+
+The Phase 1 result is summarized in `docs/phase1_summary.md`.
+
+Current decision: keep `configs/mdcath_state_jepa_multilag.yaml` with
+`artifacts/mdcath_state_jepa_multilag/checkpoint_step20000.pt` as the champion
+and Phase 2 baseline. Later ablations improved isolated metrics, but none beat
+the champion under the promotion rule.
+
 ## Current Champion
 
 Use the old multi-lag contextual JEPA checkpoint as the current main model:
