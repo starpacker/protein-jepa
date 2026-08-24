@@ -33,13 +33,17 @@ Only variants that improve the aligned evaluation metrics should be promoted.
 | Stop-gradient kinetic head, state+clip+kinetic readout | VAMP dim5 0.5651 and linear R2 rises to 0.6066, but MSM drops sharply to 0.5185 | Promising diagnostic, not champion |
 | Stop-gradient kinetic head, state+clip+delta+kinetic readout | Lower VAMP/MSM/linear dynamics than champion | Do not promote |
 | State+geometry fusion readouts | State-clip-geometry improves linear R2 to 0.5638, but all geometry fusion readouts hurt VAMP/MSM | Do not promote |
+| Scratch stop-gradient kinetic head 20k, state readout | VAMP dim5 0.5626, MSM 0.5469, linear R2 0.4117 | Do not promote |
+| Scratch stop-gradient kinetic head 20k, state+kinetic readout | VAMP dim5 0.5482, MSM 0.5477, linear R2 0.4102 | Do not promote |
+| Scratch stop-gradient kinetic head 20k, state+clip+kinetic readout | VAMP dim5 0.5512, MSM 0.5267, linear R2 0.4949 | Do not promote |
+| Scratch linear dynamics auxiliary 20k, state readout | VAMP dim5 0.5701, but MSM 0.5405 and linear R2 0.3659 | Do not promote |
+| Scratch linear dynamics auxiliary 20k, state+clip readout | VAMP dim5 0.5583, MSM 0.5148, linear R2 0.5325 | Do not promote |
 
 ## Active Candidates
 
 | ID | Change | Config | Status | Decision |
 | --- | --- | --- | --- | --- |
-| SCRATCH-SG-KIN | From-scratch multi-lag JEPA with stop-gradient VAMPNet kinetic readout | `configs/mdcath_state_jepa_multilag_scratch_sg_kinetic_balanced20k.yaml` | Implemented | Pending eval |
-| SCRATCH-LIN | From-scratch multi-lag JEPA with low-weight linear dynamics auxiliary | `configs/mdcath_state_jepa_multilag_scratch_linear_balanced20k.yaml` | Implemented | Pending eval |
+| ATLAS-PILOT300 | From-scratch champion architecture trained on mdCATH train plus 300 materialized ATLAS replicas | `configs/mdcath_atlas_pilot300_state_jepa_multilag_scratch20k.yaml` | Launching | Pending eval |
 
 ## Promotion Rule
 
