@@ -38,6 +38,41 @@ class LogTimeEmbedding(nn.Module):
         return self.proj(features)
 
 
+class ThermodynamicConditionEmbedding(nn.Module):
+    """Embed temperature and coarse simulation-domain metadata."""
+
+    def __init__(self, latent_dim: int, num_datasets: int = 8):
+        super().__init__()
+        self.temperature_proj = nn.Sequential(
+            nn.Linear(2, latent_dim),
+            nn.GELU(),
+            nn.LayerNorm(latent_dim),
+        )
+        self.dataset_embed = nn.Embedding(num_datasets, latent_dim)
+
+    def forward(
+        self,
+        temperature_k: torch.Tensor | None,
+        dataset_index: torch.Tensor | None,
+        batch_size: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        if temperature_k is None:
+            temperature_k = torch.full((batch_size,), 300.0, device=device, dtype=dtype)
+        else:
+            temperature_k = torch.nan_to_num(temperature_k.to(device=device, dtype=dtype), nan=300.0)
+        scaled_temperature = (temperature_k - 300.0) / 100.0
+        inverse_temperature = 300.0 / temperature_k.clamp(min=1.0) - 1.0
+        temperature_features = torch.stack([scaled_temperature, inverse_temperature], dim=-1)
+        if dataset_index is None:
+            dataset_index = torch.zeros(batch_size, device=device, dtype=torch.long)
+        else:
+            dataset_index = dataset_index.to(device=device, dtype=torch.long)
+        dataset_index = dataset_index.clamp(min=0, max=self.dataset_embed.num_embeddings - 1)
+        return self.temperature_proj(temperature_features) + self.dataset_embed(dataset_index)
+
+
 def relative_clip_time(time_ps: torch.Tensor | None) -> torch.Tensor | None:
     if time_ps is None:
         return None

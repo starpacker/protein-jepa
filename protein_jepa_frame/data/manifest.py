@@ -15,6 +15,7 @@ class TrajectoryRecord:
     num_frames: int | None = None
     frame_interval_ps: float | None = None
     first_frame_time_ps: float = 0.0
+    temperature_k: float | None = None
     replica_id: str = ""
     dataset: str = ""
     domain_id: str = ""
@@ -32,6 +33,10 @@ def load_manifest(path: str | Path) -> list[TrajectoryRecord]:
         data_path = raw.get("npz_path") or raw.get("h5_path") or raw.get("trajectory_path")
         if data_path is None:
             raise ValueError(f"{path}:{line_no} missing npz_path/h5_path/trajectory_path")
+        dataset = str(raw.get("dataset", ""))
+        temperature_k = raw.get("temperature_k")
+        if temperature_k is None and dataset.lower() == "atlas":
+            temperature_k = 300.0
         records.append(
             TrajectoryRecord(
                 path=Path(data_path),
@@ -41,8 +46,9 @@ def load_manifest(path: str | Path) -> list[TrajectoryRecord]:
                 num_frames=raw.get("num_frames"),
                 frame_interval_ps=raw.get("frame_interval_ps"),
                 first_frame_time_ps=float(raw.get("first_frame_time_ps") or 0.0),
+                temperature_k=float(temperature_k) if temperature_k is not None else None,
                 replica_id=str(raw.get("replica_id", "")),
-                dataset=str(raw.get("dataset", "")),
+                dataset=dataset,
                 domain_id=str(raw.get("domain_id") or raw.get("protein_id") or ""),
                 metadata=raw.get("metadata") or {},
             )

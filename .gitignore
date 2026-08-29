@@ -6,3 +6,4 @@ artifacts/
 *.egg-info/
 *.log
 *.out
+manifests/*.jsonl

@@ -8,8 +8,9 @@ from protein_jepa_frame.config import MaskConfig
 class SpatiotemporalBlockMasker:
     """V-JEPA-style block masker over `[time, residue]` tokens."""
 
-    def __init__(self, config: MaskConfig):
+    def __init__(self, config: MaskConfig, required_future_horizon: int = 0):
         self.config = config
+        self.required_future_horizon = max(0, int(required_future_horizon))
 
     @staticmethod
     def _sample_span(size: int, scale: tuple[float, float], device: torch.device) -> int:
@@ -81,6 +82,8 @@ class SpatiotemporalBlockMasker:
             else:
                 t0 = int(torch.randint(target_start_min, max_start + 1, (), device=device))
             context_end = max(1, t0 - gap)
+            if self.required_future_horizon > 0:
+                context_end = min(context_end, max(1, T - self.required_future_horizon))
             context[b, :context_end] = residue_mask[b, :context_end]
             target[b, t0 : t0 + t_span] = residue_mask[b, t0 : t0 + t_span]
             if target[b].sum() == 0 and t0 < T:

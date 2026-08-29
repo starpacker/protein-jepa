@@ -10,13 +10,18 @@ from protein_jepa_frame.models.jepa import (
     ProteinJEPA,
     jepa_loss,
     lagged_state_jepa_loss,
+    lagged_state_jepa_terms,
     lagged_state_semigroup_loss,
+    lagged_state_semigroup_terms,
     linear_dynamics_jepa_loss,
     physchem_prediction_loss,
     state_jepa_loss,
+    state_covariance_regularizer,
+    state_feature_variance_regularizer,
     state_transition_jepa_loss,
 )
-from protein_jepa_frame.training.train import train
+from protein_jepa_frame.training.train import _load_init_checkpoint, _load_resume_checkpoint, _save_checkpoint, train
+from protein_jepa_frame.models.temporal import TemporalStateEncoder
 
 
 def test_model_forward_loss_is_finite():
@@ -31,6 +36,36 @@ def test_model_forward_loss_is_finite():
 
     assert torch.isfinite(loss)
     assert outputs["predictions"].shape == outputs["targets"].shape
+
+
+def test_ema_target_encoders_remain_deterministic_in_train_mode():
+    data_cfg = DataConfig(batch_size=2, num_frames=8, synthetic_size=4, synthetic_residues=16)
+    dataset = SyntheticProteinDynamicsDataset(data_cfg)
+    batch = next(iter(DataLoader(dataset, batch_size=2, collate_fn=collate_clips)))
+    context, target = SpatiotemporalBlockMasker(
+        MaskConfig(mode="future", temporal_scale=(0.5, 0.5), future_context_ratio=0.5)
+    )(batch["residue_mask"])
+    model = ProteinJEPA(
+        ModelConfig(
+            latent_dim=32,
+            encoder_depth=1,
+            temporal_depth=1,
+            predictor_depth=1,
+            state_predictor_depth=1,
+            dropout=0.5,
+            num_heads=4,
+            num_rbf=8,
+        )
+    )
+    model.train()
+
+    first = model(batch, context, target)
+    second = model(batch, context, target)
+
+    assert not model.target_encoder.training
+    assert not model.target_temporal_encoder.training
+    assert torch.equal(first["targets"], second["targets"])
+    assert torch.equal(first["state_targets"], second["state_targets"])
 
 
 def test_temporal_state_encoder_forward_loss_is_finite():
@@ -187,6 +222,45 @@ def test_lagged_state_jepa_trains_lag_predictor():
     assert any(g is not None and torch.isfinite(g).all() and g.abs().sum() > 0 for g in lag_grads)
 
 
+def test_lagged_state_jepa_supervises_short_lags_across_future_gap():
+    data_cfg = DataConfig(batch_size=2, num_frames=24, synthetic_size=4, synthetic_residues=8)
+    dataset = SyntheticProteinDynamicsDataset(data_cfg)
+    batch = next(iter(DataLoader(dataset, batch_size=2, collate_fn=collate_clips)))
+    context, target = SpatiotemporalBlockMasker(
+        MaskConfig(
+            mode="future",
+            temporal_scale=(0.25, 0.5),
+            future_context_ratio=0.5,
+            future_gap_frames=4,
+        ),
+        required_future_horizon=12,
+    )(batch["residue_mask"])
+    model = ProteinJEPA(
+        ModelConfig(
+            latent_dim=16,
+            encoder_depth=1,
+            temporal_depth=1,
+            predictor_depth=1,
+            state_predictor_depth=1,
+            state_prediction_lags=(1, 2, 4, 8, 12),
+            lag_predictor_depth=1,
+            num_heads=4,
+            num_rbf=8,
+        )
+    )
+
+    outputs = model(batch, context, target)
+    terms = lagged_state_jepa_terms(outputs)
+    loss = lagged_state_jepa_loss(outputs)
+    loss.backward()
+
+    assert set(terms) == {1, 2, 4, 8, 12}
+    assert all(term["pairs"] == 2 for term in terms.values())
+    for lag in terms:
+        grads = [p.grad for p in model.lagged_state_predictor.heads[str(lag)].parameters()]
+        assert any(g is not None and torch.isfinite(g).all() and g.abs().sum() > 0 for g in grads)
+
+
 def test_time_conditioned_lagged_state_jepa_trains_lag_embedding():
     data_cfg = DataConfig(batch_size=2, num_frames=8, synthetic_size=4, synthetic_residues=16)
     dataset = SyntheticProteinDynamicsDataset(data_cfg)
@@ -260,6 +334,273 @@ def test_physical_time_conditioning_trains_time_embeddings():
     )
     assert lag_predictor_grad is not None and torch.isfinite(lag_predictor_grad).all()
     assert lag_predictor_grad.abs().sum() > 0
+
+
+def test_thermodynamic_conditioning_trains_temperature_and_dataset_embeddings():
+    data_cfg = DataConfig(batch_size=2, num_frames=8, synthetic_size=4, synthetic_residues=16)
+    dataset = SyntheticProteinDynamicsDataset(data_cfg)
+    batch = next(iter(DataLoader(dataset, batch_size=2, collate_fn=collate_clips)))
+    batch["temperature_k"] = torch.tensor([300.0, 450.0])
+    batch["dataset_index"] = torch.tensor([1, 2])
+    context, target = SpatiotemporalBlockMasker(
+        MaskConfig(mode="future", temporal_scale=(0.5, 0.5), future_context_ratio=0.5)
+    )(batch["residue_mask"])
+    model = ProteinJEPA(
+        ModelConfig(
+            latent_dim=32,
+            encoder_depth=1,
+            temporal_depth=1,
+            predictor_depth=1,
+            state_predictor_depth=1,
+            thermodynamic_conditioning=True,
+            num_heads=4,
+            num_rbf=8,
+        )
+    )
+
+    outputs = model(batch, context, target)
+    loss = state_jepa_loss(outputs)
+    loss.backward()
+
+    condition = model.temporal_encoder.condition_embed
+    assert torch.isfinite(loss)
+    assert condition.temperature_proj[0].weight.grad is not None
+    assert condition.temperature_proj[0].weight.grad.abs().sum() > 0
+    assert condition.dataset_embed.weight.grad is not None
+    assert condition.dataset_embed.weight.grad.abs().sum() > 0
+
+
+def test_causal_temporal_states_do_not_depend_on_future_frames():
+    encoder = TemporalStateEncoder(
+        latent_dim=16,
+        depth=2,
+        num_heads=4,
+        dropout=0.0,
+        causal=True,
+        delta_features=True,
+    )
+    encoder.eval()
+    latents = torch.randn(2, 8, 6, 16)
+    residue_mask = torch.ones(2, 8, 6, dtype=torch.bool)
+    perturbed = latents.clone()
+    perturbed[:, 4:] += 100.0 * torch.randn_like(perturbed[:, 4:])
+
+    with torch.no_grad():
+        original = encoder(latents, residue_mask)["frame_states"]
+        changed = encoder(perturbed, residue_mask)["frame_states"]
+
+    assert torch.allclose(original[:, :4], changed[:, :4], atol=1e-5)
+    assert not torch.allclose(original[:, 4:], changed[:, 4:], atol=1e-5)
+
+
+def test_position_free_temporal_state_does_not_encode_clip_index_for_static_frames():
+    encoder = TemporalStateEncoder(
+        latent_dim=16,
+        depth=2,
+        num_heads=4,
+        dropout=0.0,
+        causal=True,
+        position_encoding="none",
+    )
+    encoder.eval()
+    frame = torch.randn(2, 1, 6, 16)
+    latents = frame.expand(-1, 8, -1, -1).clone()
+    residue_mask = torch.ones(2, 8, 6, dtype=torch.bool)
+
+    with torch.no_grad():
+        states = encoder(latents, residue_mask)["frame_states"]
+
+    assert torch.allclose(states, states[:, :1].expand_as(states), atol=1e-5)
+
+
+def test_state_feature_regularizers_train_causal_temporal_encoder():
+    data_cfg = DataConfig(batch_size=2, num_frames=8, synthetic_size=4, synthetic_residues=16)
+    dataset = SyntheticProteinDynamicsDataset(data_cfg)
+    batch = next(iter(DataLoader(dataset, batch_size=2, collate_fn=collate_clips)))
+    context, target = SpatiotemporalBlockMasker(
+        MaskConfig(mode="future", temporal_scale=(0.5, 0.5), future_context_ratio=0.5)
+    )(batch["residue_mask"])
+    model = ProteinJEPA(
+        ModelConfig(
+            latent_dim=32,
+            encoder_depth=1,
+            temporal_depth=2,
+            predictor_depth=1,
+            state_predictor_depth=1,
+            temporal_causal=True,
+            temporal_delta_features=True,
+            num_heads=4,
+            num_rbf=8,
+        )
+    )
+
+    outputs = model(batch, context, target)
+    variance = state_feature_variance_regularizer(outputs)
+    covariance = state_covariance_regularizer(outputs)
+    (variance + covariance).backward()
+
+    assert torch.isfinite(variance)
+    assert torch.isfinite(covariance)
+    assert model.temporal_encoder.delta_proj[1].weight.grad is not None
+    assert model.temporal_encoder.delta_proj[1].weight.grad.abs().sum() > 0
+
+
+def test_motion_transition_is_decoupled_from_slow_state_encoder():
+    data_cfg = DataConfig(batch_size=2, num_frames=8, synthetic_size=4, synthetic_residues=16)
+    dataset = SyntheticProteinDynamicsDataset(data_cfg)
+    batch = next(iter(DataLoader(dataset, batch_size=2, collate_fn=collate_clips)))
+    batch["temperature_k"] = torch.tensor([320.0, 450.0])
+    context, target = SpatiotemporalBlockMasker(
+        MaskConfig(mode="future", temporal_scale=(0.5, 0.5), future_context_ratio=0.5),
+        required_future_horizon=4,
+    )(batch["residue_mask"])
+    model = ProteinJEPA(
+        ModelConfig(
+            latent_dim=32,
+            encoder_depth=1,
+            temporal_depth=2,
+            predictor_depth=1,
+            state_predictor_depth=1,
+            state_prediction_lags=(1, 2, 4),
+            motion_depth=1,
+            motion_stopgrad_input=True,
+            transition_source="motion",
+            transition_thermodynamic_conditioning=True,
+            temporal_causal=True,
+            num_heads=4,
+            num_rbf=8,
+        )
+    )
+
+    outputs = model(batch, context, target)
+    loss = lagged_state_jepa_loss(outputs)
+    loss.backward()
+
+    motion_grads = [p.grad for p in model.temporal_encoder.motion_blocks.parameters() if p.requires_grad]
+    slow_grads = [p.grad for p in model.temporal_encoder.blocks.parameters() if p.requires_grad]
+    spatial_grads = [p.grad for p in model.context_encoder.parameters() if p.requires_grad]
+    condition_grad = model.lagged_state_predictor.condition_embed.temperature_proj[0].weight.grad
+    assert outputs["motion_states"].shape == outputs["frame_states"].shape
+    assert any(g is not None and g.abs().sum() > 0 for g in motion_grads)
+    assert all(g is None or g.abs().sum() == 0 for g in slow_grads)
+    assert all(g is None or g.abs().sum() == 0 for g in spatial_grads)
+    assert condition_grad is not None and condition_grad.abs().sum() > 0
+
+
+def test_state_motion_residual_transition_starts_as_identity_and_preserves_gradient_split():
+    data_cfg = DataConfig(batch_size=2, num_frames=8, synthetic_size=4, synthetic_residues=16)
+    dataset = SyntheticProteinDynamicsDataset(data_cfg)
+    batch = next(iter(DataLoader(dataset, batch_size=2, collate_fn=collate_clips)))
+    context, target = SpatiotemporalBlockMasker(
+        MaskConfig(mode="future", temporal_scale=(0.5, 0.5), future_context_ratio=0.5),
+        required_future_horizon=4,
+    )(batch["residue_mask"])
+    model = ProteinJEPA(
+        ModelConfig(
+            latent_dim=32,
+            encoder_depth=1,
+            temporal_depth=2,
+            predictor_depth=1,
+            state_predictor_depth=1,
+            state_prediction_lags=(1, 2, 4),
+            lag_predictor_depth=1,
+            lag_prediction_mode="residual",
+            motion_depth=1,
+            motion_stopgrad_input=True,
+            transition_source="state_motion",
+            temporal_causal=True,
+            dropout=0.0,
+            num_heads=4,
+            num_rbf=8,
+        )
+    )
+
+    outputs = model(batch, context, target)
+    assert torch.isfinite(outputs["target_state_motion_states"]).all()
+    assert torch.equal(outputs["lagged_state_targets"], outputs["target_state_motion_states"])
+    for prediction in outputs["lagged_state_predictions"].values():
+        assert torch.allclose(prediction, outputs["transition_states"])
+    assert lagged_state_semigroup_loss(outputs, model.lagged_state_predictor).item() == 0.0
+
+    loss = lagged_state_jepa_loss(outputs)
+    loss.backward()
+    motion_grad = model.temporal_encoder.motion_gate.grad
+    slow_grads = [p.grad for p in model.temporal_encoder.blocks.parameters() if p.requires_grad]
+    spatial_grads = [p.grad for p in model.context_encoder.parameters() if p.requires_grad]
+    assert motion_grad is not None and motion_grad.abs().sum() > 0
+    assert all(g is None or g.abs().sum() == 0 for g in slow_grads)
+    assert all(g is None or g.abs().sum() == 0 for g in spatial_grads)
+
+
+def test_state_transition_uses_normalized_closed_state_and_backpropagates():
+    data_cfg = DataConfig(batch_size=2, num_frames=8, synthetic_size=4, synthetic_residues=16)
+    dataset = SyntheticProteinDynamicsDataset(data_cfg)
+    batch = next(iter(DataLoader(dataset, batch_size=2, collate_fn=collate_clips)))
+    context, target = SpatiotemporalBlockMasker(
+        MaskConfig(mode="future", temporal_scale=(0.5, 0.5), future_context_ratio=0.5),
+        required_future_horizon=4,
+    )(batch["residue_mask"])
+    model = ProteinJEPA(
+        ModelConfig(
+            latent_dim=32,
+            encoder_depth=1,
+            temporal_depth=2,
+            predictor_depth=1,
+            state_predictor_depth=1,
+            state_prediction_lags=(1, 2, 4),
+            lag_predictor_depth=1,
+            lag_prediction_mode="residual",
+            transition_source="state",
+            temporal_causal=True,
+            dropout=0.0,
+            num_heads=4,
+            num_rbf=8,
+        )
+    )
+
+    outputs = model(batch, context, target)
+    expected_source = torch.nn.functional.layer_norm(
+        outputs["frame_states"], (outputs["frame_states"].shape[-1],)
+    )
+    assert torch.allclose(outputs["transition_states"], expected_source, atol=1.0e-6)
+    assert torch.equal(outputs["lagged_state_targets"], outputs["state_targets"])
+
+    loss = lagged_state_jepa_loss(outputs)
+    loss.backward()
+    temporal_grads = [p.grad for p in model.temporal_encoder.blocks.parameters() if p.requires_grad]
+    spatial_grads = [p.grad for p in model.context_encoder.parameters() if p.requires_grad]
+    assert torch.isfinite(loss)
+    assert any(g is not None and torch.isfinite(g).all() and g.abs().sum() > 0 for g in temporal_grads)
+    assert any(g is not None and torch.isfinite(g).all() and g.abs().sum() > 0 for g in spatial_grads)
+
+
+def test_semigroup_is_disabled_for_motion_to_state_predictor():
+    data_cfg = DataConfig(batch_size=2, num_frames=8, synthetic_size=4, synthetic_residues=16)
+    dataset = SyntheticProteinDynamicsDataset(data_cfg)
+    batch = next(iter(DataLoader(dataset, batch_size=2, collate_fn=collate_clips)))
+    context, target = SpatiotemporalBlockMasker(
+        MaskConfig(mode="future", temporal_scale=(0.5, 0.5), future_context_ratio=0.5),
+        required_future_horizon=4,
+    )(batch["residue_mask"])
+    model = ProteinJEPA(
+        ModelConfig(
+            latent_dim=32,
+            encoder_depth=1,
+            temporal_depth=1,
+            predictor_depth=1,
+            state_predictor_depth=1,
+            state_prediction_lags=(1, 2, 4),
+            motion_depth=1,
+            motion_stopgrad_input=True,
+            transition_source="motion",
+            num_heads=4,
+            num_rbf=8,
+        )
+    )
+
+    outputs = model(batch, context, target)
+    assert lagged_state_semigroup_terms(outputs, model.lagged_state_predictor) == {}
+    assert lagged_state_semigroup_loss(outputs, model.lagged_state_predictor).item() == 0.0
 
 
 def test_state_transition_jepa_trains_state_predictor():
@@ -467,3 +808,59 @@ def test_smoke_training_writes_checkpoint(tmp_path):
     ckpt = train(cfg)
 
     assert ckpt.exists()
+
+
+def test_checkpoint_helpers_preserve_resume_step(tmp_path):
+    cfg = TrainConfig(
+        output_dir=str(tmp_path),
+        device="cpu",
+        model=ModelConfig(latent_dim=16, encoder_depth=1, predictor_depth=1, num_heads=2, num_rbf=4),
+        checkpoint_every_steps=2,
+    )
+    model = ProteinJEPA(cfg.model)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.optimization.lr)
+
+    _save_checkpoint(tmp_path, model, optimizer, epoch=1, step=7, config=cfg, write_step_file=True)
+
+    restored_model = ProteinJEPA(cfg.model)
+    restored_optimizer = torch.optim.AdamW(restored_model.parameters(), lr=cfg.optimization.lr)
+    step = _load_resume_checkpoint(restored_model, restored_optimizer, str(tmp_path / "checkpoint_latest.pt"), torch.device("cpu"))
+
+    assert step == 7
+    assert (tmp_path / "checkpoint_step7.pt").exists()
+
+
+def test_init_checkpoint_can_exclude_reinitialized_modules(tmp_path):
+    cfg = TrainConfig(
+        output_dir=str(tmp_path),
+        device="cpu",
+        model=ModelConfig(
+            latent_dim=16,
+            encoder_depth=1,
+            temporal_depth=1,
+            predictor_depth=1,
+            state_predictor_depth=1,
+            state_prediction_lags=(1, 2),
+            num_heads=2,
+            num_rbf=4,
+        ),
+    )
+    source = ProteinJEPA(cfg.model)
+    optimizer = torch.optim.AdamW(source.parameters(), lr=cfg.optimization.lr)
+    with torch.no_grad():
+        source.context_encoder.geom_proj.weight.fill_(0.25)
+        source.lagged_state_predictor.heads["1"].weight.fill_(0.75)
+    _save_checkpoint(tmp_path, source, optimizer, epoch=1, step=3, config=cfg, write_step_file=False)
+
+    restored = ProteinJEPA(cfg.model)
+    initial_lag_weight = restored.lagged_state_predictor.heads["1"].weight.detach().clone()
+    _load_init_checkpoint(
+        restored,
+        str(tmp_path / "checkpoint_latest.pt"),
+        torch.device("cpu"),
+        strict=False,
+        exclude_prefixes=("lagged_state_predictor.",),
+    )
+
+    assert torch.all(restored.context_encoder.geom_proj.weight == 0.25)
+    assert torch.equal(restored.lagged_state_predictor.heads["1"].weight, initial_lag_weight)

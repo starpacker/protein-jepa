@@ -45,6 +45,7 @@ def iter_records(
                     "num_frames": num_frames,
                     "frame_interval_ps": frame_interval_ps,
                     "first_frame_time_ps": 0.0,
+                    "temperature_k": 300.0,
                     "coordinate_unit": "Angstrom",
                     "metadata": {
                         "source": "ATLAS",

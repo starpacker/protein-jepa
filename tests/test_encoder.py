@@ -42,3 +42,37 @@ def test_context_encoder_does_not_depend_on_masked_coordinates():
         out_b = encoder(perturbed, residue_mask, aatype, residue_index, chain_id, token_mask=token_mask)
 
     assert torch.allclose(out_a[token_mask], out_b[token_mask], atol=1e-5)
+
+
+def test_orientation_encoder_distinguishes_mirror_images():
+    encoder = ProteinGeometryEncoder(
+        latent_dim=32, depth=2, num_heads=4, num_rbf=8, dropout=0.0, orientation_features=True
+    )
+    encoder.eval()
+    coords, residue_mask, aatype, residue_index, chain_id = _batch()
+    mirrored = coords.clone()
+    mirrored[..., 0] *= -1.0
+
+    with torch.no_grad():
+        original = encoder(coords, residue_mask, aatype, residue_index, chain_id)
+        reflected = encoder(mirrored, residue_mask, aatype, residue_index, chain_id)
+
+    assert not torch.allclose(original, reflected, atol=1e-5)
+
+
+def test_orientation_context_encoder_does_not_read_masked_neighbors():
+    encoder = ProteinGeometryEncoder(
+        latent_dim=32, depth=2, num_heads=4, num_rbf=8, dropout=0.0, orientation_features=True
+    )
+    encoder.eval()
+    coords, residue_mask, aatype, residue_index, chain_id = _batch()
+    token_mask = residue_mask.clone()
+    token_mask[:, :, 4:8] = False
+    perturbed = coords.clone()
+    perturbed[:, :, 4:8] += 1000.0 * torch.randn_like(perturbed[:, :, 4:8])
+
+    with torch.no_grad():
+        out_a = encoder(coords, residue_mask, aatype, residue_index, chain_id, token_mask=token_mask)
+        out_b = encoder(perturbed, residue_mask, aatype, residue_index, chain_id, token_mask=token_mask)
+
+    assert torch.allclose(out_a[token_mask], out_b[token_mask], atol=1e-5)

@@ -25,7 +25,7 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader, Subset
 
-from protein_jepa_frame.config import DataConfig, ModelConfig
+from protein_jepa_frame.config import DataConfig, model_config_from_dict
 from protein_jepa_frame.data.collate import collate_clips
 from protein_jepa_frame.data.dataset import TrajectoryClipDataset
 from protein_jepa_frame.data.manifest import TrajectoryRecord, load_manifest
@@ -38,7 +38,15 @@ DEFAULT_VAL_MANIFEST = DEFAULT_MANIFESTS / "mdcath.deeptime_lcc_pcca_v2.full_lag
 DEFAULT_VAL_LABELS = DEFAULT_LABELS / "mdcath.deeptime_lcc_pcca_v2.full_lag1.validation.filtered_labels.json"
 MODEL_READOUT_CHOICES = [
     "mean",
+    "endpoint",
+    "causal_endpoint",
+    "slow_endpoint",
+    "metastable",
+    "local_dynamics",
+    "local_metastable",
     "state",
+    "motion",
+    "state_motion",
     "clip_state",
     "state_clip",
     "state_delta",
@@ -101,48 +109,79 @@ def _load_checkpoint_spec(spec: str) -> CheckpointSpec:
 
 def _model_from_spec(spec: CheckpointSpec, device: torch.device) -> tuple[ProteinJEPA, dict]:
     cfg = _load_json(spec.artifact_dir / "config.json")
-    model_cfg = ModelConfig(**cfg["model"])
-    model = ProteinJEPA(model_cfg).to(device)
     if spec.kind == "checkpoint":
         ckpt = torch.load(spec.checkpoint, map_location=device, weights_only=True)
-        model.load_state_dict(ckpt.get("model", ckpt), strict=False)
+        state = ckpt.get("model", ckpt)
+        model_cfg = model_config_from_dict(cfg["model"], state)
+        model = ProteinJEPA(model_cfg).to(device)
+        model.load_state_dict(state, strict=False)
         cfg["_checkpoint_step"] = ckpt.get("step", "?")
         cfg["_checkpoint_epoch"] = ckpt.get("epoch", "?")
     else:
+        model = ProteinJEPA(model_config_from_dict(cfg["model"])).to(device)
         cfg["_checkpoint_step"] = "random_init"
         cfg["_checkpoint_epoch"] = "random_init"
     model.eval()
     return model, cfg
 
 
-def _data_cfg_from_artifact(artifact_dir: Path, batch_size: int, num_frames: int, window_stride: int) -> DataConfig:
+def _data_cfg_from_artifact(
+    artifact_dir: Path,
+    batch_size: int,
+    num_frames: int,
+    window_stride: int | None,
+    frame_stride: int | None = None,
+) -> DataConfig:
     cfg = _load_json(artifact_dir / "config.json")
+    resolved_frame_stride = int(frame_stride or cfg["data"].get("frame_stride", 1))
+    clip_span = (num_frames - 1) * resolved_frame_stride + 1
+    resolved_window_stride = int(window_stride or cfg["data"].get("window_stride", clip_span))
     return DataConfig(
         manifest_path=None,
         batch_size=batch_size,
         num_workers=0,
         num_frames=num_frames,
-        frame_stride=1,
-        window_stride=window_stride,
+        frame_stride=resolved_frame_stride,
+        window_stride=resolved_window_stride,
         max_residues=cfg["data"].get("max_residues"),
         coordinate_scale=cfg["data"].get("coordinate_scale", 1.0),
     )
 
 
-def _window_overlap_ratio(num_frames: int, window_stride: int) -> float:
-    if num_frames <= 0:
+def _window_overlap_ratio(num_frames: int, frame_stride: int, window_stride: int) -> float:
+    clip_span = (num_frames - 1) * frame_stride + 1
+    if clip_span <= 0:
         return 0.0
-    return float(max(0, num_frames - window_stride) / num_frames)
+    return float(max(0, clip_span - window_stride) / clip_span)
 
 
-def _first_n_trajectories(records: list[TrajectoryRecord], n: int) -> list[TrajectoryRecord]:
-    trajs: OrderedDict[str, TrajectoryRecord] = OrderedDict()
+def _default_nonoverlap_lags(num_frames: int, frame_stride: int, window_stride: int) -> list[int]:
+    clip_span = (num_frames - 1) * frame_stride + 1
+    minimum_lag = max(1, int(math.ceil(clip_span / window_stride)))
+    return [minimum_lag, minimum_lag * 2, minimum_lag * 4]
+
+
+def _stratified_trajectories(records: list[TrajectoryRecord], n: int) -> list[TrajectoryRecord]:
+    """Select trajectories round-robin across proteins in manifest order."""
+    by_protein: OrderedDict[str, list[TrajectoryRecord]] = OrderedDict()
     for record in records:
-        if record.trajectory_id not in trajs:
-            trajs[record.trajectory_id] = record
-        if len(trajs) >= n:
+        protein_records = by_protein.setdefault(record.protein_id, [])
+        if all(existing.trajectory_id != record.trajectory_id for existing in protein_records):
+            protein_records.append(record)
+    selected = []
+    round_index = 0
+    while len(selected) < n:
+        added = False
+        for protein_records in by_protein.values():
+            if round_index < len(protein_records):
+                selected.append(protein_records[round_index])
+                added = True
+                if len(selected) >= n:
+                    break
+        if not added:
             break
-    return list(trajs.values())
+        round_index += 1
+    return selected
 
 
 def _move_tensor_batch(batch: dict, device: torch.device) -> dict:
@@ -158,18 +197,35 @@ def _model_readout(
     residue_mask: torch.Tensor,
     readout: str,
     time_ps: torch.Tensor | None = None,
+    temperature_k: torch.Tensor | None = None,
+    dataset_index: torch.Tensor | None = None,
 ) -> torch.Tensor:
     valid = residue_mask.unsqueeze(-1).float()
     frame_mean = (latents * valid).sum(dim=2) / valid.sum(dim=2).clamp(min=1)
     last_mean = frame_mean[:, -1]
     if readout == "mean":
         return last_mean
-    states = model.encode_states(latents, residue_mask, time_ps=time_ps)
+    encode_states = model.encode_causal_states if readout == "causal_endpoint" else model.encode_states
+    states = encode_states(
+        latents,
+        residue_mask,
+        time_ps=time_ps,
+        temperature_k=temperature_k,
+        dataset_index=dataset_index,
+    )
     frame_states = states["frame_states"]
     last_state = frame_states[:, -1]
+    motion_states = states.get("motion_states")
+    last_motion = motion_states[:, -1] if motion_states is not None else None
     clip_state = states["clip_state"]
     if readout == "kinetic":
-        kinetic = model.encode_kinetic_readout(latents, residue_mask, time_ps=time_ps)
+        kinetic = model.encode_kinetic_readout(
+            latents,
+            residue_mask,
+            time_ps=time_ps,
+            temperature_k=temperature_k,
+            dataset_index=dataset_index,
+        )
         return kinetic[:, -1]
     if frame_states.shape[1] > 1:
         delta_state = frame_states[:, -1] - frame_states[:, -2]
@@ -177,6 +233,39 @@ def _model_readout(
         delta_state = torch.zeros_like(last_state)
     if readout == "state":
         return last_state
+    if readout == "endpoint":
+        return last_state
+    if readout == "causal_endpoint":
+        return last_state
+    if readout == "slow_endpoint":
+        if model.slow_state_projector is None:
+            raise ValueError("slow_endpoint readout requires a V2.2 slow state projector")
+        return model.slow_state_projector(last_state)
+    if readout == "metastable":
+        if model.metastable_state_head is None:
+            raise ValueError("metastable readout requires a V3 metastable state head")
+        return model.metastable_state_head(frame_states)[:, -1]
+    if readout in {"local_dynamics", "local_metastable"}:
+        if model.local_dynamics_head is None:
+            raise ValueError("local_dynamics readout requires a V3.1 local dynamics head")
+        local_tokens, local_mask = model.local_dynamics_head.encode_tokens(
+            latents[:, -1], residue_mask[:, -1]
+        )
+        local_tokens = local_tokens * local_mask.unsqueeze(-1).to(dtype=local_tokens.dtype)
+        parts = [last_state, local_tokens.flatten(start_dim=1)]
+        if readout == "local_metastable":
+            if model.metastable_state_head is None:
+                raise ValueError("local_metastable readout requires a metastable state head")
+            parts.append(model.metastable_state_head(frame_states)[:, -1])
+        return torch.cat(parts, dim=-1)
+    if readout == "motion":
+        if last_motion is None:
+            raise ValueError("motion readout requires model.motion_depth > 0")
+        return last_motion
+    if readout == "state_motion":
+        if last_motion is None:
+            raise ValueError("state_motion readout requires model.motion_depth > 0")
+        return torch.cat([last_state, last_motion], dim=-1)
     if readout == "clip_state":
         return clip_state
     if readout == "state_clip":
@@ -190,7 +279,13 @@ def _model_readout(
     if readout == "state_clip_delta_mean":
         return torch.cat([last_state, clip_state, delta_state, last_mean], dim=-1)
     if readout in {"state_kinetic", "state_clip_kinetic", "state_clip_delta_kinetic"}:
-        kinetic = model.encode_kinetic_readout(latents, residue_mask, time_ps=time_ps)[:, -1]
+        kinetic = model.encode_kinetic_readout(
+            latents,
+            residue_mask,
+            time_ps=time_ps,
+            temperature_k=temperature_k,
+            dataset_index=dataset_index,
+        )[:, -1]
         if readout == "state_kinetic":
             return torch.cat([last_state, kinetic], dim=-1)
         if readout == "state_clip_kinetic":
@@ -247,6 +342,8 @@ def extract_model_frame_sequences(
             batch["residue_mask"],
             _geometry_fusion_base_readout(readout) if readout in GEOMETRY_FUSION_READOUTS else readout,
             time_ps=batch.get("time_ps"),
+            temperature_k=batch.get("temperature_k"),
+            dataset_index=batch.get("dataset_index"),
         )
         if geom_features is not None:
             pooled = torch.cat([pooled, geom_features.to(dtype=pooled.dtype)], dim=-1)
@@ -407,8 +504,16 @@ def _vamp2_from_pairs(
         cv_score = train_model.score("VAMP2", test_model=test_model, epsilon=eps, dim=score_dim)
         out[f"train_vamp2_dim_{dim}"] = float(train_score)
         out[f"cv_vamp2_dim_{dim}"] = float(cv_score)
-        out[f"cv_vamp2_norm_dim_{dim}"] = float(cv_score / max(1, score_dim))
+        # deeptime's score contains the constant singular function. Normalize
+        # only the kinetic excess above that trivial score.
+        out[f"cv_vamp2_norm_dim_{dim}"] = _kinetic_normalized_vamp2(cv_score, score_dim)
     return out
+
+
+def _kinetic_normalized_vamp2(score: float, kinetic_dim: int) -> float:
+    if kinetic_dim <= 0:
+        raise ValueError("kinetic_dim must be positive")
+    return float((score - 1.0) / kinetic_dim)
 
 
 def blocked_cv_vamp2(
@@ -480,13 +585,23 @@ def run_vamp_cv(args: argparse.Namespace) -> dict:
     import deeptime
 
     device = _device(args.device)
-    records = _first_n_trajectories(load_manifest(args.manifest), args.max_trajs)
     specs = [_load_checkpoint_spec(item) for item in args.checkpoint]
+    records = _stratified_trajectories(load_manifest(args.manifest), args.max_trajs)
     baselines = args.baseline or ["geometry_stats", "centered_ca"]
     if args.include_random:
         base = specs[0]
         specs.append(CheckpointSpec(name="random_encoder", checkpoint=None, artifact_dir=base.artifact_dir, kind="random"))
 
+    reference_data_cfg = _data_cfg_from_artifact(
+        specs[0].artifact_dir,
+        args.batch_size,
+        num_frames=args.sequence_frames,
+        window_stride=args.window_stride,
+        frame_stride=getattr(args, "frame_stride", None),
+    )
+    lags = args.lags or _default_nonoverlap_lags(
+        args.sequence_frames, reference_data_cfg.frame_stride, reference_data_cfg.window_stride
+    )
     out = {
         "protocol": {
             "implementation": "deeptime.decomposition.VAMP + CovarianceKoopmanModel.score(test_model=...)",
@@ -494,16 +609,26 @@ def run_vamp_cv(args: argparse.Namespace) -> dict:
             "manifest": str(args.manifest),
             "max_trajs": args.max_trajs,
             "num_eval_trajs": len(records),
-            "window_stride": args.window_stride,
-            "window_overlap_ratio": _window_overlap_ratio(args.sequence_frames, args.window_stride),
+            "sampling": "protein-stratified round-robin",
+            "num_eval_proteins": len({record.protein_id for record in records}),
+            "frame_stride": reference_data_cfg.frame_stride,
+            "window_stride": reference_data_cfg.window_stride,
+            "window_overlap_ratio": _window_overlap_ratio(
+                args.sequence_frames, reference_data_cfg.frame_stride, reference_data_cfg.window_stride
+            ),
+            "clip_span_saved_frames": (args.sequence_frames - 1) * reference_data_cfg.frame_stride + 1,
             "sequence_frames": args.sequence_frames,
             "readout": args.readout,
-            "lags": args.lags,
+            "lags": lags,
+            "minimum_nonoverlap_lag": _default_nonoverlap_lags(
+                args.sequence_frames, reference_data_cfg.frame_stride, reference_data_cfg.window_stride
+            )[0],
             "dims": args.dims,
             "n_folds": args.folds,
             "gap": args.gap,
             "max_pre_dim": args.max_pre_dim,
             "min_pairs": args.min_pairs,
+            "vamp2_normalization": "(cross_validated_score - 1 constant mode) / requested kinetic dimension",
         },
         "models": {},
         "baselines": {},
@@ -514,7 +639,11 @@ def run_vamp_cv(args: argparse.Namespace) -> dict:
         print(f"[VAMP-CV] extracting {spec.name}", flush=True)
         model, cfg = _model_from_spec(spec, device)
         data_cfg = _data_cfg_from_artifact(
-            spec.artifact_dir, args.batch_size, num_frames=args.sequence_frames, window_stride=args.window_stride
+            spec.artifact_dir,
+            args.batch_size,
+            num_frames=args.sequence_frames,
+            window_stride=reference_data_cfg.window_stride,
+            frame_stride=reference_data_cfg.frame_stride,
         )
         seqs = extract_model_frame_sequences(model, records, data_cfg, device, readout=args.readout)
         out["models"][spec.name] = {
@@ -527,13 +656,17 @@ def run_vamp_cv(args: argparse.Namespace) -> dict:
             },
             "n_sequences": len(seqs),
             "vamp2_cv": blocked_cv_vamp2(
-                seqs, args.lags, args.dims, args.folds, args.gap, args.eps, args.max_pre_dim, args.min_pairs
+                seqs, lags, args.dims, args.folds, args.gap, args.eps, args.max_pre_dim, args.min_pairs
             ),
         }
         _write_json(args.output, {**out, "status": f"partial_after_model_{spec.name}"})
 
     baseline_cfg = _data_cfg_from_artifact(
-        specs[0].artifact_dir, args.batch_size, num_frames=args.sequence_frames, window_stride=args.window_stride
+        specs[0].artifact_dir,
+        args.batch_size,
+        num_frames=args.sequence_frames,
+        window_stride=reference_data_cfg.window_stride,
+        frame_stride=reference_data_cfg.frame_stride,
     )
     for baseline in baselines:
         print(f"[VAMP-CV] extracting baseline {baseline}", flush=True)
@@ -541,12 +674,12 @@ def run_vamp_cv(args: argparse.Namespace) -> dict:
         out["baselines"][baseline] = {
             "n_sequences": len(seqs),
             "vamp2_cv": blocked_cv_vamp2(
-                seqs, args.lags, args.dims, args.folds, args.gap, args.eps, args.max_pre_dim, args.min_pairs
+                seqs, lags, args.dims, args.folds, args.gap, args.eps, args.max_pre_dim, args.min_pairs
             ),
         }
         _write_json(args.output, {**out, "status": f"partial_after_baseline_{baseline}"})
 
-    add_vamp_pairwise_comparisons(out)
+    add_vamp_pairwise_comparisons(out, {record.trajectory_id: record.protein_id for record in records})
     out["elapsed_s"] = round(time.time() - t0, 2)
     _write_json(args.output, out)
     _print_vamp_cv_summary(out, args.dims)
@@ -606,8 +739,9 @@ def _bootstrap_delta(a: np.ndarray, b: np.ndarray, seed: int = 0, n_boot: int = 
     }
 
 
-def add_vamp_pairwise_comparisons(out: dict) -> None:
+def add_vamp_pairwise_comparisons(out: dict, trajectory_to_protein: dict[str, str] | None = None) -> None:
     comparisons = {}
+    trajectory_to_protein = trajectory_to_protein or {}
     for lag in out["protocol"]["lags"]:
         lag_key = f"lag_{lag}"
         comparisons[lag_key] = {}
@@ -616,7 +750,15 @@ def add_vamp_pairwise_comparisons(out: dict) -> None:
             comparisons[lag_key][dim_key] = {}
             blocks = {f"model:{k}": v for k, v in out["models"].items()}
             blocks.update({f"baseline:{k}": v for k, v in out["baselines"].items()})
-            metrics = {name: _trajectory_metric(block, lag, dim, "cv_vamp2_norm_dim") for name, block in blocks.items()}
+            trajectory_metrics = {
+                name: _trajectory_metric(block, lag, dim, "cv_vamp2_norm_dim") for name, block in blocks.items()
+            }
+            metrics = {}
+            for name, values in trajectory_metrics.items():
+                grouped: dict[str, list[float]] = defaultdict(list)
+                for trajectory_id, value in values.items():
+                    grouped[trajectory_to_protein.get(trajectory_id, trajectory_id)].append(value)
+                metrics[name] = {protein_id: float(np.mean(items)) for protein_id, items in grouped.items()}
             names = sorted(metrics)
             for i, left in enumerate(names):
                 for right in names[i + 1 :]:
@@ -627,6 +769,7 @@ def add_vamp_pairwise_comparisons(out: dict) -> None:
                     b = np.asarray([metrics[right][tid] for tid in shared], dtype=np.float64)
                     comparisons[lag_key][dim_key][f"{left} minus {right}"] = _bootstrap_delta(a, b)
     out["paired_bootstrap_comparisons"] = comparisons
+    out["paired_bootstrap_unit"] = "protein"
 
 
 def _ridge_future_score(
@@ -666,19 +809,22 @@ def _ridge_future_score(
             return np.linalg.pinv(x_aug_local.T @ x_aug_local + reg) @ x_aug_local.T @ y
 
     selected_lambda = None
-    if lambda_selection == "train_holdout" and x0_train.shape[0] >= 12:
-        split = min(x0_train.shape[0] - 3, max(8, int(round(0.8 * x0_train.shape[0]))))
-        x_fit, y_fit = x0_train[:split], x1_train[:split]
-        x_select, y_select = x0_train[split:], x1_train[split:]
-        select_aug = np.concatenate([x_select, np.ones((x_select.shape[0], 1))], axis=1)
-        best_select = {"mse": np.inf, "lambda": None}
-        for lam in lambdas:
-            weights = fit_weights(x_fit, y_fit, lam)
-            pred = select_aug @ weights
-            mse = float(np.mean((pred - y_select) ** 2))
-            if mse < best_select["mse"]:
-                best_select = {"mse": mse, "lambda": lam}
-        selected_lambda = best_select["lambda"]
+    if lambda_selection == "train_holdout":
+        if x0_train.shape[0] >= 12:
+            split = min(x0_train.shape[0] - 3, max(8, int(round(0.8 * x0_train.shape[0]))))
+            x_fit, y_fit = x0_train[:split], x1_train[:split]
+            x_select, y_select = x0_train[split:], x1_train[split:]
+            select_aug = np.concatenate([x_select, np.ones((x_select.shape[0], 1))], axis=1)
+            best_select = {"mse": np.inf, "lambda": None}
+            for lam in lambdas:
+                weights = fit_weights(x_fit, y_fit, lam)
+                pred = select_aug @ weights
+                mse = float(np.mean((pred - y_select) ** 2))
+                if mse < best_select["mse"]:
+                    best_select = {"mse": mse, "lambda": lam}
+            selected_lambda = best_select["lambda"]
+        else:
+            selected_lambda = lambdas[len(lambdas) // 2]
     elif lambda_selection != "validation":
         raise ValueError(f"unknown linear lambda selection {lambda_selection}")
 
@@ -778,18 +924,37 @@ def _aggregate_dynamics_rows(rows: list[dict]) -> dict:
 
 def run_linear_dynamics(args: argparse.Namespace) -> dict:
     device = _device(args.device)
-    records = _first_n_trajectories(load_manifest(args.manifest), args.max_trajs)
     specs = [_load_checkpoint_spec(item) for item in args.checkpoint]
+    records = _stratified_trajectories(load_manifest(args.manifest), args.max_trajs)
     baselines = args.baseline or ["geometry_stats", "centered_ca"]
+    reference_data_cfg = _data_cfg_from_artifact(
+        specs[0].artifact_dir,
+        args.batch_size,
+        num_frames=args.sequence_frames,
+        window_stride=args.window_stride,
+        frame_stride=getattr(args, "frame_stride", None),
+    )
+    lags = args.lags or _default_nonoverlap_lags(
+        args.sequence_frames, reference_data_cfg.frame_stride, reference_data_cfg.window_stride
+    )
     out = {
         "protocol": {
             "manifest": str(args.manifest),
             "max_trajs": args.max_trajs,
-            "window_stride": args.window_stride,
-            "window_overlap_ratio": _window_overlap_ratio(args.sequence_frames, args.window_stride),
+            "sampling": "protein-stratified round-robin",
+            "num_eval_proteins": len({record.protein_id for record in records}),
+            "frame_stride": reference_data_cfg.frame_stride,
+            "window_stride": reference_data_cfg.window_stride,
+            "window_overlap_ratio": _window_overlap_ratio(
+                args.sequence_frames, reference_data_cfg.frame_stride, reference_data_cfg.window_stride
+            ),
+            "clip_span_saved_frames": (args.sequence_frames - 1) * reference_data_cfg.frame_stride + 1,
             "sequence_frames": args.sequence_frames,
             "readout": args.readout,
-            "lags": args.lags,
+            "lags": lags,
+            "minimum_nonoverlap_lag": _default_nonoverlap_lags(
+                args.sequence_frames, reference_data_cfg.frame_stride, reference_data_cfg.window_stride
+            )[0],
             "n_folds": args.folds,
             "gap": args.gap,
             "max_pre_dim": args.max_pre_dim,
@@ -805,7 +970,11 @@ def run_linear_dynamics(args: argparse.Namespace) -> dict:
         print(f"[linear-dynamics] extracting {spec.name}", flush=True)
         model, cfg = _model_from_spec(spec, device)
         data_cfg = _data_cfg_from_artifact(
-            spec.artifact_dir, args.batch_size, num_frames=args.sequence_frames, window_stride=args.window_stride
+            spec.artifact_dir,
+            args.batch_size,
+            num_frames=args.sequence_frames,
+            window_stride=reference_data_cfg.window_stride,
+            frame_stride=reference_data_cfg.frame_stride,
         )
         seqs = extract_model_frame_sequences(model, records, data_cfg, device, readout=args.readout)
         out["models"][spec.name] = {
@@ -813,7 +982,7 @@ def run_linear_dynamics(args: argparse.Namespace) -> dict:
             "checkpoint_step": cfg["_checkpoint_step"],
             "linear_dynamics_cv": blocked_cv_linear_dynamics(
                 seqs,
-                args.lags,
+                lags,
                 args.folds,
                 args.gap,
                 args.lambdas,
@@ -823,7 +992,11 @@ def run_linear_dynamics(args: argparse.Namespace) -> dict:
             ),
         }
     baseline_cfg = _data_cfg_from_artifact(
-        specs[0].artifact_dir, args.batch_size, num_frames=args.sequence_frames, window_stride=args.window_stride
+        specs[0].artifact_dir,
+        args.batch_size,
+        num_frames=args.sequence_frames,
+        window_stride=reference_data_cfg.window_stride,
+        frame_stride=reference_data_cfg.frame_stride,
     )
     for baseline in baselines:
         print(f"[linear-dynamics] extracting baseline {baseline}", flush=True)
@@ -831,7 +1004,7 @@ def run_linear_dynamics(args: argparse.Namespace) -> dict:
         out["baselines"][baseline] = {
             "linear_dynamics_cv": blocked_cv_linear_dynamics(
                 seqs,
-                args.lags,
+                lags,
                 args.folds,
                 args.gap,
                 args.lambdas,
@@ -908,19 +1081,90 @@ def extract_clip_latents_with_labels(
             clip_valid = batch["residue_mask"].any(dim=2).unsqueeze(-1).float()
             clip_latents = (pooled * clip_valid).sum(dim=1) / clip_valid.sum(dim=1).clamp(min=1)
         elif readout == "state":
-            states = model.encode_states(latents, batch["residue_mask"], time_ps=batch.get("time_ps"))["frame_states"]
+            states = model.encode_states(
+                latents,
+                batch["residue_mask"],
+                time_ps=batch.get("time_ps"),
+                temperature_k=batch.get("temperature_k"),
+                dataset_index=batch.get("dataset_index"),
+            )["frame_states"]
             clip_valid = batch["residue_mask"].any(dim=2).unsqueeze(-1).float()
             clip_latents = (states * clip_valid).sum(dim=1) / clip_valid.sum(dim=1).clamp(min=1)
+        elif readout in {"endpoint", "causal_endpoint", "slow_endpoint", "metastable"}:
+            encode_states = model.encode_causal_states if readout == "causal_endpoint" else model.encode_states
+            states_block = encode_states(
+                latents,
+                batch["residue_mask"],
+                time_ps=batch.get("time_ps"),
+                temperature_k=batch.get("temperature_k"),
+                dataset_index=batch.get("dataset_index"),
+            )
+            endpoint = model.encode_endpoint_state(
+                states_block,
+                batch["residue_mask"].any(dim=2),
+            )
+            if readout == "slow_endpoint":
+                if model.slow_state_projector is None:
+                    raise ValueError("slow_endpoint readout requires a V2.2 slow state projector")
+                endpoint = model.slow_state_projector(endpoint)
+            if readout == "metastable":
+                if model.metastable_state_head is None:
+                    raise ValueError("metastable readout requires a V3 metastable state head")
+                clip_latents = model.metastable_state_head(states_block["frame_states"])[:, -1]
+            else:
+                clip_latents = endpoint
         elif readout == "clip_state":
-            clip_latents = model.encode_states(latents, batch["residue_mask"], time_ps=batch.get("time_ps"))["clip_state"]
+            clip_latents = model.encode_states(
+                latents,
+                batch["residue_mask"],
+                time_ps=batch.get("time_ps"),
+                temperature_k=batch.get("temperature_k"),
+                dataset_index=batch.get("dataset_index"),
+            )["clip_state"]
+        elif readout in {"motion", "state_motion"}:
+            states_block = model.encode_states(
+                latents,
+                batch["residue_mask"],
+                time_ps=batch.get("time_ps"),
+                temperature_k=batch.get("temperature_k"),
+                dataset_index=batch.get("dataset_index"),
+            )
+            motion = states_block.get("motion_states")
+            if motion is None:
+                raise ValueError(f"{readout} readout requires model.motion_depth > 0")
+            clip_valid = batch["residue_mask"].any(dim=2).unsqueeze(-1).float()
+            motion_avg = (motion * clip_valid).sum(dim=1) / clip_valid.sum(dim=1).clamp(min=1)
+            if readout == "motion":
+                clip_latents = motion_avg
+            else:
+                state_avg = (states_block["frame_states"] * clip_valid).sum(dim=1) / clip_valid.sum(dim=1).clamp(min=1)
+                clip_latents = torch.cat([state_avg, motion_avg], dim=-1)
         elif readout == "kinetic":
-            kinetic = model.encode_kinetic_readout(latents, batch["residue_mask"], time_ps=batch.get("time_ps"))
+            kinetic = model.encode_kinetic_readout(
+                latents,
+                batch["residue_mask"],
+                time_ps=batch.get("time_ps"),
+                temperature_k=batch.get("temperature_k"),
+                dataset_index=batch.get("dataset_index"),
+            )
             clip_valid = batch["residue_mask"].any(dim=2).unsqueeze(-1).float()
             clip_latents = (kinetic * clip_valid).sum(dim=1) / clip_valid.sum(dim=1).clamp(min=1)
         elif readout in {"state_kinetic", "state_clip_kinetic", "state_clip_delta_kinetic"}:
-            states_block = model.encode_states(latents, batch["residue_mask"], time_ps=batch.get("time_ps"))
+            states_block = model.encode_states(
+                latents,
+                batch["residue_mask"],
+                time_ps=batch.get("time_ps"),
+                temperature_k=batch.get("temperature_k"),
+                dataset_index=batch.get("dataset_index"),
+            )
             states = states_block["frame_states"]
-            kinetic = model.encode_kinetic_readout(latents, batch["residue_mask"], time_ps=batch.get("time_ps"))
+            kinetic = model.encode_kinetic_readout(
+                latents,
+                batch["residue_mask"],
+                time_ps=batch.get("time_ps"),
+                temperature_k=batch.get("temperature_k"),
+                dataset_index=batch.get("dataset_index"),
+            )
             clip_valid = batch["residue_mask"].any(dim=2).unsqueeze(-1).float()
             state_avg = (states * clip_valid).sum(dim=1) / clip_valid.sum(dim=1).clamp(min=1)
             kinetic_avg = (kinetic * clip_valid).sum(dim=1) / clip_valid.sum(dim=1).clamp(min=1)
@@ -935,7 +1179,13 @@ def extract_clip_latents_with_labels(
             else:
                 clip_latents = torch.cat([state_avg, states_block["clip_state"], delta_state, kinetic_avg], dim=-1)
         elif readout in GEOMETRY_FUSION_READOUTS:
-            states_block = model.encode_states(latents, batch["residue_mask"], time_ps=batch.get("time_ps"))
+            states_block = model.encode_states(
+                latents,
+                batch["residue_mask"],
+                time_ps=batch.get("time_ps"),
+                temperature_k=batch.get("temperature_k"),
+                dataset_index=batch.get("dataset_index"),
+            )
             states = states_block["frame_states"]
             clip_valid = batch["residue_mask"].any(dim=2).unsqueeze(-1).float()
             state_avg = (states * clip_valid).sum(dim=1) / clip_valid.sum(dim=1).clamp(min=1)
@@ -956,8 +1206,18 @@ def extract_clip_latents_with_labels(
             "state_clip_delta",
             "state_mean",
             "state_clip_delta_mean",
+            "local_dynamics",
+            "local_metastable",
         }:
-            clip_latents = _model_readout(model, latents, batch["residue_mask"], readout, time_ps=batch.get("time_ps"))
+            clip_latents = _model_readout(
+                model,
+                latents,
+                batch["residue_mask"],
+                readout,
+                time_ps=batch.get("time_ps"),
+                temperature_k=batch.get("temperature_k"),
+                dataset_index=batch.get("dataset_index"),
+            )
         else:
             raise ValueError(f"unknown model readout {readout}")
         for b in range(clip_latents.shape[0]):
@@ -977,27 +1237,75 @@ def extract_clip_latents_with_labels(
     return rows
 
 
-def _ridge_probe(train_x: np.ndarray, train_y: np.ndarray, val_x: np.ndarray, val_y: np.ndarray, lambdas: list[float]) -> dict:
-    classes = np.array(sorted(set(train_y.tolist()) | set(val_y.tolist())), dtype=int)
+def _classification_metrics(target: np.ndarray, prediction: np.ndarray, classes: np.ndarray) -> dict[str, float]:
+    accuracy = float(np.mean(prediction == target))
+    recalls = []
+    f1s = []
+    for cls in classes:
+        tp = int(np.sum((prediction == cls) & (target == cls)))
+        fp = int(np.sum((prediction == cls) & (target != cls)))
+        fn = int(np.sum((prediction != cls) & (target == cls)))
+        if tp + fn > 0:
+            recalls.append(tp / float(tp + fn))
+        denom = 2 * tp + fp + fn
+        if denom > 0:
+            f1s.append(2 * tp / float(denom))
+    return {
+        "accuracy": accuracy,
+        "balanced_accuracy": float(np.mean(recalls)) if recalls else 0.0,
+        "macro_f1": float(np.mean(f1s)) if f1s else 0.0,
+    }
+
+
+def _ridge_probe(
+    train_x: np.ndarray,
+    train_y: np.ndarray,
+    val_x: np.ndarray,
+    val_y: np.ndarray,
+    lambdas: list[float],
+    train_groups: np.ndarray | None = None,
+) -> dict:
+    classes = np.array(sorted(set(train_y.tolist())), dtype=int)
     train_x, val_x = _standardize(train_x, val_x)
-    x_aug = np.concatenate([train_x, np.ones((train_x.shape[0], 1))], axis=1)
-    v_aug = np.concatenate([val_x, np.ones((val_x.shape[0], 1))], axis=1)
-    y_onehot = (train_y[:, None] == classes[None, :]).astype(np.float64)
-    best = {"accuracy": -1.0, "lambda": None}
-    for lam in lambdas:
+    if train_groups is None:
+        train_groups = np.arange(len(train_y), dtype=int)
+    unique_groups = np.asarray(sorted(set(train_groups.tolist())))
+    n_select_groups = max(1, int(round(0.2 * len(unique_groups))))
+    select_groups = set(unique_groups[-n_select_groups:].tolist())
+    select_mask = np.asarray([group in select_groups for group in train_groups], dtype=bool)
+    fit_mask = ~select_mask
+    if fit_mask.sum() < 10 or select_mask.sum() < 5 or len(set(train_y[fit_mask].tolist())) < 2:
+        split = min(len(train_y) - 5, max(10, int(round(0.8 * len(train_y)))))
+        fit_mask = np.arange(len(train_y)) < split
+        select_mask = ~fit_mask
+
+    def fit_weights(x: np.ndarray, y: np.ndarray, lam: float) -> np.ndarray:
+        x_aug = np.concatenate([x, np.ones((x.shape[0], 1))], axis=1)
+        y_onehot = (y[:, None] == classes[None, :]).astype(np.float64)
         reg = lam * np.eye(x_aug.shape[1])
         reg[-1, -1] = 0.0
         try:
-            weights = np.linalg.solve(x_aug.T @ x_aug + reg, x_aug.T @ y_onehot)
+            return np.linalg.solve(x_aug.T @ x_aug + reg, x_aug.T @ y_onehot)
         except np.linalg.LinAlgError:
-            weights = np.linalg.pinv(x_aug.T @ x_aug + reg) @ x_aug.T @ y_onehot
-        pred = classes[np.argmax(v_aug @ weights, axis=1)]
-        acc = float(np.mean(pred == val_y))
-        if acc > best["accuracy"]:
-            best = {"accuracy": acc, "lambda": lam}
+            return np.linalg.pinv(x_aug.T @ x_aug + reg) @ x_aug.T @ y_onehot
+
+    select_aug = np.concatenate([train_x[select_mask], np.ones((select_mask.sum(), 1))], axis=1)
+    best = {"balanced_accuracy": -1.0, "lambda": None}
+    for lam in lambdas:
+        weights = fit_weights(train_x[fit_mask], train_y[fit_mask], lam)
+        pred = classes[np.argmax(select_aug @ weights, axis=1)]
+        score = _classification_metrics(train_y[select_mask], pred, classes)["balanced_accuracy"]
+        if score > best["balanced_accuracy"]:
+            best = {"balanced_accuracy": score, "lambda": lam}
+
+    selected_lambda = best["lambda"] if best["lambda"] is not None else lambdas[0]
+    weights = fit_weights(train_x, train_y, selected_lambda)
+    v_aug = np.concatenate([val_x, np.ones((val_x.shape[0], 1))], axis=1)
+    pred = classes[np.argmax(v_aug @ weights, axis=1)]
+    metrics = _classification_metrics(val_y, pred, np.asarray(sorted(set(val_y.tolist()))))
     majority = Counter(train_y.tolist()).most_common(1)[0][0]
     baseline = float(np.mean(val_y == majority))
-    return {"accuracy": best["accuracy"], "baseline": baseline, "lambda": best["lambda"]}
+    return {**metrics, "baseline": baseline, "lambda": selected_lambda, "lambda_selection": "train_group_holdout"}
 
 
 def trajectory_holdout_probe(rows: list[dict], lambdas: list[float]) -> dict:
@@ -1006,6 +1314,8 @@ def trajectory_holdout_probe(rows: list[dict], lambdas: list[float]) -> dict:
         by_protein[row["protein_id"]].append(row)
     details = {}
     accs = []
+    balanced_accs = []
+    macro_f1s = []
     bases = []
     for pid, items in sorted(by_protein.items()):
         trajs = sorted({row["trajectory_id"] for row in items})
@@ -1026,7 +1336,8 @@ def trajectory_holdout_probe(rows: list[dict], lambdas: list[float]) -> dict:
             continue
         train_x = np.stack([row["latent"] for row in train], axis=0)
         val_x = np.stack([row["latent"] for row in val], axis=0)
-        score = _ridge_probe(train_x, train_y, val_x, val_y, lambdas)
+        train_groups = np.asarray([row["trajectory_id"] for row in train])
+        score = _ridge_probe(train_x, train_y, val_x, val_y, lambdas, train_groups=train_groups)
         details[pid] = {
             **score,
             "n_train": len(train),
@@ -1035,10 +1346,15 @@ def trajectory_holdout_probe(rows: list[dict], lambdas: list[float]) -> dict:
             "n_val_trajs": len(set(trajs) - train_trajs),
         }
         accs.append(score["accuracy"])
+        balanced_accs.append(score["balanced_accuracy"])
+        macro_f1s.append(score["macro_f1"])
         bases.append(score["baseline"])
     return {
         "mean_accuracy": float(np.mean(accs)) if accs else None,
         "std_accuracy": float(np.std(accs)) if accs else None,
+        "mean_balanced_accuracy": float(np.mean(balanced_accs)) if balanced_accs else None,
+        "std_balanced_accuracy": float(np.std(balanced_accs)) if balanced_accs else None,
+        "mean_macro_f1": float(np.mean(macro_f1s)) if macro_f1s else None,
         "mean_baseline": float(np.mean(bases)) if bases else None,
         "n_above_baseline": int(sum(a > b for a, b in zip(accs, bases))),
         "n_total": len(accs),
@@ -1051,6 +1367,13 @@ def run_msm_probe(args: argparse.Namespace) -> dict:
     specs = [_load_checkpoint_spec(item) for item in args.checkpoint]
     records = load_manifest(args.manifest)
     labels = load_msm_labels(args.labels)
+    reference_data_cfg = _data_cfg_from_artifact(
+        specs[0].artifact_dir,
+        batch_size=args.batch_size,
+        num_frames=getattr(args, "num_frames", None) or _load_json(specs[0].artifact_dir / "config.json")["data"]["num_frames"],
+        window_stride=getattr(args, "window_stride", None),
+        frame_stride=getattr(args, "frame_stride", None),
+    )
     results = {
         "protocol": {
             "manifest": str(args.manifest),
@@ -1059,8 +1382,15 @@ def run_msm_probe(args: argparse.Namespace) -> dict:
             "max_clips": args.max_clips,
             "lambdas": args.lambdas,
             "readout": args.readout,
-            "num_frames": getattr(args, "num_frames", None),
-            "window_stride": getattr(args, "window_stride", None),
+            "num_frames": reference_data_cfg.num_frames,
+            "frame_stride": reference_data_cfg.frame_stride,
+            "window_stride": reference_data_cfg.window_stride,
+            "window_overlap_ratio": _window_overlap_ratio(
+                reference_data_cfg.num_frames,
+                reference_data_cfg.frame_stride,
+                reference_data_cfg.window_stride,
+            ),
+            "lambda_selection": "nested train-trajectory group holdout",
         },
         "models": {},
     }
@@ -1070,8 +1400,9 @@ def run_msm_probe(args: argparse.Namespace) -> dict:
         data_cfg = _data_cfg_from_artifact(
             spec.artifact_dir,
             batch_size=args.batch_size,
-            num_frames=getattr(args, "num_frames", None) or cfg["data"]["num_frames"],
-            window_stride=getattr(args, "window_stride", None) or cfg["data"]["window_stride"],
+            num_frames=reference_data_cfg.num_frames,
+            window_stride=reference_data_cfg.window_stride,
+            frame_stride=reference_data_cfg.frame_stride,
         )
         rows = extract_clip_latents_with_labels(model, records, data_cfg, labels, device, args.max_clips, readout=args.readout)
         results["models"][spec.name] = {
@@ -1165,7 +1496,19 @@ def run_pipeline(args: argparse.Namespace) -> dict:
     preset = _pipeline_preset(args)
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    linear_window_stride = args.linear_window_stride or args.window_stride
+    first_spec = _load_checkpoint_spec(args.checkpoint[0])
+    eval_data_cfg = _data_cfg_from_artifact(
+        first_spec.artifact_dir,
+        batch_size=args.batch_size,
+        num_frames=args.sequence_frames,
+        window_stride=args.window_stride,
+        frame_stride=args.frame_stride,
+    )
+    frame_stride = eval_data_cfg.frame_stride
+    window_stride = eval_data_cfg.window_stride
+    if args.lags is None:
+        preset["lags"] = _default_nonoverlap_lags(args.sequence_frames, frame_stride, window_stride)
+    linear_window_stride = args.linear_window_stride or window_stride
     if args.require_contextual:
         if args.sequence_frames <= 1:
             raise ValueError("--require-contextual needs --sequence-frames > 1")
@@ -1177,6 +1520,7 @@ def run_pipeline(args: argparse.Namespace) -> dict:
         "device": args.device,
         "batch_size": args.batch_size,
         "readout": args.readout,
+        "frame_stride": frame_stride,
     }
     vamp_results = None
     msm_results = None
@@ -1190,7 +1534,7 @@ def run_pipeline(args: argparse.Namespace) -> dict:
                 include_random=args.include_random,
                 baseline=preset["baselines"],
                 max_trajs=preset["max_trajs"],
-                window_stride=args.window_stride,
+                window_stride=window_stride,
                 sequence_frames=args.sequence_frames,
                 lags=preset["lags"],
                 dims=preset["dims"],
@@ -1210,7 +1554,7 @@ def run_pipeline(args: argparse.Namespace) -> dict:
                 max_clips=preset["max_clips"],
                 lambdas=args.lambdas,
                 num_frames=args.sequence_frames,
-                window_stride=args.window_stride,
+                window_stride=window_stride,
             )
         )
     if not args.skip_linear:
@@ -1241,10 +1585,14 @@ def run_pipeline(args: argparse.Namespace) -> dict:
             "contextual_protocol": args.sequence_frames > 1 and args.readout != "mean",
             "require_contextual": args.require_contextual,
             "sequence_frames": args.sequence_frames,
-            "window_stride": args.window_stride,
-            "window_overlap_ratio": _window_overlap_ratio(args.sequence_frames, args.window_stride),
+            "frame_stride": frame_stride,
+            "window_stride": window_stride,
+            "clip_span_saved_frames": (args.sequence_frames - 1) * frame_stride + 1,
+            "window_overlap_ratio": _window_overlap_ratio(args.sequence_frames, frame_stride, window_stride),
             "linear_window_stride": linear_window_stride,
-            "linear_window_overlap_ratio": _window_overlap_ratio(args.sequence_frames, linear_window_stride),
+            "linear_window_overlap_ratio": _window_overlap_ratio(
+                args.sequence_frames, frame_stride, linear_window_stride
+            ),
             "linear_lambda_selection": args.lambda_selection,
             **preset,
         },
@@ -1268,10 +1616,11 @@ def build_parser() -> argparse.ArgumentParser:
     vamp.add_argument("--device", default="auto")
     vamp.add_argument("--max-trajs", type=int, default=50)
     vamp.add_argument("--batch-size", type=int, default=16)
-    vamp.add_argument("--window-stride", type=int, default=5)
+    vamp.add_argument("--frame-stride", type=int, default=None, help="Default: checkpoint training frame stride")
+    vamp.add_argument("--window-stride", type=int, default=None, help="Default: checkpoint training window stride")
     vamp.add_argument("--sequence-frames", type=int, default=1)
     vamp.add_argument("--readout", choices=MODEL_READOUT_CHOICES, default="mean")
-    vamp.add_argument("--lags", type=int, nargs="+", default=[1, 2, 5, 10, 20])
+    vamp.add_argument("--lags", type=int, nargs="+", default=None, help="Default: non-overlapping physical horizons")
     vamp.add_argument("--dims", type=int, nargs="+", default=[2, 5, 10, 20])
     vamp.add_argument("--folds", type=int, default=5)
     vamp.add_argument("--gap", type=int, default=20)
@@ -1289,6 +1638,7 @@ def build_parser() -> argparse.ArgumentParser:
     probe.add_argument("--batch-size", type=int, default=8)
     probe.add_argument("--max-clips", type=int, default=8000)
     probe.add_argument("--num-frames", type=int, default=None)
+    probe.add_argument("--frame-stride", type=int, default=None, help="Default: checkpoint training frame stride")
     probe.add_argument("--window-stride", type=int, default=None)
     probe.add_argument("--readout", choices=MODEL_READOUT_CHOICES, default="mean")
     probe.add_argument("--lambdas", type=float, nargs="+", default=[0.01, 0.1, 1.0, 10.0, 100.0])
@@ -1302,10 +1652,11 @@ def build_parser() -> argparse.ArgumentParser:
     dyn.add_argument("--device", default="auto")
     dyn.add_argument("--max-trajs", type=int, default=50)
     dyn.add_argument("--batch-size", type=int, default=16)
-    dyn.add_argument("--window-stride", type=int, default=5)
+    dyn.add_argument("--frame-stride", type=int, default=None, help="Default: checkpoint training frame stride")
+    dyn.add_argument("--window-stride", type=int, default=None, help="Default: checkpoint training window stride")
     dyn.add_argument("--sequence-frames", type=int, default=1)
     dyn.add_argument("--readout", choices=MODEL_READOUT_CHOICES, default="mean")
-    dyn.add_argument("--lags", type=int, nargs="+", default=[1, 2, 5, 10, 20])
+    dyn.add_argument("--lags", type=int, nargs="+", default=None, help="Default: non-overlapping physical horizons")
     dyn.add_argument("--folds", type=int, default=5)
     dyn.add_argument("--gap", type=int, default=20)
     dyn.add_argument("--max-pre-dim", type=int, default=64)
@@ -1327,7 +1678,8 @@ def build_parser() -> argparse.ArgumentParser:
     pipe.add_argument("--labels", type=Path, default=DEFAULT_VAL_LABELS)
     pipe.add_argument("--device", default="auto")
     pipe.add_argument("--batch-size", type=int, default=16)
-    pipe.add_argument("--window-stride", type=int, default=5)
+    pipe.add_argument("--frame-stride", type=int, default=None, help="Default: checkpoint training frame stride")
+    pipe.add_argument("--window-stride", type=int, default=None, help="Default: checkpoint training window stride")
     pipe.add_argument("--linear-window-stride", type=int, default=None)
     pipe.add_argument("--sequence-frames", type=int, default=1)
     pipe.add_argument("--readout", choices=MODEL_READOUT_CHOICES, default="mean")

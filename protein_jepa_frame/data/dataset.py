@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import bisect
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import numpy as np
@@ -56,6 +56,13 @@ class _ClipEntry:
     count: int
 
 
+@dataclass(frozen=True)
+class _PairedEntry:
+    record_index: int
+    horizon_frames: int
+    count: int
+
+
 class TrajectoryClipDataset(Dataset):
     """Lazy fixed-length clip dataset over npz-backed trajectories."""
 
@@ -77,16 +84,18 @@ class TrajectoryClipDataset(Dataset):
             self.cumulative.append(total)
         if not self.entries:
             raise ValueError("no trajectory has enough frames for the requested clip length")
+        self._init_auxiliary_state(msm_labels_path)
+
+    def _init_auxiliary_state(self, msm_labels_path: str | None) -> None:
         self._topology_cache: dict[str, BackboneTopology] = {}
-        # Load MSM state labels
         self.msm_state_labels: dict[str, list[int]] | None = None
         if msm_labels_path:
             import json
             with open(msm_labels_path) as f:
                 lbl_data = json.load(f)
-            self.msm_state_labels = {}
-            for tid, t in lbl_data.get("trajectories", {}).items():
-                self.msm_state_labels[tid] = t["state_labels"]
+            self.msm_state_labels = {
+                tid: t["state_labels"] for tid, t in lbl_data.get("trajectories", {}).items()
+            }
 
     @staticmethod
     def _read_num_frames(record: TrajectoryRecord) -> int:
@@ -142,6 +151,16 @@ class TrajectoryClipDataset(Dataset):
             sample["msm_state_labels"] = state
         return sample
 
+    def _read_clip(self, record: TrajectoryRecord, frames: np.ndarray) -> dict:
+        fmt = record.format.lower()
+        if fmt == "npz":
+            return self._read_npz(record, frames)
+        if fmt == "protein-jepa-hdf5":
+            return self._read_normalized_h5(record, frames)
+        if fmt == "mdcath-hdf5":
+            return self._read_mdcath_h5(record, frames)
+        raise ValueError(f"unsupported trajectory format {record.format}")
+
     def _finalize(
         self,
         record: TrajectoryRecord,
@@ -153,8 +172,9 @@ class TrajectoryClipDataset(Dataset):
         residue_index: np.ndarray,
         chain_id: np.ndarray,
         time_ps: np.ndarray,
+        forces: np.ndarray | None = None,
     ) -> dict:
-        return {
+        sample = {
             "coords": torch.from_numpy(coords * self.config.coordinate_scale),
             "atom_mask": torch.from_numpy(atom_mask),
             "residue_mask": torch.from_numpy(residue_mask),
@@ -162,9 +182,16 @@ class TrajectoryClipDataset(Dataset):
             "residue_index": torch.from_numpy(residue_index),
             "chain_id": torch.from_numpy(chain_id),
             "time_ps": torch.from_numpy(time_ps.astype(np.float32, copy=False)),
+            "temperature_k": torch.tensor(
+                float(record.temperature_k) if record.temperature_k is not None else float("nan"), dtype=torch.float32
+            ),
+            "dataset": record.dataset or "unknown",
             "protein_id": record.protein_id,
             "trajectory_id": record.trajectory_id,
         }
+        if forces is not None:
+            sample["forces"] = torch.from_numpy(forces)
+        return sample
 
     def _read_npz(self, record: TrajectoryRecord, frames: np.ndarray) -> dict:
         with np.load(record.path, mmap_mode="r") as data:
@@ -225,14 +252,26 @@ class TrajectoryClipDataset(Dataset):
             group_name = (record.metadata or {}).get("hdf5_group")
             if not group_name:
                 raise ValueError(f"{record.trajectory_id} missing metadata.hdf5_group")
-            all_atom = np.asarray(handle[str(group_name)]["coords"][frames.tolist()], dtype=np.float32)
+            group = handle[str(group_name)]
+            all_atom = np.asarray(group["coords"][frames.tolist()], dtype=np.float32)
+            all_atom_forces = None
+            if self.config.load_forces:
+                if "forces" not in group:
+                    raise ValueError(f"{record.trajectory_id} has no force dataset")
+                all_atom_forces = np.asarray(group["forces"][frames.tolist()], dtype=np.float32)
         coords, atom_mask = self._gather_backbone(all_atom, topology)
+        forces = None
+        if all_atom_forces is not None:
+            forces, force_mask = self._gather_backbone(all_atom_forces, topology)
+            forces[~force_mask] = 0.0
         aatype = topology.aatype
         residue_index = topology.residue_index
         chain_id = topology.chain_id
         if self.config.max_residues is not None:
             L = self.config.max_residues
             coords = coords[:, :L]
+            if forces is not None:
+                forces = forces[:, :L]
             atom_mask = atom_mask[:, :L]
             aatype = aatype[:L]
             residue_index = residue_index[:L]
@@ -242,7 +281,10 @@ class TrajectoryClipDataset(Dataset):
             time_ps = record.first_frame_time_ps + frames.astype(np.float32) * float(record.frame_interval_ps)
         else:
             time_ps = frames.astype(np.float32)
-        return self._finalize(record, frames, coords, atom_mask, residue_mask, aatype, residue_index, chain_id, time_ps)
+        return self._finalize(
+            record, frames, coords, atom_mask, residue_mask, aatype,
+            residue_index, chain_id, time_ps, forces=forces,
+        )
 
     def _mdcath_topology(self, record: TrajectoryRecord) -> BackboneTopology:
         stat = record.path.stat()
@@ -317,6 +359,80 @@ class TrajectoryClipDataset(Dataset):
         return coords, atom_mask
 
 
+class PairedTrajectoryDataset(TrajectoryClipDataset):
+    """Two same-trajectory windows separated by a raw-frame horizon."""
+
+    def __init__(self, records: list[TrajectoryRecord], config: DataConfig, msm_labels_path: str | None = None):
+        self.records = records
+        self.config = config
+        self.horizons_frames = tuple(sorted({int(h) for h in config.paired_horizons_frames}))
+        if not self.horizons_frames or any(h <= 0 for h in self.horizons_frames):
+            raise ValueError("paired horizons must be positive")
+        if any(h % config.frame_stride != 0 for h in self.horizons_frames):
+            raise ValueError("paired horizons must be divisible by frame_stride")
+        self.entries: list[_PairedEntry] = []
+        self.cumulative: list[int] = []
+        total = 0
+        span = (config.num_frames - 1) * config.frame_stride + 1
+        if config.paired_nonoverlap_only and any(horizon < span for horizon in self.horizons_frames):
+            raise ValueError(
+                "paired_nonoverlap_only requires every horizon to be at least "
+                f"the raw clip span ({span})"
+            )
+        for record_index, record in enumerate(records):
+            num_frames = record.num_frames or self._read_num_frames(record)
+            entry_horizons = (max(self.horizons_frames),) if config.paired_all_horizons else self.horizons_frames
+            for horizon in entry_horizons:
+                count = (num_frames - horizon - span) // config.window_stride + 1
+                if count <= 0:
+                    continue
+                self.entries.append(_PairedEntry(record_index, horizon, count))
+                total += count
+                self.cumulative.append(total)
+        if not self.entries:
+            raise ValueError("no trajectory has enough frames for paired windows")
+        self._init_auxiliary_state(msm_labels_path)
+
+    def _locate(self, index: int) -> tuple[TrajectoryRecord, np.ndarray, np.ndarray, int]:
+        if index < 0:
+            index += len(self)
+        if index < 0 or index >= len(self):
+            raise IndexError(index)
+        entry_idx = bisect.bisect_right(self.cumulative, index)
+        previous = self.cumulative[entry_idx - 1] if entry_idx else 0
+        local = index - previous
+        entry = self.entries[entry_idx]
+        start = local * self.config.window_stride
+        offsets = np.arange(self.config.num_frames, dtype=np.int64) * self.config.frame_stride
+        return self.records[entry.record_index], start + offsets, start + entry.horizon_frames + offsets, entry.horizon_frames
+
+    def __getitem__(self, index: int) -> dict:
+        record, context_frames, future_frames, horizon = self._locate(index)
+        context = self._read_clip(record, context_frames)
+        if self.config.paired_all_horizons:
+            start = int(context_frames[0])
+            offsets = np.arange(self.config.num_frames, dtype=np.int64) * self.config.frame_stride
+            pairs = []
+            for grouped_horizon in self.horizons_frames:
+                grouped_future = self._read_clip(record, start + grouped_horizon + offsets)
+                pairs.append(
+                    {
+                        "context": context,
+                        "future": grouped_future,
+                        "horizon_frames": torch.tensor(grouped_horizon, dtype=torch.long),
+                        "horizon_time_ps": grouped_future["time_ps"][0] - context["time_ps"][0],
+                    }
+                )
+            return {"pairs": pairs}
+        future = self._read_clip(record, future_frames)
+        return {
+            "context": context,
+            "future": future,
+            "horizon_frames": torch.tensor(horizon, dtype=torch.long),
+            "horizon_time_ps": future["time_ps"][0] - context["time_ps"][0],
+        }
+
+
 class SyntheticProteinDynamicsDataset(Dataset):
     """Smooth toy trajectories for smoke tests and CI."""
 
@@ -351,7 +467,7 @@ class SyntheticProteinDynamicsDataset(Dataset):
             bend[:, 2] = torch.cos(residue / 11.0 - time) * 0.6
             coords.append(base[:, None, :] + offsets[None, :, :] + bend[:, None, :])
         coords_t = torch.stack(coords, dim=0)
-        return {
+        sample = {
             "coords": coords_t,
             "atom_mask": torch.ones(T, L, 4, dtype=torch.bool),
             "residue_mask": torch.ones(T, L, dtype=torch.bool),
@@ -359,12 +475,85 @@ class SyntheticProteinDynamicsDataset(Dataset):
             "residue_index": torch.arange(L, dtype=torch.long),
             "chain_id": torch.zeros(L, dtype=torch.long),
             "time_ps": torch.arange(T, dtype=torch.float32),
+            "temperature_k": torch.tensor(300.0, dtype=torch.float32),
+            "dataset": "synthetic",
             "protein_id": f"synthetic_{index % 8}",
             "trajectory_id": f"synthetic_traj_{index}",
+        }
+        if self.config.load_forces:
+            center = coords_t.mean(dim=(1, 2), keepdim=True)
+            sample["forces"] = -(coords_t - center)
+        return sample
+
+
+class SyntheticPairedProteinDynamicsDataset(Dataset):
+    """Synthetic paired windows used by V2.1 smoke tests."""
+
+    def __init__(self, config: DataConfig):
+        self.config = config
+        self.horizons_frames = tuple(sorted({int(h) for h in config.paired_horizons_frames}))
+        if not self.horizons_frames or any(h <= 0 for h in self.horizons_frames):
+            raise ValueError("paired horizons must be positive")
+        if any(h % config.frame_stride != 0 for h in self.horizons_frames):
+            raise ValueError("paired horizons must be divisible by frame_stride")
+        span = (config.num_frames - 1) * config.frame_stride + 1
+        if config.paired_nonoverlap_only and any(horizon < span for horizon in self.horizons_frames):
+            raise ValueError(
+                "paired_nonoverlap_only requires every horizon to be at least "
+                f"the raw clip span ({span})"
+            )
+        total_frames = span + max(self.horizons_frames) + span - 1
+        full_config = replace(config, num_frames=total_frames, training_mode="clip")
+        self.base = SyntheticProteinDynamicsDataset(full_config)
+
+    def __len__(self) -> int:
+        multiplier = 1 if self.config.paired_all_horizons else len(self.horizons_frames)
+        return self.config.synthetic_size * multiplier
+
+    @staticmethod
+    def _slice(sample: dict, indices: torch.Tensor) -> dict:
+        frame_keys = {"coords", "forces", "atom_mask", "residue_mask", "time_ps", "msm_state_labels"}
+        return {
+            key: value[indices] if key in frame_keys and torch.is_tensor(value) else value
+            for key, value in sample.items()
+        }
+
+    def __getitem__(self, index: int) -> dict:
+        if self.config.paired_all_horizons:
+            sample = self.base[index]
+            offsets = torch.arange(self.config.num_frames, dtype=torch.long) * self.config.frame_stride
+            context = self._slice(sample, offsets)
+            return {
+                "pairs": [
+                    {
+                        "context": context,
+                        "future": self._slice(sample, offsets + horizon),
+                        "horizon_frames": torch.tensor(horizon, dtype=torch.long),
+                        "horizon_time_ps": sample["time_ps"][horizon] - sample["time_ps"][0],
+                    }
+                    for horizon in self.horizons_frames
+                ]
+            }
+        horizon_index = index % len(self.horizons_frames)
+        base_index = index // len(self.horizons_frames)
+        horizon = self.horizons_frames[horizon_index]
+        sample = self.base[base_index]
+        offsets = torch.arange(self.config.num_frames, dtype=torch.long) * self.config.frame_stride
+        context = self._slice(sample, offsets)
+        future = self._slice(sample, offsets + horizon)
+        return {
+            "context": context,
+            "future": future,
+            "horizon_frames": torch.tensor(horizon, dtype=torch.long),
+            "horizon_time_ps": future["time_ps"][0] - context["time_ps"][0],
         }
 
 
 def build_dataset(config: DataConfig, msm_labels_path: str | None = None) -> Dataset:
+    if config.training_mode == "paired_window":
+        if config.manifest_path:
+            return PairedTrajectoryDataset(load_manifest(config.manifest_path), config, msm_labels_path=msm_labels_path)
+        return SyntheticPairedProteinDynamicsDataset(config)
     if config.manifest_path:
         return TrajectoryClipDataset(load_manifest(config.manifest_path), config, msm_labels_path=msm_labels_path)
     return SyntheticProteinDynamicsDataset(config)
