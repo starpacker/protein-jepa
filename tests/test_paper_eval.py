@@ -16,6 +16,7 @@ from protein_jepa_frame.eval.paper_eval import (
     _ridge_probe,
     _ridge_future_score,
     _stratified_trajectories,
+    _tmjepa_v3_readout,
     _window_overlap_ratio,
 )
 from protein_jepa_frame.eval.paper_eval import _model_readout
@@ -168,3 +169,66 @@ def test_historical_checkpoint_keys_restore_missing_model_flags():
 
     assert config.paired_forecast
     assert config.slow_state_enabled
+
+
+def test_tmjepa_v3_paper_readouts_are_causal_context_features():
+    dataset = SyntheticProteinDynamicsDataset(
+        DataConfig(batch_size=2, num_frames=8, synthetic_size=2, synthetic_residues=12)
+    )
+    batch = next(iter(DataLoader(dataset, batch_size=2, collate_fn=collate_clips)))
+    model = ProteinJEPA(
+        ModelConfig(
+            latent_dim=16,
+            encoder_depth=1,
+            temporal_depth=1,
+            temporal_causal=True,
+            temporal_causal_window=4,
+            temporal_position_encoding="none",
+            predictor_depth=1,
+            paired_forecast=True,
+            num_heads=4,
+            num_rbf=8,
+            tmjepa_enabled=True,
+            tmjepa_version=3,
+            tmjepa_learned_cv_dim=2,
+            tmjepa_learned_cv_burn_in_frames=3,
+            tmjepa_condition_dim=16,
+            tmjepa_auxiliary_dim=2,
+            tmjepa_diffusion_rank=1,
+            tmjepa_memory_enabled=False,
+            tmjepa_memory_times_ps=(1.0, 4.0),
+            tmjepa_base_step_ps=1.0,
+            tmjepa_max_rollout_steps=16,
+            tmjepa_ensemble_size=3,
+            tmjepa_cv_mean=(0.0,) * 16,
+            tmjepa_cv_scale=(1.0,) * 16,
+        )
+    )
+    model.eval()
+    latents = model.context_encoder(
+        coords=batch["coords"],
+        residue_mask=batch["residue_mask"],
+        aatype=batch["aatype"],
+        residue_index=batch["residue_index"],
+        chain_id=batch["chain_id"],
+        token_mask=None,
+    )
+
+    cv = _tmjepa_v3_readout(model, batch, latents, "tmjepa_cv", pool="last")
+    fixed_cv = _tmjepa_v3_readout(
+        model, batch, latents, "tmjepa_fixed_cv", pool="last"
+    )
+    learned_cv = _tmjepa_v3_readout(
+        model, batch, latents, "tmjepa_learned_cv", pool="last"
+    )
+    condition = _tmjepa_v3_readout(model, batch, latents, "tmjepa_condition", pool="last")
+    combined = _tmjepa_v3_readout(model, batch, latents, "tmjepa_cv_condition_kinetics", pool="mean")
+
+    assert cv.shape == (2, 18)
+    assert fixed_cv.shape == (2, 16)
+    assert learned_cv.shape == (2, 2)
+    assert torch.equal(cv, torch.cat([fixed_cv, learned_cv], dim=-1))
+    assert condition.shape == (2, 16)
+    assert combined.shape[0] == 2
+    assert combined.shape[1] > cv.shape[1] + condition.shape[1]
+    assert torch.isfinite(combined).all()

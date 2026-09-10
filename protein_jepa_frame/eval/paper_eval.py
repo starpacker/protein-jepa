@@ -60,9 +60,29 @@ MODEL_READOUT_CHOICES = [
     "state_geom",
     "state_clip_geom",
     "state_clip_delta_geom",
+    "v51_state",
+    "v51_memory",
+    "v51_state_memory",
+    "v51_router",
+    "tmjepa_cv",
+    "tmjepa_fixed_cv",
+    "tmjepa_learned_cv",
+    "tmjepa_condition",
+    "tmjepa_cv_condition",
+    "tmjepa_kinetics",
+    "tmjepa_cv_condition_kinetics",
 ]
 
 GEOMETRY_FUSION_READOUTS = {"state_geom", "state_clip_geom", "state_clip_delta_geom"}
+TMJEPA_V3_READOUTS = {
+    "tmjepa_cv",
+    "tmjepa_fixed_cv",
+    "tmjepa_learned_cv",
+    "tmjepa_condition",
+    "tmjepa_cv_condition",
+    "tmjepa_kinetics",
+    "tmjepa_cv_condition_kinetics",
+}
 
 
 def _geometry_fusion_base_readout(readout: str) -> str:
@@ -227,6 +247,33 @@ def _model_readout(
             dataset_index=dataset_index,
         )
         return kinetic[:, -1]
+    if readout in {"v51_state", "v51_memory", "v51_state_memory", "v51_router"}:
+        if model.v51_contextual_dynamics is None:
+            raise ValueError(f"{readout} readout requires V5.1 sparse motion dynamics")
+        frame_mask = residue_mask.any(dim=2)
+        state, memory, static, _tokens = model.v51_contextual_dynamics.state_encoder(
+            frame_states,
+            frame_mask,
+            time_ps,
+        )
+        if readout == "v51_state":
+            return state
+        if readout == "v51_memory":
+            return memory
+        if readout == "v51_state_memory":
+            return torch.cat([state, memory], dim=-1)
+        horizon = model.v51_contextual_dynamics.horizon_embed(
+            torch.full(
+                (state.shape[0],),
+                model.v51_contextual_dynamics.base_step_ps,
+                device=state.device,
+                dtype=state.dtype,
+            )
+        ).to(dtype=state.dtype)
+        probabilities, _, _, _, _ = model.v51_contextual_dynamics._route(
+            state, memory, static, horizon
+        )
+        return probabilities
     if frame_states.shape[1] > 1:
         delta_state = frame_states[:, -1] - frame_states[:, -2]
     else:
@@ -294,6 +341,125 @@ def _model_readout(
     raise ValueError(f"unknown model readout {readout}")
 
 
+def _last_valid_frames(values: torch.Tensor, frame_mask: torch.Tensor) -> torch.Tensor:
+    frame_index = torch.arange(frame_mask.shape[1], device=frame_mask.device).view(1, -1)
+    last = frame_mask.long().mul(frame_index).max(dim=1).values
+    batch_index = torch.arange(frame_mask.shape[0], device=frame_mask.device)
+    return values[batch_index, last]
+
+
+def _masked_frame_mean(values: torch.Tensor, frame_mask: torch.Tensor) -> torch.Tensor:
+    weights = frame_mask.unsqueeze(-1).to(dtype=values.dtype)
+    return (values * weights).sum(dim=1) / weights.sum(dim=1).clamp(min=1)
+
+
+def _tmjepa_v3_cv_sequence(model: ProteinJEPA, batch: dict, latents: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    if model.tmjepa is None or getattr(model.config, "tmjepa_version", None) != 3:
+        raise ValueError("TM-JEPA V3 readouts require a TM-JEPA V3 checkpoint")
+    tmjepa = model.tmjepa
+    fixed_raw = tmjepa.collective_variables(
+        batch["coords"],
+        batch["atom_mask"],
+        batch["residue_mask"],
+        batch["chain_id"],
+        batch["residue_index"],
+    )
+    fixed_cv = (
+        fixed_raw - tmjepa.cv_mean[: tmjepa.fixed_cv_dim].to(fixed_raw)
+    ) / tmjepa.cv_scale[: tmjepa.fixed_cv_dim].to(fixed_raw).clamp(min=1.0e-6)
+    frame_mask = batch["residue_mask"].any(dim=2)
+    if tmjepa.learned_projection is not None:
+        states = model.encode_causal_states(
+            latents,
+            batch["residue_mask"],
+            time_ps=batch.get("time_ps"),
+            temperature_k=batch.get("temperature_k"),
+            dataset_index=batch.get("dataset_index"),
+        )
+        learned_cv = tmjepa.learned_projection(states["frame_states"])
+        cv = torch.cat([fixed_cv, learned_cv], dim=-1)
+    else:
+        cv = fixed_cv
+    if tmjepa.learned_cv_dim and tmjepa.learned_cv_burn_in_frames:
+        start = int(tmjepa.learned_cv_burn_in_frames)
+        if start >= cv.shape[1]:
+            raise ValueError("TM-JEPA V3 learned-CV burn-in leaves no evaluation frame")
+        cv = cv[:, start:]
+        frame_mask = frame_mask[:, start:]
+    return cv, frame_mask
+
+
+def _tmjepa_v3_condition(model: ProteinJEPA, batch: dict) -> torch.Tensor:
+    tmjepa = model.tmjepa
+    if tmjepa is None:
+        raise ValueError("TM-JEPA condition readout requires a TM-JEPA checkpoint")
+    return tmjepa.condition_encoder(
+        batch["aatype"],
+        batch["residue_index"],
+        batch["residue_mask"].any(dim=1),
+        batch.get("dataset_index"),
+    )
+
+
+def _tmjepa_v3_kinetic_features(
+    model: ProteinJEPA,
+    cv: torch.Tensor,
+    condition: torch.Tensor,
+    temperature_k: torch.Tensor | None,
+) -> torch.Tensor:
+    tmjepa = model.tmjepa
+    if tmjepa is None:
+        raise ValueError("TM-JEPA kinetics readout requires a TM-JEPA checkpoint")
+    temperature = tmjepa.dynamics._temperature(temperature_k, cv.shape[0], cv)
+    kinetic = tmjepa.dynamics.kinetic_parameters(condition, temperature, cv)
+    return torch.cat(
+        [
+            kinetic["diagonal_diffusion_rates"],
+            kinetic["diffusion_rates"],
+            kinetic["coupling_rates"],
+            kinetic["relaxation_rates"],
+            kinetic["diagonal_activation_energy"],
+            kinetic["memory_activation_energy"],
+        ],
+        dim=-1,
+    )
+
+
+def _tmjepa_v3_readout(
+    model: ProteinJEPA,
+    batch: dict,
+    latents: torch.Tensor,
+    readout: str,
+    pool: str,
+) -> torch.Tensor:
+    cv_sequence, frame_mask = _tmjepa_v3_cv_sequence(model, batch, latents)
+    if pool == "last":
+        cv = _last_valid_frames(cv_sequence, frame_mask)
+    elif pool == "mean":
+        cv = _masked_frame_mean(cv_sequence, frame_mask)
+    else:
+        raise ValueError(f"unknown TM-JEPA V3 pooling mode {pool}")
+    condition = _tmjepa_v3_condition(model, batch)
+    if readout == "tmjepa_cv":
+        return cv
+    if readout == "tmjepa_fixed_cv":
+        return cv[..., : model.tmjepa.fixed_cv_dim]
+    if readout == "tmjepa_learned_cv":
+        if model.tmjepa.learned_cv_dim <= 0:
+            raise ValueError("learned-CV readout requires learned CV dimensions")
+        return cv[..., model.tmjepa.fixed_cv_dim :]
+    if readout == "tmjepa_condition":
+        return condition
+    if readout == "tmjepa_cv_condition":
+        return torch.cat([cv, condition], dim=-1)
+    kinetics = _tmjepa_v3_kinetic_features(model, cv, condition, batch.get("temperature_k"))
+    if readout == "tmjepa_kinetics":
+        return kinetics
+    if readout == "tmjepa_cv_condition_kinetics":
+        return torch.cat([cv, condition, kinetics], dim=-1)
+    raise ValueError(f"unknown TM-JEPA V3 readout {readout}")
+
+
 @torch.no_grad()
 def extract_model_frame_sequences(
     model: ProteinJEPA,
@@ -336,15 +502,18 @@ def extract_model_frame_sequences(
             chain_id=batch["chain_id"],
             token_mask=None,
         )
-        pooled = _model_readout(
-            model,
-            latents,
-            batch["residue_mask"],
-            _geometry_fusion_base_readout(readout) if readout in GEOMETRY_FUSION_READOUTS else readout,
-            time_ps=batch.get("time_ps"),
-            temperature_k=batch.get("temperature_k"),
-            dataset_index=batch.get("dataset_index"),
-        )
+        if readout in TMJEPA_V3_READOUTS:
+            pooled = _tmjepa_v3_readout(model, batch, latents, readout, pool="last")
+        else:
+            pooled = _model_readout(
+                model,
+                latents,
+                batch["residue_mask"],
+                _geometry_fusion_base_readout(readout) if readout in GEOMETRY_FUSION_READOUTS else readout,
+                time_ps=batch.get("time_ps"),
+                temperature_k=batch.get("temperature_k"),
+                dataset_index=batch.get("dataset_index"),
+            )
         if geom_features is not None:
             pooled = torch.cat([pooled, geom_features.to(dtype=pooled.dtype)], dim=-1)
         B = pooled.shape[0]
@@ -1075,7 +1244,9 @@ def extract_clip_latents_with_labels(
             chain_id=batch["chain_id"],
             token_mask=None,
         )
-        if readout == "mean":
+        if readout in TMJEPA_V3_READOUTS:
+            clip_latents = _tmjepa_v3_readout(model, batch, latents, readout, pool="mean")
+        elif readout == "mean":
             valid = batch["residue_mask"].unsqueeze(-1).float()
             pooled = (latents * valid).sum(dim=2) / valid.sum(dim=2).clamp(min=1)
             clip_valid = batch["residue_mask"].any(dim=2).unsqueeze(-1).float()
@@ -1208,6 +1379,10 @@ def extract_clip_latents_with_labels(
             "state_clip_delta_mean",
             "local_dynamics",
             "local_metastable",
+            "v51_state",
+            "v51_memory",
+            "v51_state_memory",
+            "v51_router",
         }:
             clip_latents = _model_readout(
                 model,

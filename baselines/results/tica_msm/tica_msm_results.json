@@ -1,0 +1,28 @@
+{
+  "method": "tica_msm",
+  "time_seconds": 199.3,
+  "n_successful": 30,
+  "n_proteins": 30,
+  "vamp2_scores": {
+    "lag_1": {"mean": 1.9667, "std": 0.7112, "n_trajs": 250},
+    "lag_2": {"mean": 1.9034, "std": 0.6971, "n_trajs": 250},
+    "lag_5": {"mean": 1.7995, "std": 0.6424, "n_trajs": 250},
+    "lag_10": {"mean": 1.6749, "std": 0.5582, "n_trajs": 248},
+    "lag_20": {"mean": 1.5125, "std": 0.4381, "n_trajs": 242}
+  },
+  "state_accuracy": {
+    "top1_accuracy": 0.3167,
+    "top2_accuracy": 0.4769,
+    "balanced_accuracy": 0.1899,
+    "persistence_accuracy": 0.9364,
+    "n_frames": 128359,
+    "n_trajectories": 354
+  },
+  "msm_probe": {
+    "mean_accuracy": 0.9456,
+    "std_accuracy": 0.0163,
+    "mean_baseline": 0.4152,
+    "n_above_baseline": 30,
+    "n_total": 30
+  }
+}

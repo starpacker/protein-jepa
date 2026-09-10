@@ -359,12 +359,33 @@ class TrajectoryClipDataset(Dataset):
         return coords, atom_mask
 
 
+def _paired_context_offsets(config: DataConfig) -> np.ndarray:
+    """Build chronological offsets with recent and slow endpoint history."""
+    if config.paired_history_mode == "uniform":
+        return np.arange(config.num_frames, dtype=np.int64) * config.frame_stride
+    if config.paired_history_mode != "multiscale":
+        raise ValueError(f"unknown paired_history_mode {config.paired_history_mode}")
+    recent = int(config.paired_recent_frames)
+    slow_stride = int(config.paired_slow_stride)
+    if not 1 <= recent < config.num_frames:
+        raise ValueError("paired_recent_frames must be between 1 and num_frames - 1")
+    if slow_stride <= config.frame_stride:
+        raise ValueError("paired_slow_stride must exceed frame_stride")
+    recent_back = np.arange(recent, dtype=np.int64) * config.frame_stride
+    slow_back = recent * config.frame_stride + np.arange(
+        config.num_frames - recent, dtype=np.int64
+    ) * slow_stride
+    span = int(max(recent_back.max(initial=0), slow_back.max(initial=0)) + 1)
+    return np.sort(span - 1 - np.concatenate([recent_back, slow_back]))
+
+
 class PairedTrajectoryDataset(TrajectoryClipDataset):
     """Two same-trajectory windows separated by a raw-frame horizon."""
 
     def __init__(self, records: list[TrajectoryRecord], config: DataConfig, msm_labels_path: str | None = None):
         self.records = records
         self.config = config
+        self.context_offsets = _paired_context_offsets(config)
         self.horizons_frames = tuple(sorted({int(h) for h in config.paired_horizons_frames}))
         if not self.horizons_frames or any(h <= 0 for h in self.horizons_frames):
             raise ValueError("paired horizons must be positive")
@@ -373,7 +394,7 @@ class PairedTrajectoryDataset(TrajectoryClipDataset):
         self.entries: list[_PairedEntry] = []
         self.cumulative: list[int] = []
         total = 0
-        span = (config.num_frames - 1) * config.frame_stride + 1
+        span = max(self.context_offsets) + 1
         if config.paired_nonoverlap_only and any(horizon < span for horizon in self.horizons_frames):
             raise ValueError(
                 "paired_nonoverlap_only requires every horizon to be at least "
@@ -403,7 +424,7 @@ class PairedTrajectoryDataset(TrajectoryClipDataset):
         local = index - previous
         entry = self.entries[entry_idx]
         start = local * self.config.window_stride
-        offsets = np.arange(self.config.num_frames, dtype=np.int64) * self.config.frame_stride
+        offsets = self.context_offsets
         return self.records[entry.record_index], start + offsets, start + entry.horizon_frames + offsets, entry.horizon_frames
 
     def __getitem__(self, index: int) -> dict:
@@ -411,7 +432,7 @@ class PairedTrajectoryDataset(TrajectoryClipDataset):
         context = self._read_clip(record, context_frames)
         if self.config.paired_all_horizons:
             start = int(context_frames[0])
-            offsets = np.arange(self.config.num_frames, dtype=np.int64) * self.config.frame_stride
+            offsets = self.context_offsets
             pairs = []
             for grouped_horizon in self.horizons_frames:
                 grouped_future = self._read_clip(record, start + grouped_horizon + offsets)
@@ -491,12 +512,13 @@ class SyntheticPairedProteinDynamicsDataset(Dataset):
 
     def __init__(self, config: DataConfig):
         self.config = config
+        self.context_offsets = _paired_context_offsets(config)
         self.horizons_frames = tuple(sorted({int(h) for h in config.paired_horizons_frames}))
         if not self.horizons_frames or any(h <= 0 for h in self.horizons_frames):
             raise ValueError("paired horizons must be positive")
         if any(h % config.frame_stride != 0 for h in self.horizons_frames):
             raise ValueError("paired horizons must be divisible by frame_stride")
-        span = (config.num_frames - 1) * config.frame_stride + 1
+        span = max(self.context_offsets) + 1
         if config.paired_nonoverlap_only and any(horizon < span for horizon in self.horizons_frames):
             raise ValueError(
                 "paired_nonoverlap_only requires every horizon to be at least "
@@ -521,7 +543,7 @@ class SyntheticPairedProteinDynamicsDataset(Dataset):
     def __getitem__(self, index: int) -> dict:
         if self.config.paired_all_horizons:
             sample = self.base[index]
-            offsets = torch.arange(self.config.num_frames, dtype=torch.long) * self.config.frame_stride
+            offsets = torch.as_tensor(self.context_offsets, dtype=torch.long)
             context = self._slice(sample, offsets)
             return {
                 "pairs": [
@@ -538,7 +560,7 @@ class SyntheticPairedProteinDynamicsDataset(Dataset):
         base_index = index // len(self.horizons_frames)
         horizon = self.horizons_frames[horizon_index]
         sample = self.base[base_index]
-        offsets = torch.arange(self.config.num_frames, dtype=torch.long) * self.config.frame_stride
+        offsets = torch.as_tensor(self.context_offsets, dtype=torch.long)
         context = self._slice(sample, offsets)
         future = self._slice(sample, offsets + horizon)
         return {

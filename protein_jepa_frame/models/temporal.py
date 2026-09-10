@@ -55,6 +55,7 @@ class TemporalStateEncoder(nn.Module):
         time_conditioning: str = "none",
         thermodynamic_conditioning: bool = False,
         causal: bool = False,
+        causal_window: int = 0,
         position_encoding: str = "learned",
         delta_features: bool = False,
         motion_depth: int = 0,
@@ -64,6 +65,11 @@ class TemporalStateEncoder(nn.Module):
         self.time_conditioning = time_conditioning
         self.thermodynamic_conditioning = thermodynamic_conditioning
         self.causal = causal
+        if causal_window < 0:
+            raise ValueError("causal_window must be non-negative")
+        if causal_window and not causal:
+            raise ValueError("causal_window requires causal temporal attention")
+        self.causal_window = int(causal_window)
         if position_encoding not in {"learned", "none"}:
             raise ValueError(f"unknown temporal position encoding {position_encoding}")
         self.position_encoding = position_encoding
@@ -185,6 +191,11 @@ class TemporalStateEncoder(nn.Module):
             )
             attention_mask[0] = False
             attention_mask[1:, 0] = True
+            if self.causal_window:
+                query = torch.arange(T, device=x.device)[:, None]
+                key = torch.arange(T, device=x.device)[None, :]
+                too_old = key < query - self.causal_window + 1
+                attention_mask[1:, 1:] |= too_old
         x = self.blocks(x, mask=attention_mask, src_key_padding_mask=padding)
         x = self.norm(x)
         out = {"clip_state": x[:, 0], "frame_states": x[:, 1:]}

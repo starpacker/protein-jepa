@@ -1,1 +1,1 @@
-"""Evaluation entry points will live here; MSM labels remain evaluation-only."""
+"""Evaluation suite for LSP-WM protein dynamics world model."""

@@ -1,0 +1,1083 @@
+{
+  "timestamp": "2026-08-30",
+  "dataset": "mdCATH validation set (30 proteins, 354 trajectories)",
+  "results": {
+    "tica_msm": {
+      "method": "tica_msm",
+      "time_seconds": 199.3,
+      "n_successful": 30,
+      "n_proteins": 30,
+      "vamp2_scores": {
+        "lag_1": {
+          "mean": 1.9667,
+          "std": 0.7112,
+          "n_trajs": 250
+        },
+        "lag_2": {
+          "mean": 1.9034,
+          "std": 0.6971,
+          "n_trajs": 250
+        },
+        "lag_5": {
+          "mean": 1.7995,
+          "std": 0.6424,
+          "n_trajs": 250
+        },
+        "lag_10": {
+          "mean": 1.6749,
+          "std": 0.5582,
+          "n_trajs": 248
+        },
+        "lag_20": {
+          "mean": 1.5125,
+          "std": 0.4381,
+          "n_trajs": 242
+        }
+      },
+      "state_accuracy": {
+        "top1_accuracy": 0.3167,
+        "top2_accuracy": 0.4769,
+        "balanced_accuracy": 0.1899,
+        "persistence_accuracy": 0.9364,
+        "n_frames": 128359,
+        "n_trajectories": 354
+      },
+      "msm_probe": {
+        "mean_accuracy": 0.9456,
+        "std_accuracy": 0.0163,
+        "mean_baseline": 0.4152,
+        "n_above_baseline": 30,
+        "n_total": 30
+      }
+    },
+    "vampnet": {
+      "method": "vampnet",
+      "n_proteins": 30,
+      "n_successful": 30,
+      "time_seconds": 150.26013898849487,
+      "params": {
+        "n_states": 6,
+        "lag": 1,
+        "max_epochs": 200,
+        "seed": 42
+      },
+      "protein_results": [
+        {
+          "protein_id": "1ayeA02",
+          "status": "success",
+          "n_trajectories": 16,
+          "n_epochs": 22,
+          "final_val_loss": -0.004084421321749687
+        },
+        {
+          "protein_id": "1bd3A00",
+          "status": "success",
+          "n_trajectories": 13,
+          "n_epochs": 21,
+          "final_val_loss": NaN
+        },
+        {
+          "protein_id": "1cjxB02",
+          "status": "success",
+          "n_trajectories": 10,
+          "n_epochs": 34,
+          "final_val_loss": -0.017074523493647575
+        },
+        {
+          "protein_id": "1eswA00",
+          "status": "success",
+          "n_trajectories": 14,
+          "n_epochs": 24,
+          "final_val_loss": NaN
+        },
+        {
+          "protein_id": "1hq0A00",
+          "status": "success",
+          "n_trajectories": 14,
+          "n_epochs": 32,
+          "final_val_loss": -0.0007386181969195604
+        },
+        {
+          "protein_id": "1ia5A00",
+          "status": "success",
+          "n_trajectories": 11,
+          "n_epochs": 21,
+          "final_val_loss": -0.007924514822661877
+        },
+        {
+          "protein_id": "1iicA02",
+          "status": "success",
+          "n_trajectories": 11,
+          "n_epochs": 26,
+          "final_val_loss": -0.001046116929501295
+        },
+        {
+          "protein_id": "1myrA00",
+          "status": "success",
+          "n_trajectories": 12,
+          "n_epochs": 22,
+          "final_val_loss": NaN
+        },
+        {
+          "protein_id": "1qmgA02",
+          "status": "success",
+          "n_trajectories": 10,
+          "n_epochs": 35,
+          "final_val_loss": NaN
+        },
+        {
+          "protein_id": "1ru4A00",
+          "status": "success",
+          "n_trajectories": 12,
+          "n_epochs": 21,
+          "final_val_loss": -2.490321046166172e-13
+        },
+        {
+          "protein_id": "1u0vB01",
+          "status": "success",
+          "n_trajectories": 6,
+          "n_epochs": 83,
+          "final_val_loss": -0.04994076490402222
+        },
+        {
+          "protein_id": "1upsB01",
+          "status": "success",
+          "n_trajectories": 16,
+          "n_epochs": 32,
+          "final_val_loss": -0.003602480748668313
+        },
+        {
+          "protein_id": "1uteA00",
+          "status": "success",
+          "n_trajectories": 14,
+          "n_epochs": 49,
+          "final_val_loss": -0.006988293491303921
+        },
+        {
+          "protein_id": "2ahfA00",
+          "status": "success",
+          "n_trajectories": 7,
+          "n_epochs": 29,
+          "final_val_loss": -0.0
+        },
+        {
+          "protein_id": "2k4tA00",
+          "status": "success",
+          "n_trajectories": 6,
+          "n_epochs": 38,
+          "final_val_loss": -0.09128057956695557
+        },
+        {
+          "protein_id": "2mzbA00",
+          "status": "success",
+          "n_trajectories": 9,
+          "n_epochs": 34,
+          "final_val_loss": -0.04245942458510399
+        },
+        {
+          "protein_id": "2vztA03",
+          "status": "success",
+          "n_trajectories": 9,
+          "n_epochs": 22,
+          "final_val_loss": -0.01034820731729269
+        },
+        {
+          "protein_id": "2wcoA01",
+          "status": "success",
+          "n_trajectories": 11,
+          "n_epochs": 22,
+          "final_val_loss": NaN
+        },
+        {
+          "protein_id": "2zuvA03",
+          "status": "success",
+          "n_trajectories": 14,
+          "n_epochs": 33,
+          "final_val_loss": -0.007957510650157928
+        },
+        {
+          "protein_id": "3a6hB00",
+          "status": "success",
+          "n_trajectories": 15,
+          "n_epochs": 47,
+          "final_val_loss": -0.013813461177051067
+        },
+        {
+          "protein_id": "3b0xA05",
+          "status": "success",
+          "n_trajectories": 13,
+          "n_epochs": 21,
+          "final_val_loss": -0.005963072180747986
+        },
+        {
+          "protein_id": "3er6A00",
+          "status": "success",
+          "n_trajectories": 12,
+          "n_epochs": 28,
+          "final_val_loss": -0.025969574227929115
+        },
+        {
+          "protein_id": "3ihjA03",
+          "status": "success",
+          "n_trajectories": 13,
+          "n_epochs": 29,
+          "final_val_loss": -0.027435531839728355
+        },
+        {
+          "protein_id": "3ik4A02",
+          "status": "success",
+          "n_trajectories": 14,
+          "n_epochs": 34,
+          "final_val_loss": -0.013938114047050476
+        },
+        {
+          "protein_id": "3jr1A02",
+          "status": "success",
+          "n_trajectories": 10,
+          "n_epochs": 57,
+          "final_val_loss": -0.028341153636574745
+        },
+        {
+          "protein_id": "4beqA02",
+          "status": "success",
+          "n_trajectories": 14,
+          "n_epochs": 21,
+          "final_val_loss": -0.017942406237125397
+        },
+        {
+          "protein_id": "4ci8A02",
+          "status": "success",
+          "n_trajectories": 15,
+          "n_epochs": 37,
+          "final_val_loss": NaN
+        },
+        {
+          "protein_id": "4u49B02",
+          "status": "success",
+          "n_trajectories": 9,
+          "n_epochs": 21,
+          "final_val_loss": -0.004165954887866974
+        },
+        {
+          "protein_id": "5fl3A02",
+          "status": "success",
+          "n_trajectories": 14,
+          "n_epochs": 21,
+          "final_val_loss": -0.006953302770853043
+        },
+        {
+          "protein_id": "5h9fJ00",
+          "status": "success",
+          "n_trajectories": 10,
+          "n_epochs": 25,
+          "final_val_loss": -0.015183205716311932
+        }
+      ],
+      "vamp2_scores": {
+        "lag_1": {
+          "mean": 2.2264195283661774,
+          "std": 0.7503705792549518,
+          "n_trajs": 239
+        },
+        "lag_2": {
+          "mean": 2.0471730834176753,
+          "std": 0.6407559758362343,
+          "n_trajs": 239
+        },
+        "lag_5": {
+          "mean": 1.777280985548813,
+          "std": 0.5049155788381088,
+          "n_trajs": 239
+        },
+        "lag_10": {
+          "mean": 1.578870235385381,
+          "std": 0.41717661786736815,
+          "n_trajs": 239
+        },
+        "lag_20": {
+          "mean": 1.4109051038800524,
+          "std": 0.3445239233826091,
+          "n_trajs": 239
+        }
+      },
+      "brier_skill": {
+        "brier_score": NaN,
+        "persistence_brier": 0.021184641019491635,
+        "brier_skill": NaN,
+        "n_trajs": 354
+      },
+      "state_accuracy": {
+        "top1_accuracy": 0.2612983896727148,
+        "top2_accuracy": 0.6711878403540071,
+        "balanced_accuracy": 0.1890892415762928,
+        "persistence_accuracy": 0.936446076941525,
+        "n_frames": 128359,
+        "n_trajectories": 354
+      },
+      "msm_probe": {
+        "mean_accuracy": 0.945572162443064,
+        "std_accuracy": 0.016309311721268333,
+        "mean_baseline": 0.41522188283978667,
+        "n_above_baseline": 30,
+        "n_total": 30,
+        "protein_details": {
+          "1ayeA02": {
+            "accuracy": 0.9561351511558981,
+            "baseline": 0.4896265560165975,
+            "n_train": 3934,
+            "n_val": 1687,
+            "n_states": 6,
+            "best_C": 10.0
+          },
+          "1bd3A00": {
+            "accuracy": 0.9546925566343042,
+            "baseline": 0.5087378640776699,
+            "n_train": 3602,
+            "n_val": 1545,
+            "n_states": 6,
+            "best_C": 0.01
+          },
+          "1cjxB02": {
+            "accuracy": 0.9272908366533864,
+            "baseline": 0.3386454183266932,
+            "n_train": 2341,
+            "n_val": 1004,
+            "n_states": 6,
+            "best_C": 0.1
+          },
+          "1eswA00": {
+            "accuracy": 0.9324215607401448,
+            "baseline": 0.33789219629927597,
+            "n_train": 2899,
+            "n_val": 1243,
+            "n_states": 6,
+            "best_C": 0.01
+          },
+          "1hq0A00": {
+            "accuracy": 0.9443681318681318,
+            "baseline": 0.6304945054945055,
+            "n_train": 3396,
+            "n_val": 1456,
+            "n_states": 5,
+            "best_C": 1.0
+          },
+          "1ia5A00": {
+            "accuracy": 0.9316455696202531,
+            "baseline": 0.3468354430379747,
+            "n_train": 2763,
+            "n_val": 1185,
+            "n_states": 6,
+            "best_C": 0.1
+          },
+          "1iicA02": {
+            "accuracy": 0.9335394126738794,
+            "baseline": 0.3068006182380216,
+            "n_train": 3019,
+            "n_val": 1294,
+            "n_states": 6,
+            "best_C": 1.0
+          },
+          "1myrA00": {
+            "accuracy": 0.951969260326609,
+            "baseline": 0.2804995196926033,
+            "n_train": 2427,
+            "n_val": 1041,
+            "n_states": 6,
+            "best_C": 0.1
+          },
+          "1qmgA02": {
+            "accuracy": 0.9451827242524917,
+            "baseline": 0.43853820598006643,
+            "n_train": 1402,
+            "n_val": 602,
+            "n_states": 6,
+            "best_C": 0.1
+          },
+          "1ru4A00": {
+            "accuracy": 0.943474646716542,
+            "baseline": 0.3192019950124688,
+            "n_train": 2806,
+            "n_val": 1203,
+            "n_states": 6,
+            "best_C": 0.01
+          },
+          "1u0vB01": {
+            "accuracy": 0.9769585253456221,
+            "baseline": 0.41244239631336405,
+            "n_train": 1012,
+            "n_val": 434,
+            "n_states": 6,
+            "best_C": 0.1
+          },
+          "1upsB01": {
+            "accuracy": 0.9265936896329684,
+            "baseline": 0.3960077269800386,
+            "n_train": 3621,
+            "n_val": 1553,
+            "n_states": 6,
+            "best_C": 0.1
+          },
+          "1uteA00": {
+            "accuracy": 0.9391361256544503,
+            "baseline": 0.49280104712041883,
+            "n_train": 3565,
+            "n_val": 1528,
+            "n_states": 6,
+            "best_C": 0.01
+          },
+          "2ahfA00": {
+            "accuracy": 0.9398907103825137,
+            "baseline": 0.3224043715846995,
+            "n_train": 1281,
+            "n_val": 549,
+            "n_states": 6,
+            "best_C": 0.01
+          },
+          "2k4tA00": {
+            "accuracy": 0.9547169811320755,
+            "baseline": 0.5383647798742138,
+            "n_train": 1852,
+            "n_val": 795,
+            "n_states": 6,
+            "best_C": 1.0
+          },
+          "2mzbA00": {
+            "accuracy": 0.9005791505791506,
+            "baseline": 0.39285714285714285,
+            "n_train": 2415,
+            "n_val": 1036,
+            "n_states": 6,
+            "best_C": 0.01
+          },
+          "2vztA03": {
+            "accuracy": 0.9691629955947136,
+            "baseline": 0.24118942731277532,
+            "n_train": 2118,
+            "n_val": 908,
+            "n_states": 6,
+            "best_C": 0.1
+          },
+          "2wcoA01": {
+            "accuracy": 0.9587458745874587,
+            "baseline": 0.3358085808580858,
+            "n_train": 2828,
+            "n_val": 1212,
+            "n_states": 6,
+            "best_C": 0.01
+          },
+          "2zuvA03": {
+            "accuracy": 0.9660678642714571,
+            "baseline": 0.3320026613439787,
+            "n_train": 3506,
+            "n_val": 1503,
+            "n_states": 6,
+            "best_C": 0.01
+          },
+          "3a6hB00": {
+            "accuracy": 0.9239543726235742,
+            "baseline": 0.4796306355241716,
+            "n_train": 4295,
+            "n_val": 1841,
+            "n_states": 6,
+            "best_C": 0.1
+          },
+          "3b0xA05": {
+            "accuracy": 0.9234449760765551,
+            "baseline": 0.4407894736842105,
+            "n_train": 3899,
+            "n_val": 1672,
+            "n_states": 6,
+            "best_C": 0.01
+          },
+          "3er6A00": {
+            "accuracy": 0.9646739130434783,
+            "baseline": 0.4898097826086957,
+            "n_train": 3434,
+            "n_val": 1472,
+            "n_states": 6,
+            "best_C": 0.1
+          },
+          "3ihjA03": {
+            "accuracy": 0.9563046192259675,
+            "baseline": 0.44132334581772786,
+            "n_train": 3737,
+            "n_val": 1602,
+            "n_states": 6,
+            "best_C": 1.0
+          },
+          "3ik4A02": {
+            "accuracy": 0.9529639175257731,
+            "baseline": 0.5457474226804123,
+            "n_train": 3621,
+            "n_val": 1552,
+            "n_states": 6,
+            "best_C": 0.1
+          },
+          "3jr1A02": {
+            "accuracy": 0.9664634146341463,
+            "baseline": 0.4014227642276423,
+            "n_train": 2296,
+            "n_val": 984,
+            "n_states": 6,
+            "best_C": 0.01
+          },
+          "4beqA02": {
+            "accuracy": 0.9444772593030124,
+            "baseline": 0.3030124040165387,
+            "n_train": 3949,
+            "n_val": 1693,
+            "n_states": 6,
+            "best_C": 1.0
+          },
+          "4ci8A02": {
+            "accuracy": 0.9324894514767933,
+            "baseline": 0.36023206751054854,
+            "n_train": 4422,
+            "n_val": 1896,
+            "n_states": 6,
+            "best_C": 0.1
+          },
+          "4u49B02": {
+            "accuracy": 0.9531502423263328,
+            "baseline": 0.5872374798061389,
+            "n_train": 2888,
+            "n_val": 1238,
+            "n_states": 6,
+            "best_C": 10.0
+          },
+          "5fl3A02": {
+            "accuracy": 0.9529163738580464,
+            "baseline": 0.45397048489107517,
+            "n_train": 3318,
+            "n_val": 1423,
+            "n_states": 6,
+            "best_C": 0.1
+          },
+          "5h9fJ00": {
+            "accuracy": 0.943754565376187,
+            "baseline": 0.49233016800584367,
+            "n_train": 3193,
+            "n_val": 1369,
+            "n_states": 6,
+            "best_C": 0.1
+          }
+        }
+      }
+    },
+    "spib": {
+      "method": "spib",
+      "n_proteins": 30,
+      "n_successful": 30,
+      "time_seconds": 158.93814492225647,
+      "params": {
+        "n_states": 6,
+        "lag": 1,
+        "beta": 0.1,
+        "max_epochs": 200,
+        "seed": 42
+      },
+      "protein_results": [
+        {
+          "protein_id": "1ayeA02",
+          "status": "success",
+          "n_trajectories": 16,
+          "n_epochs": 23,
+          "final_val_loss": -0.17850163578987122
+        },
+        {
+          "protein_id": "1bd3A00",
+          "status": "success",
+          "n_trajectories": 13,
+          "n_epochs": 38,
+          "final_val_loss": -0.18554754555225372
+        },
+        {
+          "protein_id": "1cjxB02",
+          "status": "success",
+          "n_trajectories": 10,
+          "n_epochs": 45,
+          "final_val_loss": -0.21781307458877563
+        },
+        {
+          "protein_id": "1eswA00",
+          "status": "success",
+          "n_trajectories": 14,
+          "n_epochs": 32,
+          "final_val_loss": -0.17916493117809296
+        },
+        {
+          "protein_id": "1hq0A00",
+          "status": "success",
+          "n_trajectories": 14,
+          "n_epochs": 33,
+          "final_val_loss": -0.1791289895772934
+        },
+        {
+          "protein_id": "1ia5A00",
+          "status": "success",
+          "n_trajectories": 11,
+          "n_epochs": 42,
+          "final_val_loss": -0.17911182343959808
+        },
+        {
+          "protein_id": "1iicA02",
+          "status": "success",
+          "n_trajectories": 11,
+          "n_epochs": 24,
+          "final_val_loss": -0.20827023684978485
+        },
+        {
+          "protein_id": "1myrA00",
+          "status": "success",
+          "n_trajectories": 12,
+          "n_epochs": 24,
+          "final_val_loss": -0.1988898515701294
+        },
+        {
+          "protein_id": "1qmgA02",
+          "status": "success",
+          "n_trajectories": 10,
+          "n_epochs": 43,
+          "final_val_loss": -0.20803698897361755
+        },
+        {
+          "protein_id": "1ru4A00",
+          "status": "success",
+          "n_trajectories": 12,
+          "n_epochs": 32,
+          "final_val_loss": -0.18071967363357544
+        },
+        {
+          "protein_id": "1u0vB01",
+          "status": "success",
+          "n_trajectories": 6,
+          "n_epochs": 43,
+          "final_val_loss": -0.30236315727233887
+        },
+        {
+          "protein_id": "1upsB01",
+          "status": "success",
+          "n_trajectories": 16,
+          "n_epochs": 25,
+          "final_val_loss": -0.1791386902332306
+        },
+        {
+          "protein_id": "1uteA00",
+          "status": "success",
+          "n_trajectories": 14,
+          "n_epochs": 24,
+          "final_val_loss": -0.17899560928344727
+        },
+        {
+          "protein_id": "2ahfA00",
+          "status": "success",
+          "n_trajectories": 7,
+          "n_epochs": 41,
+          "final_val_loss": -0.21764150261878967
+        },
+        {
+          "protein_id": "2k4tA00",
+          "status": "success",
+          "n_trajectories": 6,
+          "n_epochs": 54,
+          "final_val_loss": -0.2613711357116699
+        },
+        {
+          "protein_id": "2mzbA00",
+          "status": "success",
+          "n_trajectories": 9,
+          "n_epochs": 44,
+          "final_val_loss": -0.19692778587341309
+        },
+        {
+          "protein_id": "2vztA03",
+          "status": "success",
+          "n_trajectories": 9,
+          "n_epochs": 25,
+          "final_val_loss": -0.22719480097293854
+        },
+        {
+          "protein_id": "2wcoA01",
+          "status": "success",
+          "n_trajectories": 11,
+          "n_epochs": 44,
+          "final_val_loss": -0.17902767658233643
+        },
+        {
+          "protein_id": "2zuvA03",
+          "status": "success",
+          "n_trajectories": 14,
+          "n_epochs": 23,
+          "final_val_loss": -0.21055927872657776
+        },
+        {
+          "protein_id": "3a6hB00",
+          "status": "success",
+          "n_trajectories": 15,
+          "n_epochs": 41,
+          "final_val_loss": -0.17912334203720093
+        },
+        {
+          "protein_id": "3b0xA05",
+          "status": "success",
+          "n_trajectories": 13,
+          "n_epochs": 25,
+          "final_val_loss": -0.1854989379644394
+        },
+        {
+          "protein_id": "3er6A00",
+          "status": "success",
+          "n_trajectories": 12,
+          "n_epochs": 35,
+          "final_val_loss": -0.17912445962429047
+        },
+        {
+          "protein_id": "3ihjA03",
+          "status": "success",
+          "n_trajectories": 13,
+          "n_epochs": 23,
+          "final_val_loss": -0.2126200646162033
+        },
+        {
+          "protein_id": "3ik4A02",
+          "status": "success",
+          "n_trajectories": 14,
+          "n_epochs": 24,
+          "final_val_loss": -0.2022310495376587
+        },
+        {
+          "protein_id": "3jr1A02",
+          "status": "success",
+          "n_trajectories": 10,
+          "n_epochs": 68,
+          "final_val_loss": -0.2462349385023117
+        },
+        {
+          "protein_id": "4beqA02",
+          "status": "success",
+          "n_trajectories": 14,
+          "n_epochs": 27,
+          "final_val_loss": -0.1968843787908554
+        },
+        {
+          "protein_id": "4ci8A02",
+          "status": "success",
+          "n_trajectories": 15,
+          "n_epochs": 31,
+          "final_val_loss": -0.17939908802509308
+        },
+        {
+          "protein_id": "4u49B02",
+          "status": "success",
+          "n_trajectories": 9,
+          "n_epochs": 27,
+          "final_val_loss": -0.21511626243591309
+        },
+        {
+          "protein_id": "5fl3A02",
+          "status": "success",
+          "n_trajectories": 14,
+          "n_epochs": 29,
+          "final_val_loss": -0.20849765837192535
+        },
+        {
+          "protein_id": "5h9fJ00",
+          "status": "success",
+          "n_trajectories": 10,
+          "n_epochs": 47,
+          "final_val_loss": -0.1791263222694397
+        }
+      ],
+      "vamp2_scores": {
+        "lag_1": {
+          "mean": 2.922682597940547,
+          "std": 1.0373054568363549,
+          "n_trajs": 249
+        },
+        "lag_2": {
+          "mean": 2.620748753605271,
+          "std": 0.900079143419449,
+          "n_trajs": 249
+        },
+        "lag_5": {
+          "mean": 2.1992442651981112,
+          "std": 0.7181122623472493,
+          "n_trajs": 249
+        },
+        "lag_10": {
+          "mean": 1.9043181117669619,
+          "std": 0.5821685155025648,
+          "n_trajs": 249
+        },
+        "lag_20": {
+          "mean": 1.665909503282339,
+          "std": 0.4840789366653494,
+          "n_trajs": 247
+        }
+      },
+      "brier_skill": {
+        "brier_score": 0.13868028704369778,
+        "persistence_brier": 0.021184641019491638,
+        "brier_skill": -5.546265613663236,
+        "n_trajs": 354
+      },
+      "state_accuracy": {
+        "top1_accuracy": 0.2481633543421186,
+        "top2_accuracy": 0.6711878403540071,
+        "balanced_accuracy": 0.20268646048514036,
+        "persistence_accuracy": 0.936446076941525,
+        "n_frames": 128359,
+        "n_trajectories": 354
+      },
+      "msm_probe": {
+        "mean_accuracy": 0.945572162443064,
+        "std_accuracy": 0.016309311721268333,
+        "mean_baseline": 0.41522188283978667,
+        "n_above_baseline": 30,
+        "n_total": 30,
+        "protein_details": {
+          "1ayeA02": {
+            "accuracy": 0.9561351511558981,
+            "baseline": 0.4896265560165975,
+            "n_train": 3934,
+            "n_val": 1687,
+            "n_states": 6,
+            "best_C": 10.0
+          },
+          "1bd3A00": {
+            "accuracy": 0.9546925566343042,
+            "baseline": 0.5087378640776699,
+            "n_train": 3602,
+            "n_val": 1545,
+            "n_states": 6,
+            "best_C": 0.01
+          },
+          "1cjxB02": {
+            "accuracy": 0.9272908366533864,
+            "baseline": 0.3386454183266932,
+            "n_train": 2341,
+            "n_val": 1004,
+            "n_states": 6,
+            "best_C": 0.1
+          },
+          "1eswA00": {
+            "accuracy": 0.9324215607401448,
+            "baseline": 0.33789219629927597,
+            "n_train": 2899,
+            "n_val": 1243,
+            "n_states": 6,
+            "best_C": 0.01
+          },
+          "1hq0A00": {
+            "accuracy": 0.9443681318681318,
+            "baseline": 0.6304945054945055,
+            "n_train": 3396,
+            "n_val": 1456,
+            "n_states": 5,
+            "best_C": 1.0
+          },
+          "1ia5A00": {
+            "accuracy": 0.9316455696202531,
+            "baseline": 0.3468354430379747,
+            "n_train": 2763,
+            "n_val": 1185,
+            "n_states": 6,
+            "best_C": 0.1
+          },
+          "1iicA02": {
+            "accuracy": 0.9335394126738794,
+            "baseline": 0.3068006182380216,
+            "n_train": 3019,
+            "n_val": 1294,
+            "n_states": 6,
+            "best_C": 1.0
+          },
+          "1myrA00": {
+            "accuracy": 0.951969260326609,
+            "baseline": 0.2804995196926033,
+            "n_train": 2427,
+            "n_val": 1041,
+            "n_states": 6,
+            "best_C": 0.1
+          },
+          "1qmgA02": {
+            "accuracy": 0.9451827242524917,
+            "baseline": 0.43853820598006643,
+            "n_train": 1402,
+            "n_val": 602,
+            "n_states": 6,
+            "best_C": 0.1
+          },
+          "1ru4A00": {
+            "accuracy": 0.943474646716542,
+            "baseline": 0.3192019950124688,
+            "n_train": 2806,
+            "n_val": 1203,
+            "n_states": 6,
+            "best_C": 0.01
+          },
+          "1u0vB01": {
+            "accuracy": 0.9769585253456221,
+            "baseline": 0.41244239631336405,
+            "n_train": 1012,
+            "n_val": 434,
+            "n_states": 6,
+            "best_C": 0.1
+          },
+          "1upsB01": {
+            "accuracy": 0.9265936896329684,
+            "baseline": 0.3960077269800386,
+            "n_train": 3621,
+            "n_val": 1553,
+            "n_states": 6,
+            "best_C": 0.1
+          },
+          "1uteA00": {
+            "accuracy": 0.9391361256544503,
+            "baseline": 0.49280104712041883,
+            "n_train": 3565,
+            "n_val": 1528,
+            "n_states": 6,
+            "best_C": 0.01
+          },
+          "2ahfA00": {
+            "accuracy": 0.9398907103825137,
+            "baseline": 0.3224043715846995,
+            "n_train": 1281,
+            "n_val": 549,
+            "n_states": 6,
+            "best_C": 0.01
+          },
+          "2k4tA00": {
+            "accuracy": 0.9547169811320755,
+            "baseline": 0.5383647798742138,
+            "n_train": 1852,
+            "n_val": 795,
+            "n_states": 6,
+            "best_C": 1.0
+          },
+          "2mzbA00": {
+            "accuracy": 0.9005791505791506,
+            "baseline": 0.39285714285714285,
+            "n_train": 2415,
+            "n_val": 1036,
+            "n_states": 6,
+            "best_C": 0.01
+          },
+          "2vztA03": {
+            "accuracy": 0.9691629955947136,
+            "baseline": 0.24118942731277532,
+            "n_train": 2118,
+            "n_val": 908,
+            "n_states": 6,
+            "best_C": 0.1
+          },
+          "2wcoA01": {
+            "accuracy": 0.9587458745874587,
+            "baseline": 0.3358085808580858,
+            "n_train": 2828,
+            "n_val": 1212,
+            "n_states": 6,
+            "best_C": 0.01
+          },
+          "2zuvA03": {
+            "accuracy": 0.9660678642714571,
+            "baseline": 0.3320026613439787,
+            "n_train": 3506,
+            "n_val": 1503,
+            "n_states": 6,
+            "best_C": 0.01
+          },
+          "3a6hB00": {
+            "accuracy": 0.9239543726235742,
+            "baseline": 0.4796306355241716,
+            "n_train": 4295,
+            "n_val": 1841,
+            "n_states": 6,
+            "best_C": 0.1
+          },
+          "3b0xA05": {
+            "accuracy": 0.9234449760765551,
+            "baseline": 0.4407894736842105,
+            "n_train": 3899,
+            "n_val": 1672,
+            "n_states": 6,
+            "best_C": 0.01
+          },
+          "3er6A00": {
+            "accuracy": 0.9646739130434783,
+            "baseline": 0.4898097826086957,
+            "n_train": 3434,
+            "n_val": 1472,
+            "n_states": 6,
+            "best_C": 0.1
+          },
+          "3ihjA03": {
+            "accuracy": 0.9563046192259675,
+            "baseline": 0.44132334581772786,
+            "n_train": 3737,
+            "n_val": 1602,
+            "n_states": 6,
+            "best_C": 1.0
+          },
+          "3ik4A02": {
+            "accuracy": 0.9529639175257731,
+            "baseline": 0.5457474226804123,
+            "n_train": 3621,
+            "n_val": 1552,
+            "n_states": 6,
+            "best_C": 0.1
+          },
+          "3jr1A02": {
+            "accuracy": 0.9664634146341463,
+            "baseline": 0.4014227642276423,
+            "n_train": 2296,
+            "n_val": 984,
+            "n_states": 6,
+            "best_C": 0.01
+          },
+          "4beqA02": {
+            "accuracy": 0.9444772593030124,
+            "baseline": 0.3030124040165387,
+            "n_train": 3949,
+            "n_val": 1693,
+            "n_states": 6,
+            "best_C": 1.0
+          },
+          "4ci8A02": {
+            "accuracy": 0.9324894514767933,
+            "baseline": 0.36023206751054854,
+            "n_train": 4422,
+            "n_val": 1896,
+            "n_states": 6,
+            "best_C": 0.1
+          },
+          "4u49B02": {
+            "accuracy": 0.9531502423263328,
+            "baseline": 0.5872374798061389,
+            "n_train": 2888,
+            "n_val": 1238,
+            "n_states": 6,
+            "best_C": 10.0
+          },
+          "5fl3A02": {
+            "accuracy": 0.9529163738580464,
+            "baseline": 0.45397048489107517,
+            "n_train": 3318,
+            "n_val": 1423,
+            "n_states": 6,
+            "best_C": 0.1
+          },
+          "5h9fJ00": {
+            "accuracy": 0.943754565376187,
+            "baseline": 0.49233016800584367,
+            "n_train": 3193,
+            "n_val": 1369,
+            "n_states": 6,
+            "best_C": 0.1
+          }
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,267 @@
+{
+  "metadata": {
+    "seed": 6303,
+    "train_proteins": [
+      "1a0aA00",
+      "1a0sP00",
+      "1bf6A00",
+      "1bifA01",
+      "1bxrC02",
+      "1ci0B00",
+      "1cq3A00",
+      "1euaA00",
+      "1ex9A00",
+      "1g4wR02",
+      "1ju3A02",
+      "1k5mB00",
+      "1nwhA02",
+      "1ou5A02",
+      "1pjaA00",
+      "1pwuA04",
+      "1q2lA02",
+      "1qwzA00",
+      "1rv9A00",
+      "1uaiA00",
+      "2cfqA02",
+      "2ddzE00",
+      "2e1tA01",
+      "2ewfA03",
+      "2fi7A00",
+      "2g47A01",
+      "2h8gA00",
+      "2i74A00",
+      "2jo7A00",
+      "2kwbA00",
+      "2lcuA01",
+      "2p65A00",
+      "2qjgA00",
+      "2rhqB05",
+      "2xwtC00",
+      "2zj8A03",
+      "3a4uA00",
+      "3amrA00",
+      "3aqlA02",
+      "3b9oA00",
+      "3bk7A01",
+      "3c7aA01",
+      "3cx5A02",
+      "3ervA00",
+      "3go6A00",
+      "3khbB00",
+      "3klyD00",
+      "3kraC00",
+      "3o0aA00",
+      "3oiyB01",
+      "3pf8A00",
+      "3q3eA03",
+      "3r20A00",
+      "3tavA00",
+      "3wz2B00",
+      "4akgA02",
+      "4axzA00",
+      "4b9bA02",
+      "4c0xA00",
+      "4dzzA00",
+      "4elnA00",
+      "4es8B01",
+      "4fd4A00",
+      "4fp9A02",
+      "4fqmA02",
+      "4i4nA00",
+      "4i7zA00",
+      "4i9cA02",
+      "4nz1A01",
+      "4o6yB00",
+      "4qloA00",
+      "4qpgA00",
+      "4tvsA00",
+      "5a6bA03",
+      "5e1vB00",
+      "5fusA01",
+      "5hh1A00",
+      "5jp1A00",
+      "5lzpN00",
+      "5swuA00"
+    ],
+    "validation_proteins": [
+      "1ajoA00",
+      "1efpB00",
+      "1fuiA03",
+      "1g61A00",
+      "1k32A01",
+      "1kqfC00",
+      "2c6zA00",
+      "2dwcA03",
+      "2ft0A00",
+      "2i4lA01",
+      "2ykyA02",
+      "2z84A00",
+      "2zodA02",
+      "3ar4A04",
+      "3d19B00",
+      "3n7mA02",
+      "4dkwA00",
+      "4o5qA01",
+      "4oc8A01",
+      "4xjxA03"
+    ],
+    "blind_proteins": [
+      "1ap8A00",
+      "1t70A00",
+      "1wwlB00",
+      "2ebfX04",
+      "2fb2B00",
+      "2fji102",
+      "2gfpA00",
+      "2uwaA00",
+      "2xedC00",
+      "3eb7A03",
+      "3i5xA02",
+      "3jciA00",
+      "3slpA00",
+      "3tt9A00",
+      "3u64A00",
+      "4ap5A01",
+      "4aw9A00",
+      "4kp2A01",
+      "4nh0A03",
+      "4qpiC00"
+    ],
+    "blind_excludes_previous_pilot": true
+  },
+  "splits": {
+    "train": {
+      "path": "manifests/tmjepa_v3.train.jsonl",
+      "records": 960,
+      "proteins": 80,
+      "temperatures": [
+        320.0,
+        348.0,
+        379.0,
+        413.0
+      ],
+      "replicas": [
+        "0",
+        "1",
+        "2"
+      ]
+    },
+    "validation": {
+      "path": "manifests/tmjepa_v3.validation.jsonl",
+      "records": 80,
+      "proteins": 20,
+      "temperatures": [
+        320.0,
+        348.0,
+        379.0,
+        413.0
+      ],
+      "replicas": [
+        "3"
+      ]
+    },
+    "test": {
+      "path": "manifests/tmjepa_v3.test.jsonl",
+      "records": 80,
+      "proteins": 20,
+      "temperatures": [
+        320.0,
+        348.0,
+        379.0,
+        413.0
+      ],
+      "replicas": [
+        "4"
+      ]
+    },
+    "temperature_test": {
+      "path": "manifests/tmjepa_v3.temperature_test.jsonl",
+      "records": 20,
+      "proteins": 20,
+      "temperatures": [
+        450.0
+      ],
+      "replicas": [
+        "4"
+      ]
+    },
+    "temperature_cv_348_train": {
+      "path": "manifests/tmjepa_v3.temperature_cv_348_train.jsonl",
+      "records": 720,
+      "proteins": 80,
+      "temperatures": [
+        320.0,
+        379.0,
+        413.0
+      ],
+      "replicas": [
+        "0",
+        "1",
+        "2"
+      ]
+    },
+    "temperature_cv_348_validation": {
+      "path": "manifests/tmjepa_v3.temperature_cv_348_validation.jsonl",
+      "records": 20,
+      "proteins": 20,
+      "temperatures": [
+        348.0
+      ],
+      "replicas": [
+        "3"
+      ]
+    },
+    "temperature_cv_379_train": {
+      "path": "manifests/tmjepa_v3.temperature_cv_379_train.jsonl",
+      "records": 720,
+      "proteins": 80,
+      "temperatures": [
+        320.0,
+        348.0,
+        413.0
+      ],
+      "replicas": [
+        "0",
+        "1",
+        "2"
+      ]
+    },
+    "temperature_cv_379_validation": {
+      "path": "manifests/tmjepa_v3.temperature_cv_379_validation.jsonl",
+      "records": 20,
+      "proteins": 20,
+      "temperatures": [
+        379.0
+      ],
+      "replicas": [
+        "3"
+      ]
+    },
+    "temperature_cv_413_train": {
+      "path": "manifests/tmjepa_v3.temperature_cv_413_train.jsonl",
+      "records": 720,
+      "proteins": 80,
+      "temperatures": [
+        320.0,
+        348.0,
+        379.0
+      ],
+      "replicas": [
+        "0",
+        "1",
+        "2"
+      ]
+    },
+    "temperature_cv_413_validation": {
+      "path": "manifests/tmjepa_v3.temperature_cv_413_validation.jsonl",
+      "records": 20,
+      "proteins": 20,
+      "temperatures": [
+        413.0
+      ],
+      "replicas": [
+        "3"
+      ]
+    }
+  }
+}

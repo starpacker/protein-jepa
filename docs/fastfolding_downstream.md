@@ -104,3 +104,67 @@ FastFolding should primarily evaluate contextual state latents. A single-frame
 geometry latent cannot distinguish folding and unfolding paths that pass through
 similar conformations. Downstream probes should therefore prefer state readouts
 computed from temporal windows.
+
+## Dynamics Benchmark Runner
+
+The paper-oriented event benchmark is implemented in
+`protein_jepa_frame.fastfolding.benchmark` and
+`scripts/evaluate_dynamics_benchmarks.py`. It assigns numbered replicas to a
+shared scaffold group, keeps each group in exactly one split, and evaluates
+state forecasts and transition operators separately at every horizon.
+
+Run the persistence baseline first:
+
+```bash
+PYTHONPATH=/liuyutian/protein_jepa_frame \
+python scripts/evaluate_dynamics_benchmarks.py fastfolding \
+  --labels artifacts/fastfolding/frame_labels.jsonl \
+  --output artifacts/fastfolding/persistence_benchmark.json \
+  --context-frames 8 \
+  --horizons 1 4 8 16
+```
+
+To score a model adapter, provide a JSONL prediction file with one row per
+sample id:
+
+```json
+{"sample_id":"CLN025-0-protein|CLN025-0-protein|800|8",
+ "state_probs":[0.15,0.25,0.60],
+ "committor_probability":0.73}
+```
+
+The state order is `unfolded transition folded` by default. The prediction file
+must contain model outputs only; future labels are joined internally from the
+held-out label file. The output reports per-horizon NLL, Brier score, macro-F1,
+calibration error, committor-proxy metrics, and transition-operator metrics
+including stationary distance, implied timescales, and MFPT error.
+
+This runner evaluates event and operator predictions. It does not treat a
+linear probe over frozen latents as a generated path. A future model adapter
+should therefore emit state probabilities from the actual transition model or
+from an explicitly declared sampled rollout, and should add path samples for
+the transition-path ensemble benchmark.
+
+For checkpoints with `paired_forecast=True`, the repository includes a causal
+transition-head adapter:
+
+```bash
+PYTHONPATH=/liuyutian/protein_jepa_frame \
+python scripts/generate_fastfolding_predictions.py \
+  --checkpoint model=/path/to/checkpoint.pt \
+  --labels artifacts/fastfolding/frame_labels.jsonl \
+  --output artifacts/fastfolding/model_predictions.jsonl \
+  --context-frames 8 \
+  --horizons 1 4 8 16
+
+PYTHONPATH=/liuyutian/protein_jepa_frame \
+python scripts/evaluate_dynamics_benchmarks.py fastfolding \
+  --labels artifacts/fastfolding/frame_labels.jsonl \
+  --predictions artifacts/fastfolding/model_predictions.jsonl \
+  --output artifacts/fastfolding/model_benchmark.json
+```
+
+The adapter fits only a train-scaffold readout from the predicted future
+latent state to the three FastFolding states. It is therefore a transition-head
+forecast evaluation, not a claim that the latent itself has a unique physical
+state interpretation.

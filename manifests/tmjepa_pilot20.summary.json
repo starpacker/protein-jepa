@@ -1,0 +1,61 @@
+{
+  "train": {
+    "path": "manifests/tmjepa_pilot20.train.jsonl",
+    "records": 240,
+    "proteins": 20,
+    "temperatures": [
+      320.0,
+      348.0,
+      379.0,
+      413.0
+    ],
+    "replicas": [
+      "0",
+      "1",
+      "2"
+    ]
+  },
+  "validation": {
+    "path": "manifests/tmjepa_pilot20.validation.jsonl",
+    "records": 80,
+    "proteins": 20,
+    "temperatures": [
+      320.0,
+      348.0,
+      379.0,
+      413.0
+    ],
+    "replicas": [
+      "3"
+    ]
+  },
+  "test": {
+    "path": "manifests/tmjepa_pilot20.test.jsonl",
+    "records": 80,
+    "proteins": 20,
+    "temperatures": [
+      320.0,
+      348.0,
+      379.0,
+      413.0
+    ],
+    "replicas": [
+      "4"
+    ]
+  },
+  "temperature_test": {
+    "path": "manifests/tmjepa_pilot20.temperature_test.jsonl",
+    "records": 100,
+    "proteins": 20,
+    "temperatures": [
+      450.0
+    ],
+    "replicas": [
+      "0",
+      "1",
+      "2",
+      "3",
+      "4"
+    ]
+  }
+}

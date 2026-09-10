@@ -1,7 +1,15 @@
+import pytest
 import torch
 from torch.utils.data import DataLoader
 
-from protein_jepa_frame.config import DataConfig, MaskConfig, ModelConfig, OptimizationConfig, TrainConfig
+from protein_jepa_frame.config import (
+    DataConfig,
+    MaskConfig,
+    ModelConfig,
+    OptimizationConfig,
+    TrainConfig,
+    _coerce_dataclass,
+)
 from protein_jepa_frame.data.collate import collate_clips
 from protein_jepa_frame.data.dataset import SyntheticProteinDynamicsDataset
 from protein_jepa_frame.data.masks import SpatiotemporalBlockMasker
@@ -20,7 +28,13 @@ from protein_jepa_frame.models.jepa import (
     state_feature_variance_regularizer,
     state_transition_jepa_loss,
 )
-from protein_jepa_frame.training.train import _load_init_checkpoint, _load_resume_checkpoint, _save_checkpoint, train
+from protein_jepa_frame.training.train import (
+    _load_init_checkpoint,
+    _load_resume_checkpoint,
+    _save_checkpoint,
+    _validate_init_freeze_contract,
+    train,
+)
 from protein_jepa_frame.models.temporal import TemporalStateEncoder
 
 
@@ -36,6 +50,11 @@ def test_model_forward_loss_is_finite():
 
     assert torch.isfinite(loss)
     assert outputs["predictions"].shape == outputs["targets"].shape
+
+
+def test_config_rejects_unknown_fields():
+    with pytest.raises(ValueError, match="unknown TrainConfig fields"):
+        _coerce_dataclass(TrainConfig, {"deterministc": True})
 
 
 def test_ema_target_encoders_remain_deterministic_in_train_mode():
@@ -391,6 +410,29 @@ def test_causal_temporal_states_do_not_depend_on_future_frames():
 
     assert torch.allclose(original[:, :4], changed[:, :4], atol=1e-5)
     assert not torch.allclose(original[:, 4:], changed[:, 4:], atol=1e-5)
+
+
+def test_windowed_causal_temporal_state_has_bounded_receptive_field():
+    encoder = TemporalStateEncoder(
+        latent_dim=16,
+        depth=2,
+        num_heads=4,
+        dropout=0.0,
+        causal=True,
+        causal_window=4,
+        position_encoding="none",
+    ).eval()
+    latents = torch.randn(2, 8, 6, 16)
+    residue_mask = torch.ones(2, 8, 6, dtype=torch.bool)
+    perturbed = latents.clone()
+    perturbed[:, 0] += 100.0 * torch.randn_like(perturbed[:, 0])
+
+    with torch.no_grad():
+        original = encoder(latents, residue_mask)["frame_states"]
+        changed = encoder(perturbed, residue_mask)["frame_states"]
+
+    assert not torch.allclose(original[:, :7], changed[:, :7], atol=1e-5)
+    assert torch.allclose(original[:, 7], changed[:, 7], atol=1e-5)
 
 
 def test_position_free_temporal_state_does_not_encode_clip_index_for_static_frames():
@@ -864,3 +906,73 @@ def test_init_checkpoint_can_exclude_reinitialized_modules(tmp_path):
 
     assert torch.all(restored.context_encoder.geom_proj.weight == 0.25)
     assert torch.equal(restored.lagged_state_predictor.heads["1"].weight, initial_lag_weight)
+
+
+def test_init_checkpoint_cannot_exclude_frozen_tmjepa_potential():
+    cfg = TrainConfig(
+        init_checkpoint="pretrained.pt",
+        init_exclude_prefixes=("tmjepa.",),
+        model=ModelConfig(
+            paired_forecast=True,
+            tmjepa_enabled=True,
+            tmjepa_version=3,
+            tmjepa_freeze_potential=True,
+        ),
+    )
+
+    with pytest.raises(ValueError, match="exclusions overlap frozen TM-JEPA parameters"):
+        _validate_init_freeze_contract(cfg)
+
+
+def test_init_checkpoint_may_reinitialize_trainable_tmjepa_kinetics():
+    cfg = TrainConfig(
+        init_checkpoint="pretrained.pt",
+        init_exclude_prefixes=("tmjepa.dynamics.kinetics.",),
+        model=ModelConfig(
+            paired_forecast=True,
+            tmjepa_enabled=True,
+            tmjepa_version=3,
+            tmjepa_freeze_potential=True,
+            tmjepa_freeze_kinetics=False,
+        ),
+    )
+
+    _validate_init_freeze_contract(cfg)
+
+
+def test_pmf_stage_may_ignore_reinitialized_frozen_kinetics():
+    cfg = TrainConfig(
+        init_checkpoint="pretrained.pt",
+        init_exclude_prefixes=("tmjepa.dynamics.kinetics.",),
+        model=ModelConfig(
+            paired_forecast=True,
+            tmjepa_enabled=True,
+            tmjepa_version=3,
+            tmjepa_freeze_potential=False,
+            tmjepa_freeze_kinetics=True,
+        ),
+        optimization=OptimizationConfig(tmjepa_equilibrium_score_weight=0.001),
+    )
+
+    _validate_init_freeze_contract(cfg)
+
+
+def test_frozen_learned_tmjepa_representation_requires_checkpoint():
+    cfg = TrainConfig(
+        model=ModelConfig(
+            paired_forecast=True,
+            temporal_depth=1,
+            temporal_causal=True,
+            temporal_causal_window=4,
+            freeze_context_encoder=True,
+            freeze_temporal_encoder=True,
+            tmjepa_enabled=True,
+            tmjepa_version=3,
+            tmjepa_learned_cv_dim=2,
+            tmjepa_learned_cv_burn_in_frames=3,
+            tmjepa_freeze_learned_projection=True,
+        )
+    )
+
+    with pytest.raises(ValueError, match="requires an init or resume checkpoint"):
+        _validate_init_freeze_contract(cfg)

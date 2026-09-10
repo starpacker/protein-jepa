@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import copy
+
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from protein_jepa_frame.models.time_features import (
     LogTimeEmbedding,
@@ -356,6 +359,1078 @@ class HistoryConditionedTransition(nn.Module):
                 temperature_k, dataset_index, B, history.device, history.dtype
             )
         return self.delta(self.trunk(history + condition)), history
+
+
+class ContextualAdaptiveDynamics(nn.Module):
+    """Continuous-time dynamics in a context-specific adaptive state basis.
+
+    The slots are generated from the observed history, so slot indices do not
+    carry global state semantics across proteins. The transition generator is
+    recomputed after every integration step from the evolving state posterior
+    and memory. This makes both the assignment and the dynamics depend on the
+    observed motion, while retaining a valid rate matrix at every step.
+    """
+
+    def __init__(
+        self,
+        latent_dim: int,
+        slot_dim: int = 32,
+        max_slots: int = 16,
+        base_step_ps: float = 16000.0,
+        max_rollout_steps: int = 16,
+        assignment_temperature: float = 0.25,
+        observable_dim: int = 12,
+        control_horizons_frames: tuple[int, ...] = (),
+        training_fixed_controls: bool = False,
+        thermodynamic_conditioning: bool = True,
+        dropout: float = 0.0,
+    ):
+        super().__init__()
+        if latent_dim <= 0 or slot_dim <= 0 or max_slots < 2:
+            raise ValueError("V5 latent, slot, and state dimensions must be positive")
+        if base_step_ps <= 0 or max_rollout_steps <= 0:
+            raise ValueError("V5 integration scales must be positive")
+        if assignment_temperature <= 0:
+            raise ValueError("V5 assignment temperature must be positive")
+        if observable_dim <= 0:
+            raise ValueError("V5 observable dimension must be positive")
+        self.latent_dim = int(latent_dim)
+        self.slot_dim = int(slot_dim)
+        self.max_slots = int(max_slots)
+        self.base_step_ps = float(base_step_ps)
+        self.max_rollout_steps = int(max_rollout_steps)
+        self.assignment_temperature = float(assignment_temperature)
+        self.observable_dim = int(observable_dim)
+        self.control_horizons_frames = tuple(int(value) for value in control_horizons_frames)
+        self.training_fixed_controls = bool(training_fixed_controls)
+
+        self.history_encoder = nn.GRU(latent_dim, slot_dim, batch_first=True)
+        self.history_norm = nn.LayerNorm(slot_dim)
+        self.state_projection = nn.Sequential(
+            nn.LayerNorm(latent_dim),
+            nn.Linear(latent_dim, slot_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+        )
+        self.history_state_projection = nn.Linear(slot_dim, slot_dim, bias=False)
+        self.slot_seed = nn.Parameter(torch.empty(max_slots, slot_dim))
+        self.slot_generator = nn.Sequential(
+            nn.LayerNorm(slot_dim),
+            nn.Linear(slot_dim, slot_dim * 2),
+            nn.GELU(),
+            nn.Linear(slot_dim * 2, max_slots * slot_dim),
+        )
+        self.slot_gate = nn.Sequential(
+            nn.LayerNorm(slot_dim),
+            nn.Linear(slot_dim, max_slots),
+        )
+        self.condition_embed = (
+            ThermodynamicConditionEmbedding(slot_dim) if thermodynamic_conditioning else None
+        )
+        self.posterior_to_memory = nn.Linear(slot_dim, slot_dim, bias=False)
+        self.memory_cell = nn.GRUCell(slot_dim, slot_dim)
+        self.energy_head = nn.Sequential(
+            nn.LayerNorm(slot_dim * 2),
+            nn.Linear(slot_dim * 2, slot_dim),
+            nn.SiLU(),
+            nn.Linear(slot_dim, 1),
+        )
+        self.flux_head = nn.Sequential(
+            nn.LayerNorm(slot_dim * 4),
+            nn.Linear(slot_dim * 4, slot_dim * 2),
+            nn.SiLU(),
+            nn.Linear(slot_dim * 2, 1),
+        )
+        self.observable_head = nn.Sequential(
+            nn.LayerNorm(slot_dim * 2),
+            nn.Linear(slot_dim * 2, slot_dim * 2),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(slot_dim * 2, observable_dim),
+        )
+        self.log_rate_scale = nn.Parameter(torch.tensor(-6.0))
+        pair_i, pair_j = torch.triu_indices(max_slots, max_slots, offset=1)
+        self.register_buffer("pair_i", pair_i, persistent=False)
+        self.register_buffer("pair_j", pair_j, persistent=False)
+        nn.init.normal_(self.slot_seed, std=0.02)
+
+    @staticmethod
+    def _last_valid(sequence: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        index = torch.arange(mask.shape[1], device=mask.device).view(1, -1)
+        last = torch.where(mask, index, -1).max(dim=1).values.clamp(min=0)
+        return sequence[torch.arange(sequence.shape[0], device=sequence.device), last]
+
+    def _history(self, states: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        if states.dim() != 3 or mask.shape != states.shape[:2]:
+            raise ValueError("V5 history states and mask must be [B,T,D] and [B,T]")
+        encoded, _ = self.history_encoder(states * mask.unsqueeze(-1).to(dtype=states.dtype))
+        return self.history_norm(self._last_valid(encoded, mask))
+
+    def _state_feature(
+        self, states: torch.Tensor, mask: torch.Tensor, history: torch.Tensor
+    ) -> torch.Tensor:
+        endpoint = self._last_valid(states, mask)
+        feature = self.state_projection(endpoint) + self.history_state_projection(history)
+        return torch.nn.functional.normalize(feature, dim=-1, eps=1.0e-6)
+
+    def _context_slots(self, history: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        delta = self.slot_generator(history).view(
+            history.shape[0], self.max_slots, self.slot_dim
+        )
+        slots = torch.nn.functional.normalize(
+            self.slot_seed.unsqueeze(0) + delta, dim=-1, eps=1.0e-6
+        )
+        gates = torch.sigmoid(self.slot_gate(history)).clamp(1.0e-4, 1.0 - 1.0e-4)
+        return slots, gates
+
+    def _assign(
+        self, feature: torch.Tensor, slots: torch.Tensor, gates: torch.Tensor
+    ) -> torch.Tensor:
+        logits = torch.einsum("bd,bkd->bk", feature, slots)
+        logits = logits / self.assignment_temperature + gates.log()
+        return torch.softmax(logits, dim=-1)
+
+    def _generator(
+        self,
+        memory: torch.Tensor,
+        posterior: torch.Tensor,
+        slots: torch.Tensor,
+        gates: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        state = torch.bmm(posterior.unsqueeze(1), slots).squeeze(1)
+        condition = self.history_norm(memory + self.posterior_to_memory(state))
+        expanded_condition = condition.unsqueeze(1).expand(-1, self.max_slots, -1)
+        energies = self.energy_head(torch.cat([slots, expanded_condition], dim=-1)).squeeze(-1)
+        stationary = torch.softmax(-energies + gates.log(), dim=-1)
+        stationary = stationary.clamp(min=1.0e-4)
+        stationary = stationary / stationary.sum(dim=-1, keepdim=True)
+
+        left = slots[:, self.pair_i]
+        right = slots[:, self.pair_j]
+        pair_condition = condition.unsqueeze(1).expand(-1, self.pair_i.numel(), -1)
+        pair_features = torch.cat([left, right, (left - right).abs(), pair_condition], dim=-1)
+        pair_flux = torch.nn.functional.softplus(
+            self.flux_head(pair_features).squeeze(-1) + self.log_rate_scale
+        )
+        pair_flux = pair_flux * gates[:, self.pair_i] * gates[:, self.pair_j]
+        symmetric_flux = slots.new_zeros(
+            slots.shape[0], self.max_slots, self.max_slots
+        )
+        symmetric_flux[:, self.pair_i, self.pair_j] = pair_flux
+        symmetric_flux[:, self.pair_j, self.pair_i] = pair_flux
+        generator = symmetric_flux / stationary.unsqueeze(-1)
+        generator = generator - torch.diag_embed(generator.sum(dim=-1))
+        detailed_balance = (
+            stationary.unsqueeze(-1) * generator
+            - stationary.unsqueeze(-2) * generator.transpose(-1, -2)
+        )
+        return generator, stationary, detailed_balance
+
+    def _rollout(
+        self,
+        posterior: torch.Tensor,
+        memory: torch.Tensor,
+        slots: torch.Tensor,
+        gates: torch.Tensor,
+        horizon_time_ps: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        scaled_time = horizon_time_ps.to(dtype=posterior.dtype).clamp(min=0.0) / self.base_step_ps
+        whole_steps = torch.floor(scaled_time).to(dtype=torch.long)
+        if int(whole_steps.max().detach().cpu()) > self.max_rollout_steps:
+            raise ValueError(
+                f"V5 horizon requires {int(whole_steps.max())} steps, "
+                f"above max_rollout_steps={self.max_rollout_steps}"
+            )
+        initial_generator, initial_stationary, detailed_balance = self._generator(
+            memory, posterior, slots, gates
+        )
+        current = posterior
+        current_memory = memory
+        for step in range(int(whole_steps.max().detach().cpu())):
+            generator, _, _ = self._generator(current_memory, current, slots, gates)
+            transition = torch.matrix_exp(generator)
+            candidate = torch.bmm(current.unsqueeze(1), transition).squeeze(1)
+            candidate_state = torch.bmm(candidate.unsqueeze(1), slots).squeeze(1)
+            candidate_memory = self.memory_cell(candidate_state, current_memory)
+            active = (whole_steps > step).unsqueeze(-1)
+            current = torch.where(active, candidate, current)
+            current_memory = torch.where(active, candidate_memory, current_memory)
+        fraction = (scaled_time - whole_steps.to(dtype=scaled_time.dtype)).view(-1, 1, 1)
+        generator, _, _ = self._generator(current_memory, current, slots, gates)
+        transition = torch.matrix_exp(generator * fraction)
+        current = torch.bmm(current.unsqueeze(1), transition).squeeze(1)
+        return current, initial_generator, initial_stationary, detailed_balance
+
+    def forward(
+        self,
+        context_states: torch.Tensor,
+        future_states: torch.Tensor,
+        context_mask: torch.Tensor,
+        future_mask: torch.Tensor,
+        horizon_time_ps: torch.Tensor,
+        horizon_frames: torch.Tensor,
+        temperature_k: torch.Tensor | None = None,
+        dataset_index: torch.Tensor | None = None,
+    ) -> dict[str, torch.Tensor]:
+        history = self._history(context_states, context_mask)
+        if self.condition_embed is not None:
+            history = self.history_norm(
+                history
+                + self.condition_embed(
+                    temperature_k,
+                    dataset_index,
+                    context_states.shape[0],
+                    context_states.device,
+                    context_states.dtype,
+                )
+            )
+        slots, gates = self._context_slots(history)
+        current_feature = self._state_feature(context_states, context_mask, history)
+        current = self._assign(current_feature, slots, gates)
+        prediction, generator, stationary, detailed_balance = self._rollout(
+            current, history, slots, gates, horizon_time_ps
+        )
+        with torch.no_grad():
+            future_history = self._history(future_states, future_mask)
+            future_feature = self._state_feature(future_states, future_mask, future_history)
+            target = self._assign(future_feature, slots.detach(), gates.detach())
+
+        predicted_feature = torch.bmm(prediction.unsqueeze(1), slots).squeeze(1)
+        result = {
+            "v5_context_history": history,
+            "v5_context_slots": slots,
+            "v5_slot_gates": gates,
+            "v5_current_assignment": current,
+            "v5_target_assignment": target,
+            "v5_prediction": prediction,
+            "v5_current_feature": current_feature,
+            "v5_target_feature": future_feature,
+            "v5_predicted_feature": predicted_feature,
+            "v5_observable_prediction": self.observable_head(
+                torch.cat([predicted_feature, history], dim=-1)
+            ),
+            "v5_generator": generator,
+            "v5_stationary_distribution": stationary,
+            "v5_detailed_balance_residual": detailed_balance,
+        }
+        if self.training_fixed_controls or not self.training:
+            ps_per_frame = horizon_time_ps / horizon_frames.to(dtype=horizon_time_ps.dtype).clamp(min=1)
+            fixed = []
+            for fixed_horizon in self.control_horizons_frames:
+                fixed_time = ps_per_frame * float(fixed_horizon)
+                fixed.append(self._rollout(current, history, slots, gates, fixed_time)[0])
+            if fixed:
+                result["v5_fixed_predictions"] = torch.stack(fixed, dim=1)
+                result["v5_fixed_horizons"] = torch.tensor(
+                    self.control_horizons_frames, device=horizon_frames.device
+                )
+        return result
+
+
+class DynamicSequenceStateEncoder(nn.Module):
+    """Encode conformation residuals and incoming motion into a continuous state."""
+
+    def __init__(
+        self,
+        latent_dim: int,
+        state_dim: int,
+        dropout: float = 0.0,
+        multi_scale_history: bool = False,
+        slow_history_stride: int = 2,
+    ):
+        super().__init__()
+        if slow_history_stride <= 1:
+            raise ValueError("V5.3 slow_history_stride must be greater than one")
+        self.multi_scale_history = bool(multi_scale_history)
+        self.slow_history_stride = int(slow_history_stride)
+        self.token_projection = nn.Sequential(
+            nn.LayerNorm(latent_dim * 2),
+            nn.Linear(latent_dim * 2, state_dim * 2),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(state_dim * 2, state_dim),
+        )
+        self.history_encoder = nn.GRU(state_dim, state_dim, batch_first=True)
+        self.slow_history_encoder = (
+            nn.GRU(state_dim, state_dim, batch_first=True)
+            if self.multi_scale_history else None
+        )
+        history_input_dim = state_dim * 4
+        self.history_gate = (
+            nn.Sequential(
+                nn.LayerNorm(history_input_dim), nn.Linear(history_input_dim, 2)
+            )
+            if self.multi_scale_history else None
+        )
+        self.history_fusion = (
+            nn.Sequential(
+                nn.LayerNorm(history_input_dim),
+                nn.Linear(history_input_dim, state_dim * 2),
+                nn.GELU(),
+                nn.Linear(state_dim * 2, state_dim),
+            )
+            if self.multi_scale_history else None
+        )
+        self.velocity_projection = (
+            nn.Linear(latent_dim, state_dim) if self.multi_scale_history else None
+        )
+        self.acceleration_projection = (
+            nn.Linear(latent_dim, state_dim) if self.multi_scale_history else None
+        )
+        self.endpoint_projection = nn.Sequential(
+            nn.LayerNorm(latent_dim), nn.Linear(latent_dim, state_dim)
+        )
+        self.local_projection = nn.Sequential(
+            nn.LayerNorm(latent_dim),
+            nn.Linear(latent_dim, state_dim),
+            nn.LayerNorm(state_dim),
+        )
+        self.amplitude_projection = nn.Linear(latent_dim * 2, state_dim)
+        self.static_projection = nn.Sequential(
+            nn.LayerNorm(latent_dim), nn.Linear(latent_dim, state_dim)
+        )
+        self.state_norm = nn.LayerNorm(state_dim)
+        self.memory_norm = nn.LayerNorm(state_dim)
+        nn.init.normal_(self.amplitude_projection.weight, std=1.0e-3)
+        nn.init.zeros_(self.amplitude_projection.bias)
+        nn.init.orthogonal_(self.local_projection[1].weight)
+        nn.init.zeros_(self.local_projection[1].bias)
+        if self.multi_scale_history:
+            nn.init.zeros_(self.history_fusion[-1].weight)
+            nn.init.zeros_(self.history_fusion[-1].bias)
+            nn.init.zeros_(self.velocity_projection.weight)
+            nn.init.zeros_(self.velocity_projection.bias)
+            nn.init.zeros_(self.acceleration_projection.weight)
+            nn.init.zeros_(self.acceleration_projection.bias)
+            nn.init.constant_(self.history_gate[-1].bias[0], 2.0)
+            nn.init.constant_(self.history_gate[-1].bias[1], -2.0)
+
+    @staticmethod
+    def masked_mean(states: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        weight = mask.unsqueeze(-1).to(dtype=states.dtype)
+        return (states * weight).sum(dim=1) / weight.sum(dim=1).clamp(min=1.0)
+
+    @staticmethod
+    def last_valid(sequence: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        index = torch.arange(mask.shape[1], device=mask.device).view(1, -1)
+        last = torch.where(mask, index, -1).max(dim=1).values.clamp(min=0)
+        rows = torch.arange(sequence.shape[0], device=sequence.device)
+        return sequence[rows, last]
+
+    @staticmethod
+    def velocity(states: torch.Tensor, time_ps: torch.Tensor | None) -> torch.Tensor:
+        velocity = torch.zeros_like(states)
+        delta = states[:, 1:] - states[:, :-1]
+        if time_ps is not None:
+            dt = (time_ps[:, 1:] - time_ps[:, :-1]).abs().clamp(min=1.0e-6)
+            scale = dt.mean(dim=1, keepdim=True).clamp(min=1.0e-6)
+            delta = delta / (dt / scale).unsqueeze(-1)
+        velocity[:, 1:] = delta
+        return velocity
+
+    def encode_local_conformation(
+        self, states: torch.Tensor, mask: torch.Tensor, return_sequence: bool = False
+    ) -> torch.Tensor:
+        """Encode instantaneous conformations in one shared coordinate system."""
+        if states.dim() != 3 or mask.shape != states.shape[:2]:
+            raise ValueError("local conformation states and mask must be [B,T,D] and [B,T]")
+        states = torch.nan_to_num(states)
+        sequence = self.local_projection(states)
+        sequence = torch.where(mask.unsqueeze(-1), sequence, torch.zeros_like(sequence))
+        return sequence if return_sequence else self.last_valid(sequence, mask)
+
+    def forward(
+        self,
+        states: torch.Tensor,
+        mask: torch.Tensor,
+        time_ps: torch.Tensor | None = None,
+        reference: torch.Tensor | None = None,
+        return_sequence: bool = False,
+    ) -> tuple[torch.Tensor, ...]:
+        if states.dim() != 3 or mask.shape != states.shape[:2]:
+            raise ValueError("dynamic states and mask must be [B,T,D] and [B,T]")
+        # Transformer padding can produce non-finite values at fully masked
+        # positions; multiplication by zero would leave NaNs in the GRU.
+        states = torch.nan_to_num(states)
+        states = torch.where(mask.unsqueeze(-1), states, torch.zeros_like(states))
+        if reference is None:
+            # Prefix statistics keep an auxiliary next-frame target genuinely causal.
+            weight = mask.unsqueeze(-1).to(dtype=states.dtype)
+            prefix_count = weight.cumsum(dim=1).clamp(min=1.0)
+            reference_sequence = (states * weight).cumsum(dim=1) / prefix_count
+            reference = reference_sequence[:, -1]
+        else:
+            reference_sequence = reference.unsqueeze(1).expand(-1, states.shape[1], -1)
+        centered = states - reference_sequence
+        motion = self.velocity(states, time_ps)
+        tokens = self.token_projection(torch.cat([centered, motion], dim=-1))
+        encoded, _ = self.history_encoder(tokens * mask.unsqueeze(-1).to(tokens.dtype))
+        endpoint = self.last_valid(centered, mask)
+        last_motion = self.last_valid(motion, mask)
+        amplitude = self.amplitude_projection(torch.cat([endpoint, last_motion], dim=-1))
+        recent_memory_sequence = self.memory_norm(encoded)
+        memory_sequence = recent_memory_sequence
+        if self.multi_scale_history:
+            stride = self.slow_history_stride
+            slow_tokens = tokens[:, ::stride]
+            slow_mask = mask[:, ::stride]
+            slow_encoded, _ = self.slow_history_encoder(
+                slow_tokens * slow_mask.unsqueeze(-1).to(slow_tokens.dtype)
+            )
+            slow_memory = self.memory_norm(slow_encoded)
+            slow_index = torch.arange(states.shape[1], device=states.device) // stride
+            slow_sequence = slow_memory[:, slow_index.clamp(max=slow_memory.shape[1] - 1)]
+            acceleration = torch.zeros_like(motion)
+            acceleration[:, 1:] = motion[:, 1:] - motion[:, :-1]
+            kinetic_input = torch.cat(
+                [
+                    recent_memory_sequence,
+                    slow_sequence,
+                    self.velocity_projection(motion),
+                    self.acceleration_projection(acceleration),
+                ],
+                dim=-1,
+            )
+            gate = torch.softmax(self.history_gate(kinetic_input), dim=-1)
+            memory_sequence = self.memory_norm(
+                gate[..., :1] * recent_memory_sequence
+                + gate[..., 1:] * slow_sequence
+                + self.history_fusion(kinetic_input)
+            )
+            memory_sequence = memory_sequence * mask.unsqueeze(-1).to(memory_sequence.dtype)
+        memory = self.last_valid(memory_sequence, mask)
+        state = self.state_norm(self.endpoint_projection(endpoint) + memory) + amplitude
+        state_sequence = (
+            self.state_norm(self.endpoint_projection(centered) + memory_sequence)
+            + self.amplitude_projection(torch.cat([centered, motion], dim=-1))
+        )
+        static_sequence = self.static_projection(reference_sequence)
+        static = static_sequence[:, -1]
+        if return_sequence:
+            return (
+                state,
+                memory,
+                static,
+                tokens,
+                state_sequence,
+                memory_sequence,
+                static_sequence,
+            )
+        return state, memory, static, tokens
+
+
+class ContextualSparseMotionDynamics(nn.Module):
+    """History-conditioned continuous dynamics with sparse local motion modes."""
+
+    def __init__(
+        self,
+        latent_dim: int,
+        state_dim: int = 32,
+        num_modes: int = 16,
+        active_modes: int = 4,
+        base_step_ps: float = 16000.0,
+        max_rollout_steps: int = 16,
+        router_temperature: float = 0.5,
+        routing_noise_std: float = 0.0,
+        active_temperature: float = 0.25,
+        log_sigma_min: float = -5.0,
+        log_sigma_max: float = 1.0,
+        observable_dim: int = 12,
+        observable_state_weight: float = 0.0,
+        control_horizons_frames: tuple[int, ...] = (),
+        training_controls: bool = True,
+        causal_prediction_enabled: bool = False,
+        history_truncation_enabled: bool = False,
+        history_keep_fraction: float = 0.5,
+        multi_scale_history_enabled: bool = False,
+        slow_history_stride: int = 2,
+        autonomous_rollout_enabled: bool = False,
+        horizon_calibration_enabled: bool = False,
+        horizon_calibration_scale: float = 0.5,
+        frame_local_target_enabled: bool = False,
+        physical_state_anchor_enabled: bool = False,
+        learned_state_residual_scale: float = 0.1,
+        dropout: float = 0.0,
+    ):
+        super().__init__()
+        if latent_dim <= 0 or state_dim <= 0 or num_modes < 2:
+            raise ValueError("V5.1 latent, state, and mode dimensions must be positive")
+        if not 1 <= active_modes < num_modes:
+            raise ValueError("V5.1 active_modes must be in [1, num_modes)")
+        if (
+            base_step_ps <= 0
+            or max_rollout_steps <= 0
+            or router_temperature <= 0
+            or routing_noise_std < 0
+            or active_temperature <= 0
+            or observable_state_weight < 0
+        ):
+            raise ValueError("V5.1 rollout scales and router temperature must be positive")
+        if log_sigma_min >= log_sigma_max:
+            raise ValueError("V5.1 log-sigma bounds are invalid")
+        self.state_dim = int(state_dim)
+        self.num_modes = int(num_modes)
+        self.active_modes = int(active_modes)
+        self.base_step_ps = float(base_step_ps)
+        self.max_rollout_steps = int(max_rollout_steps)
+        self.router_temperature = float(router_temperature)
+        self.routing_noise_std = float(routing_noise_std)
+        self.active_temperature = float(active_temperature)
+        self.log_sigma_min = float(log_sigma_min)
+        self.log_sigma_max = float(log_sigma_max)
+        self.observable_dim = int(observable_dim)
+        self.observable_state_weight = float(observable_state_weight)
+        self.control_horizons_frames = tuple(int(value) for value in control_horizons_frames)
+        self.training_controls = bool(training_controls)
+        self.causal_prediction_enabled = bool(causal_prediction_enabled)
+        if not 0.0 < history_keep_fraction <= 1.0:
+            raise ValueError("V5.1 history_keep_fraction must be in (0, 1]")
+        self.history_truncation_enabled = bool(history_truncation_enabled)
+        self.history_keep_fraction = float(history_keep_fraction)
+        self.multi_scale_history_enabled = bool(multi_scale_history_enabled)
+        self.slow_history_stride = int(slow_history_stride)
+        self.autonomous_rollout_enabled = bool(autonomous_rollout_enabled)
+        self.horizon_calibration_enabled = bool(horizon_calibration_enabled)
+        if horizon_calibration_scale < 0.0:
+            raise ValueError("V5.3 horizon calibration scale must be non-negative")
+        self.horizon_calibration_scale = float(horizon_calibration_scale)
+        self.frame_local_target_enabled = bool(frame_local_target_enabled)
+        self.physical_state_anchor_enabled = bool(physical_state_anchor_enabled)
+        if learned_state_residual_scale < 0.0:
+            raise ValueError("V5.3 learned state residual scale must be non-negative")
+        self.learned_state_residual_scale = float(learned_state_residual_scale)
+
+        self.state_encoder = DynamicSequenceStateEncoder(
+            latent_dim,
+            state_dim,
+            dropout,
+            multi_scale_history=self.multi_scale_history_enabled,
+            slow_history_stride=self.slow_history_stride,
+        )
+        self.target_state_encoder = copy.deepcopy(self.state_encoder)
+        for parameter in self.target_state_encoder.parameters():
+            parameter.requires_grad = False
+        self.target_state_encoder.eval()
+        self.physical_history_projection = (
+            nn.Linear(state_dim, latent_dim, bias=False)
+            if self.physical_state_anchor_enabled else None
+        )
+
+        self.horizon_embed = LogTimeEmbedding(state_dim)
+        self.router = nn.Sequential(
+            nn.LayerNorm(state_dim * 4),
+            nn.Linear(state_dim * 4, state_dim * 2),
+            nn.GELU(),
+            nn.Linear(state_dim * 2, num_modes),
+        )
+        self.router_query = nn.Sequential(
+            nn.LayerNorm(state_dim * 3),
+            nn.Linear(state_dim * 3, state_dim),
+            nn.SiLU(),
+        )
+        self.mode_seed = nn.Parameter(torch.empty(num_modes, state_dim))
+        self.motion_expert = nn.Sequential(
+            nn.LayerNorm(state_dim * 5),
+            nn.Linear(state_dim * 5, state_dim * 3),
+            nn.SiLU(),
+            nn.Dropout(dropout),
+            nn.Linear(state_dim * 3, state_dim * 2),
+        )
+        self.terminal_delta = nn.Sequential(
+            nn.LayerNorm(state_dim * 4),
+            nn.Linear(state_dim * 4, state_dim * 2),
+            nn.SiLU(),
+            nn.Dropout(dropout),
+            nn.Linear(state_dim * 2, state_dim),
+        )
+        self.horizon_calibration = nn.Sequential(
+            nn.LayerNorm(state_dim * 4),
+            nn.Linear(state_dim * 4, state_dim * 2),
+            nn.SiLU(),
+            nn.Linear(state_dim * 2, state_dim),
+        )
+        self.memory_input = nn.Sequential(
+            nn.LayerNorm(state_dim * 2), nn.Linear(state_dim * 2, state_dim), nn.GELU()
+        )
+        self.memory_cell = nn.GRUCell(state_dim, state_dim)
+        self.observable_decoder = nn.Sequential(
+            nn.LayerNorm(state_dim * 2),
+            nn.Linear(state_dim * 2, state_dim * 2),
+            nn.GELU(),
+            nn.Linear(state_dim * 2, observable_dim),
+        )
+        self.observable_state_projection = nn.Sequential(
+            nn.LayerNorm(observable_dim),
+            nn.Linear(observable_dim, state_dim),
+        )
+        zero_motion = torch.zeros(observable_dim)
+        zero_motion[0] = 1.0
+        self.register_buffer("zero_motion_observable", zero_motion, persistent=False)
+        nn.init.normal_(self.mode_seed, std=0.02)
+        nn.init.normal_(self.motion_expert[-1].weight, std=1.0e-3)
+        nn.init.zeros_(self.motion_expert[-1].bias)
+        nn.init.normal_(self.terminal_delta[-1].weight, std=1.0e-3)
+        nn.init.zeros_(self.terminal_delta[-1].bias)
+        nn.init.zeros_(self.horizon_calibration[-1].weight)
+        nn.init.zeros_(self.horizon_calibration[-1].bias)
+        nn.init.normal_(self.observable_state_projection[-1].weight, std=2.0e-2)
+        nn.init.zeros_(self.observable_state_projection[-1].bias)
+        if self.physical_history_projection is not None:
+            nn.init.normal_(self.physical_history_projection.weight, std=2.0e-2)
+
+    def train(self, mode: bool = True) -> ContextualSparseMotionDynamics:
+        super().train(mode)
+        self.target_state_encoder.eval()
+        return self
+
+    @torch.no_grad()
+    def sync_target_encoder(self) -> None:
+        self.target_state_encoder.load_state_dict(self.state_encoder.state_dict())
+
+    @torch.no_grad()
+    def update_target_encoder(self, momentum: float) -> None:
+        for target, online in zip(
+            self.target_state_encoder.parameters(), self.state_encoder.parameters()
+        ):
+            target.data.mul_(momentum).add_(online.detach().data, alpha=1.0 - momentum)
+
+    def _route(
+        self,
+        state: torch.Tensor,
+        memory: torch.Tensor,
+        static: torch.Tensor,
+        horizon: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        effective_horizon = torch.zeros_like(horizon) if self.autonomous_rollout_enabled else horizon
+        logits = self.router(torch.cat([state, memory, static, effective_horizon], dim=-1))
+        # Tie routing to the learned local basis. The old router produced
+        # nearly identical logits for long-history contexts, leaving the
+        # top-k assignment effectively arbitrary. A context query against
+        # normalized mode seeds makes assignment change with the observed
+        # state while retaining context-specific, non-global semantics.
+        query = F.normalize(self.router_query(torch.cat([state, memory, static], dim=-1)), dim=-1)
+        keys = F.normalize(self.mode_seed, dim=-1)
+        logits = logits + 0.5 * (query @ keys.T)
+        route_logits = logits
+        if self.training and self.routing_noise_std > 0.0:
+            route_logits = logits + torch.randn_like(logits) * self.routing_noise_std
+        probabilities = torch.softmax(route_logits / self.router_temperature, dim=-1)
+        indices = route_logits.topk(self.active_modes, dim=-1).indices
+        mask = torch.zeros_like(probabilities).scatter(1, indices, 1.0)
+        selected = probabilities * mask
+        hard = selected / selected.sum(dim=-1, keepdim=True).clamp(min=1.0e-8)
+        routing = hard.detach() + probabilities - probabilities.detach()
+        threshold = route_logits.topk(self.active_modes, dim=-1).values[:, -1:]
+        soft_active = torch.sigmoid((logits - threshold.detach()) / self.active_temperature)
+        soft_active = soft_active * (
+            float(self.active_modes) / soft_active.sum(dim=-1, keepdim=True).clamp(min=1.0e-8)
+        )
+        return routing, probabilities, mask.bool(), soft_active.clamp(max=1.0), route_logits
+
+    def _motion(
+        self,
+        state: torch.Tensor,
+        memory: torch.Tensor,
+        static: torch.Tensor,
+        horizon: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        routing, probabilities, active_mask, soft_active, route_logits = self._route(
+            state, memory, static, horizon
+        )
+        batch = state.shape[0]
+        mode = self.mode_seed.unsqueeze(0).expand(batch, -1, -1)
+        effective_horizon = torch.zeros_like(horizon) if self.autonomous_rollout_enabled else horizon
+        condition = torch.cat([state, memory, static, effective_horizon], dim=-1)
+        condition = condition.unsqueeze(1).expand(-1, self.num_modes, -1)
+        parameters = self.motion_expert(torch.cat([condition, mode], dim=-1))
+        drift, raw_log_sigma = parameters.chunk(2, dim=-1)
+        log_sigma = raw_log_sigma.clamp(self.log_sigma_min, self.log_sigma_max)
+        weight = routing.unsqueeze(-1)
+        mean_drift = (weight * drift).sum(dim=1)
+        second_moment = (
+            weight * (log_sigma.mul(2.0).exp() + drift.square())
+        ).sum(dim=1)
+        variance_rate = (second_moment - mean_drift.square()).clamp(min=1.0e-8)
+        if self.autonomous_rollout_enabled:
+            # In autonomous mode every contribution must be a local vector
+            # field. Reusing terminal_delta here preserves the warm-started
+            # V5.2 capacity without allowing a horizon-dependent endpoint
+            # shortcut to dominate the semigroup.
+            zero_horizon = torch.zeros_like(horizon)
+            local_residual = self.terminal_delta(
+                torch.cat([state, memory, static, zero_horizon], dim=-1)
+            )
+            mean_drift = mean_drift + local_residual
+        return mean_drift, variance_rate, probabilities, active_mask, soft_active, route_logits
+
+    def _rollout(
+        self,
+        state: torch.Tensor,
+        memory: torch.Tensor,
+        static: torch.Tensor,
+        horizon_time_ps: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        scaled_time = horizon_time_ps.to(dtype=state.dtype).clamp(min=0.0) / self.base_step_ps
+        whole_steps = torch.floor(scaled_time).long()
+        max_steps = int(whole_steps.max().detach().cpu())
+        if max_steps > self.max_rollout_steps:
+            raise ValueError(
+                f"V5.1 horizon requires {max_steps} steps, above "
+                f"max_rollout_steps={self.max_rollout_steps}"
+            )
+        current = state
+        current_memory = memory
+        variance = torch.zeros_like(state)
+        horizon = self.horizon_embed(horizon_time_ps).to(dtype=state.dtype)
+        _, _, initial_probabilities, initial_active, initial_soft_active, initial_logits = self._motion(
+            current, current_memory, static, horizon
+        )
+
+        def integrate(dt: torch.Tensor) -> None:
+            nonlocal current, current_memory, variance
+            drift, variance_rate, _, _, _, _ = self._motion(
+                current, current_memory, static, horizon
+            )
+            delta = drift * dt
+            candidate = current + delta
+            memory_input = self.memory_input(torch.cat([current, delta], dim=-1))
+            candidate_memory = self.memory_cell(memory_input, current_memory)
+            active = dt > 0
+            current = torch.where(active, candidate, current)
+            current_memory = torch.where(active, candidate_memory, current_memory)
+            variance = variance + variance_rate * dt.abs()
+
+        for step in range(max_steps):
+            integrate((whole_steps > step).to(state.dtype).unsqueeze(-1))
+        fraction = (scaled_time - whole_steps.to(scaled_time.dtype)).unsqueeze(-1)
+        integrate(fraction)
+        if not self.autonomous_rollout_enabled:
+            correction = self.terminal_delta(torch.cat([state, memory, static, horizon], dim=-1))
+            current = current + correction
+        elif self.horizon_calibration_enabled and self.horizon_calibration_scale > 0.0:
+            # This is a bounded endpoint residual for finite-data horizon
+            # bias. It cannot alter the local vector field or zero-time state,
+            # and its zero initialization preserves the autonomous warm start.
+            calibration = self.horizon_calibration(
+                torch.cat([state, memory, static, horizon], dim=-1)
+            )
+            current = current + self.horizon_calibration_scale * torch.tanh(calibration)
+        log_sigma = 0.5 * variance.clamp(min=torch.exp(state.new_tensor(2 * self.log_sigma_min))).log()
+        log_sigma = log_sigma.clamp(self.log_sigma_min, self.log_sigma_max)
+        return current, log_sigma, initial_probabilities, initial_active, initial_soft_active, initial_logits
+
+    def _decode_observable(self, static: torch.Tensor, displacement: torch.Tensor) -> torch.Tensor:
+        zero = torch.zeros_like(displacement)
+        value = self.observable_decoder(torch.cat([static, displacement], dim=-1))
+        anchor = self.observable_decoder(torch.cat([static, zero], dim=-1))
+        return self.zero_motion_observable.to(value).unsqueeze(0) + value - anchor
+
+    @staticmethod
+    def _reverse_history_keep_endpoint(
+        states: torch.Tensor, mask: torch.Tensor
+    ) -> torch.Tensor:
+        reversed_states = states.clone()
+        for row in range(states.shape[0]):
+            valid = torch.nonzero(mask[row], as_tuple=False).flatten()
+            if valid.numel() > 2:
+                reversed_states[row, valid[:-1]] = states[row, valid[:-1].flip(0)]
+        return reversed_states
+
+    def forward(
+        self,
+        context_states: torch.Tensor,
+        teacher_context_states: torch.Tensor,
+        future_states: torch.Tensor,
+        context_mask: torch.Tensor,
+        future_mask: torch.Tensor,
+        context_time_ps: torch.Tensor | None,
+        future_time_ps: torch.Tensor | None,
+        horizon_time_ps: torch.Tensor,
+        horizon_frames: torch.Tensor,
+        context_local_states: torch.Tensor | None = None,
+        teacher_context_local_states: torch.Tensor | None = None,
+        future_local_states: torch.Tensor | None = None,
+        context_physical_states: torch.Tensor | None = None,
+        future_physical_states: torch.Tensor | None = None,
+        observable_target: torch.Tensor | None = None,
+        wrong_context_states: torch.Tensor | None = None,
+        wrong_context_mask: torch.Tensor | None = None,
+        short_context_states: torch.Tensor | None = None,
+        context_group_index: torch.Tensor | None = None,
+    ) -> dict[str, torch.Tensor]:
+        use_local_target = self.frame_local_target_enabled
+        if use_local_target and (
+            context_local_states is None
+            or teacher_context_local_states is None
+            or future_local_states is None
+        ):
+            raise ValueError("V5.3 frame-local targets require context, teacher, and future states")
+        if self.physical_state_anchor_enabled:
+            if context_physical_states is None or future_physical_states is None:
+                raise ValueError("V5.3 physical state anchoring requires context and future states")
+            if (
+                context_physical_states.shape[-1] != self.state_dim
+                or future_physical_states.shape[-1] != self.state_dim
+            ):
+                raise ValueError(
+                    "V5.3 flattened physical state dimension must equal v51_state_dim"
+                )
+        # V5.3 history must be built from the same instantaneous conformation
+        # sequence used by the transition state. Temporal frame states already
+        # mix the full prefix and make reversal interventions almost invisible.
+        history_input_states = context_local_states if use_local_target else context_states
+        if self.physical_state_anchor_enabled:
+            history_input_states = history_input_states + self.physical_history_projection(
+                context_physical_states.to(dtype=history_input_states.dtype)
+            )
+        online_reference = self.state_encoder.masked_mean(history_input_states, context_mask)
+        if self.causal_prediction_enabled:
+            (
+                history_current,
+                memory,
+                static,
+                tokens,
+                online_state_sequence,
+                online_memory_sequence,
+                online_static_sequence,
+            ) = self.state_encoder(
+                history_input_states, context_mask, context_time_ps, return_sequence=True
+            )
+        else:
+            history_current, memory, static, tokens = self.state_encoder(
+                history_input_states, context_mask, context_time_ps, reference=online_reference
+            )
+            online_state_sequence = online_memory_sequence = online_static_sequence = None
+        if use_local_target:
+            online_current = self.state_encoder.encode_local_conformation(context_local_states, context_mask)
+            online_future = self.state_encoder.encode_local_conformation(future_local_states.detach(), future_mask)
+            if self.causal_prediction_enabled:
+                online_state_sequence = self.state_encoder.encode_local_conformation(
+                    context_local_states, context_mask, return_sequence=True
+                )
+            if self.physical_state_anchor_enabled:
+                context_physical = context_physical_states.to(dtype=online_current.dtype)
+                future_physical = future_physical_states.to(dtype=online_future.dtype)
+                online_current = self.state_encoder.last_valid(context_physical, context_mask) + (
+                    self.learned_state_residual_scale * online_current
+                )
+                online_future = self.state_encoder.last_valid(future_physical, future_mask) + (
+                    self.learned_state_residual_scale * online_future
+                )
+                if self.causal_prediction_enabled:
+                    online_state_sequence = context_physical + (
+                        self.learned_state_residual_scale * online_state_sequence
+                    )
+        else:
+            online_current = history_current
+            online_future, _, _, _ = self.state_encoder(
+                future_states.detach(),
+                future_mask,
+                future_time_ps,
+                reference=online_reference,
+            )
+        with torch.no_grad():
+            if use_local_target:
+                teacher_current = self.target_state_encoder.encode_local_conformation(
+                    teacher_context_local_states, context_mask
+                )
+                teacher_future = self.target_state_encoder.encode_local_conformation(
+                    future_local_states, future_mask
+                )
+                if self.physical_state_anchor_enabled:
+                    teacher_current = self.target_state_encoder.last_valid(
+                        context_physical_states.to(dtype=teacher_current.dtype), context_mask
+                    ) + self.learned_state_residual_scale * teacher_current
+                    teacher_future = self.target_state_encoder.last_valid(
+                        future_physical_states.to(dtype=teacher_future.dtype), future_mask
+                    ) + self.learned_state_residual_scale * teacher_future
+            else:
+                teacher_reference = self.target_state_encoder.masked_mean(
+                    teacher_context_states, context_mask
+                )
+                teacher_current, _, _, _ = self.target_state_encoder(
+                    teacher_context_states,
+                    context_mask,
+                    context_time_ps,
+                    reference=teacher_reference,
+                )
+                teacher_future, _, _, _ = self.target_state_encoder(
+                    future_states,
+                    future_mask,
+                    future_time_ps,
+                    reference=teacher_reference,
+                )
+
+        rolled, log_sigma, probabilities, active_mask, soft_active, router_logits = self._rollout(
+            online_current, memory, static, horizon_time_ps
+        )
+        predicted_delta = rolled - online_current
+        online_target_delta = online_future - online_current
+        observable_state_delta = torch.zeros_like(online_target_delta)
+        if observable_target is not None and self.observable_state_weight > 0.0:
+            observable_state_delta = (
+                self.observable_state_projection(observable_target.to(dtype=online_current.dtype))
+                * self.observable_state_weight
+            )
+        teacher_target_delta = teacher_future - teacher_current
+        # A transition must be measured inside one coordinate system. In the
+        # old frame-local path the source came from the online spatial tower
+        # while the future came from the EMA tower; their representation offset
+        # was much larger than the true horizon-dependent motion. EMA endpoints
+        # provide a slowly moving, shared coordinate system for both ends.
+        dynamics_target_delta = (
+            teacher_target_delta if use_local_target else online_target_delta
+        )
+        feature_anchor = teacher_current if use_local_target else online_current
+        target_delta = dynamics_target_delta + observable_state_delta
+        predicted_feature = feature_anchor + predicted_delta
+        result = {
+            "v51_online_current_feature": online_current,
+            "v51_online_future_feature": online_future,
+            "v51_online_target_delta": online_target_delta,
+            "v51_observable_state_delta": observable_state_delta,
+            "v51_teacher_current_feature": teacher_current,
+            "v51_teacher_target_feature": teacher_future,
+            "v51_teacher_target_delta": teacher_target_delta,
+            "v51_current_feature": feature_anchor,
+            "v51_target_feature": feature_anchor + target_delta,
+            "v51_target_delta": target_delta,
+            "v51_predicted_delta": predicted_delta,
+            "v51_predicted_feature": predicted_feature,
+            "v51_prediction_log_sigma": log_sigma,
+            "v51_context_memory": memory,
+            "v51_history_state": history_current,
+            "v51_static_condition": static,
+            "v51_router_probabilities": probabilities,
+            "v51_router_logits": router_logits,
+            "v51_active_mode_mask": active_mask,
+            "v51_soft_active_mode_mask": soft_active,
+            "v51_mode_seed": self.mode_seed,
+            "v51_dynamic_tokens": tokens,
+            "v51_dynamic_token_mask": context_mask,
+            "v51_observable_prediction": self._decode_observable(static, predicted_delta),
+            "v51_no_rollout_observable": self._decode_observable(
+                static, torch.zeros_like(predicted_delta)
+            ),
+            "v51_oracle_observable": self._decode_observable(static, target_delta),
+            "v51_ema_oracle_observable": self._decode_observable(static, teacher_target_delta),
+            "v51_online_oracle_observable": self._decode_observable(static, online_target_delta),
+        }
+
+        if context_group_index is not None:
+            semigroup_predictions = []
+            semigroup_targets = []
+            for group in context_group_index.unique(sorted=True):
+                members = torch.nonzero(context_group_index == group, as_tuple=False).flatten()
+                if members.numel() < 2:
+                    continue
+                order = torch.argsort(horizon_time_ps[members])
+                members = members[order]
+                for left, right in zip(members[:-1], members[1:]):
+                    elapsed = (horizon_time_ps[right] - horizon_time_ps[left]).clamp(min=0.0)
+                    composed, _, _, _, _, _ = self._rollout(
+                        rolled.index_select(0, left.view(1)),
+                        memory.index_select(0, left.view(1)),
+                        static.index_select(0, left.view(1)),
+                        elapsed.view(1),
+                    )
+                    semigroup_predictions.append(composed.squeeze(0))
+                    semigroup_targets.append(rolled[right].detach())
+            if semigroup_predictions:
+                result["v51_semigroup_prediction"] = torch.stack(semigroup_predictions)
+                result["v51_semigroup_target"] = torch.stack(semigroup_targets)
+
+        # Train the same transition operator on observed prefixes. The target is
+        # the next causal state, so this term carries temporal direction into the
+        # representation and cannot be solved from the endpoint alone.
+        if self.causal_prediction_enabled and context_states.shape[1] > 1:
+            prefix_valid = context_mask[:, :-1] & context_mask[:, 1:]
+            prefix_state = online_state_sequence[:, :-1]
+            prefix_memory = online_memory_sequence[:, :-1]
+            prefix_static = online_static_sequence[:, :-1]
+            if context_time_ps is None:
+                prefix_dt = torch.ones(
+                    prefix_state.shape[:2], device=prefix_state.device, dtype=prefix_state.dtype
+                )
+            else:
+                prefix_dt = (
+                    context_time_ps[:, 1:] - context_time_ps[:, :-1]
+                ).abs().to(dtype=prefix_state.dtype)
+            flat_valid = prefix_valid.reshape(-1)
+            if flat_valid.any():
+                flat_prediction, _, _, _, _, _ = self._rollout(
+                    prefix_state.reshape(-1, self.state_dim)[flat_valid],
+                    prefix_memory.reshape(-1, self.state_dim)[flat_valid],
+                    prefix_static.reshape(-1, self.state_dim)[flat_valid],
+                    prefix_dt.reshape(-1)[flat_valid],
+                )
+                flat_target = online_state_sequence[:, 1:].reshape(-1, self.state_dim)[flat_valid]
+                flat_source = prefix_state.reshape(-1, self.state_dim)[flat_valid]
+                # Only supervise the transition increment. Predicting the
+                # absolute next state would reward a static representation and
+                # dominate the long-horizon objective.
+                result["v51_causal_next_prediction"] = flat_prediction - flat_source
+                result["v51_causal_next_target"] = (flat_target - flat_source.detach()).detach()
+                result["v51_causal_next_dt"] = prefix_dt.reshape(-1)[flat_valid]
+            else:
+                result["v51_causal_next_prediction"] = online_current.new_empty((0, self.state_dim))
+                result["v51_causal_next_target"] = online_current.new_empty((0, self.state_dim))
+                result["v51_causal_next_dt"] = online_current.new_empty((0,))
+
+        if self.training_controls or not self.training:
+            ps_per_frame = horizon_time_ps / horizon_frames.to(horizon_time_ps.dtype).clamp(min=1)
+            fixed_features = []
+            fixed_observables = []
+            for fixed_horizon in self.control_horizons_frames:
+                fixed_time = ps_per_frame * float(fixed_horizon)
+                fixed_state, _, _, _, _, _ = self._rollout(
+                    online_current, memory, static, fixed_time
+                )
+                fixed_delta = fixed_state - online_current
+                fixed_features.append(feature_anchor + fixed_delta)
+                fixed_observables.append(self._decode_observable(static, fixed_delta))
+            if fixed_features:
+                result["v51_fixed_predictions"] = torch.stack(fixed_features, dim=1)
+                result["v51_fixed_observable_predictions"] = torch.stack(
+                    fixed_observables, dim=1
+                )
+                result["v51_fixed_horizons"] = torch.tensor(
+                    self.control_horizons_frames, device=horizon_frames.device
+                )
+
+            reversed_context = (
+                self._reverse_history_keep_endpoint(history_input_states, context_mask)
+                if wrong_context_states is None
+                else wrong_context_states
+            )
+            wrong_history, wrong_memory, wrong_static, _ = self.state_encoder(
+                reversed_context, context_mask, context_time_ps
+            )
+            wrong_current = online_current if use_local_target else wrong_history
+            wrong_rolled, _, _, _, _, _ = self._rollout(
+                wrong_current, wrong_memory, wrong_static, horizon_time_ps
+            )
+            wrong_delta = wrong_rolled - wrong_current
+            result["v51_wrong_history_prediction"] = feature_anchor + wrong_delta
+            result["v51_wrong_history_observable_prediction"] = self._decode_observable(
+                wrong_static, wrong_delta
+            )
+            if wrong_context_mask is not None:
+                if short_context_states is None:
+                    short_context_states = history_input_states
+                short_history, short_memory, short_static, _ = self.state_encoder(
+                    short_context_states, wrong_context_mask, context_time_ps
+                )
+                short_current = online_current if use_local_target else short_history
+                short_rolled, _, _, _, _, _ = self._rollout(
+                    short_current, short_memory, short_static, horizon_time_ps
+                )
+                short_delta = short_rolled - short_current
+                result["v51_short_history_prediction"] = feature_anchor + short_delta
+                result["v51_short_history_observable_prediction"] = self._decode_observable(
+                    short_static, short_delta
+                )
+        return result
 
 
 class MetastableStateHead(nn.Module):
@@ -1274,9 +2349,222 @@ class SlowStateProjector(nn.Module):
         self.output_norm = nn.LayerNorm(output_dim)
 
     def forward(self, state: torch.Tensor) -> torch.Tensor:
-        if state.dim() != 2:
-            raise ValueError("slow state projector expects [B,D]")
+        if state.dim() not in {2, 3}:
+            raise ValueError("slow state projector expects [B,D] or [B,T,D]")
         return self.output_norm(self.net(state))
+
+
+class ReversibleKineticOUDynamics(nn.Module):
+    """Composable learned-state dynamics with an exact stationary measure.
+
+    A reversible continuous-time Markov chain propagates soft metastable
+    assignments. The within-state residual follows an exact diagonal OU
+    transition. Both pieces therefore share one local generator across every
+    requested horizon and converge to a sequence/temperature-conditioned
+    equilibrium without using handcrafted collective variables.
+    """
+
+    def __init__(
+        self,
+        state_dim: int,
+        num_states: int = 12,
+        base_step_ps: float = 1000.0,
+        assignment_temperature: float = 0.5,
+        stationary_floor: float = 1.0e-4,
+        rate_scale: float = 0.1,
+        dropout: float = 0.0,
+    ):
+        super().__init__()
+        if state_dim <= 0 or num_states < 2:
+            raise ValueError("LS2 state dimension must be positive and num_states >= 2")
+        if base_step_ps <= 0.0 or assignment_temperature <= 0.0 or rate_scale <= 0.0:
+            raise ValueError("LS2 time, assignment temperature, and rate scale must be positive")
+        if not 0.0 <= stationary_floor < 1.0 / num_states:
+            raise ValueError("LS2 stationary floor must be in [0, 1 / num_states)")
+        self.state_dim = int(state_dim)
+        self.num_states = int(num_states)
+        self.base_step_ps = float(base_step_ps)
+        self.assignment_temperature = float(assignment_temperature)
+        self.stationary_floor = float(stationary_floor)
+        self.rate_scale = float(rate_scale)
+
+        hidden = state_dim * 2
+        self.assignment_head = nn.Sequential(
+            nn.LayerNorm(state_dim),
+            nn.Linear(state_dim, hidden),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden, num_states),
+        )
+        self.target_assignment_head = copy.deepcopy(self.assignment_head)
+        for parameter in self.target_assignment_head.parameters():
+            parameter.requires_grad = False
+
+        self.sequence_embedding = nn.Embedding(32, state_dim)
+        self.thermodynamic_condition = ThermodynamicConditionEmbedding(state_dim)
+        self.condition_trunk = nn.Sequential(
+            nn.LayerNorm(state_dim),
+            nn.Linear(state_dim, hidden),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden, state_dim),
+            nn.LayerNorm(state_dim),
+        )
+        self.equilibrium_head = nn.Linear(state_dim, num_states)
+        self.flux_head = nn.Linear(state_dim, num_states * num_states)
+        nn.init.zeros_(self.equilibrium_head.weight)
+        nn.init.zeros_(self.equilibrium_head.bias)
+        nn.init.zeros_(self.flux_head.weight)
+        nn.init.constant_(self.flux_head.bias, -8.0)
+
+        self.prototypes = nn.Parameter(torch.empty(num_states, state_dim))
+        nn.init.normal_(self.prototypes, std=0.2)
+        self.log_relaxation_rate = nn.Parameter(torch.full((state_dim,), -8.0))
+        self.log_equilibrium_variance = nn.Parameter(torch.zeros(state_dim))
+        self.register_buffer(
+            "off_diagonal_mask",
+            1.0 - torch.eye(num_states),
+            persistent=False,
+        )
+
+    def train(self, mode: bool = True):
+        super().train(mode)
+        self.target_assignment_head.eval()
+        return self
+
+    @torch.no_grad()
+    def sync_target(self) -> None:
+        self.target_assignment_head.load_state_dict(self.assignment_head.state_dict())
+
+    @torch.no_grad()
+    def update_target(self, momentum: float) -> None:
+        for target, online in zip(
+            self.target_assignment_head.parameters(), self.assignment_head.parameters()
+        ):
+            target.data.mul_(momentum).add_(online.detach().data, alpha=1.0 - momentum)
+
+    def assignments(self, state: torch.Tensor, *, target: bool = False) -> torch.Tensor:
+        head = self.target_assignment_head if target else self.assignment_head
+        return torch.softmax(head(state) / self.assignment_temperature, dim=-1)
+
+    def _static_condition(
+        self,
+        aatype: torch.Tensor,
+        residue_mask: torch.Tensor,
+        temperature_k: torch.Tensor | None,
+        dataset_index: torch.Tensor | None,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        if aatype.dim() != 2:
+            raise ValueError("LS2 aatype must be [B,L]")
+        if residue_mask.dim() == 3:
+            residue_mask = residue_mask.any(dim=1)
+        if residue_mask.shape != aatype.shape:
+            raise ValueError("LS2 residue mask must match aatype")
+        tokens = self.sequence_embedding(aatype.clamp(min=0, max=31))
+        weights = residue_mask.unsqueeze(-1).to(dtype=tokens.dtype)
+        sequence = (tokens * weights).sum(dim=1) / weights.sum(dim=1).clamp(min=1.0)
+        thermo = self.thermodynamic_condition(
+            temperature_k,
+            dataset_index,
+            aatype.shape[0],
+            aatype.device,
+            sequence.dtype,
+        )
+        return self.condition_trunk(sequence + thermo).to(dtype=dtype)
+
+    def generator(
+        self,
+        aatype: torch.Tensor,
+        residue_mask: torch.Tensor,
+        temperature_k: torch.Tensor | None = None,
+        dataset_index: torch.Tensor | None = None,
+        dtype: torch.dtype = torch.float32,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        condition = self._static_condition(
+            aatype, residue_mask, temperature_k, dataset_index, dtype
+        )
+        logits = self.equilibrium_head(condition)
+        stationary = torch.softmax(logits, dim=-1)
+        stationary = stationary * (1.0 - self.num_states * self.stationary_floor)
+        stationary = stationary + self.stationary_floor
+
+        raw_flux = self.flux_head(condition).view(-1, self.num_states, self.num_states)
+        symmetric_flux = 0.5 * (raw_flux + raw_flux.transpose(-1, -2))
+        symmetric_flux = F.softplus(symmetric_flux) * self.rate_scale / self.num_states
+        symmetric_flux = symmetric_flux * self.off_diagonal_mask.to(dtype=dtype)
+        generator = symmetric_flux / stationary.unsqueeze(-1)
+        generator = generator - torch.diag_embed(generator.sum(dim=-1))
+        detailed_balance = (
+            stationary.unsqueeze(-1) * generator
+            - stationary.unsqueeze(-2) * generator.transpose(-1, -2)
+        )
+        return generator, stationary, detailed_balance
+
+    def propagate(
+        self,
+        assignment: torch.Tensor,
+        residual: torch.Tensor,
+        generator: torch.Tensor,
+        horizon_time_ps: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        steps = horizon_time_ps.to(dtype=generator.dtype) / self.base_step_ps
+        transition = torch.matrix_exp(generator * steps.view(-1, 1, 1))
+        next_assignment = torch.bmm(assignment.unsqueeze(1), transition).squeeze(1)
+        relaxation = F.softplus(self.log_relaxation_rate) * self.rate_scale
+        decay = torch.exp(-steps.unsqueeze(-1) * relaxation.unsqueeze(0))
+        next_residual = decay * residual
+        mean = next_assignment @ self.prototypes + next_residual
+        equilibrium_variance = F.softplus(self.log_equilibrium_variance) + 1.0e-4
+        variance = equilibrium_variance.unsqueeze(0) * (1.0 - decay.square()) + 1.0e-5
+        log_sigma = 0.5 * torch.log(variance)
+        return mean, log_sigma, next_assignment, transition
+
+    def forward(
+        self,
+        context_state: torch.Tensor,
+        future_state: torch.Tensor,
+        horizon_time_ps: torch.Tensor,
+        aatype: torch.Tensor,
+        residue_mask: torch.Tensor,
+        temperature_k: torch.Tensor | None = None,
+        dataset_index: torch.Tensor | None = None,
+        context_sequence: torch.Tensor | None = None,
+    ) -> dict[str, torch.Tensor]:
+        context_assignment = self.assignments(context_state)
+        with torch.no_grad():
+            future_assignment = self.assignments(future_state, target=True)
+        generator, stationary, detailed_balance = self.generator(
+            aatype,
+            residue_mask,
+            temperature_k=temperature_k,
+            dataset_index=dataset_index,
+            dtype=context_state.dtype,
+        )
+        context_residual = context_state - context_assignment @ self.prototypes
+        mean, log_sigma, prediction, transition = self.propagate(
+            context_assignment,
+            context_residual,
+            generator,
+            horizon_time_ps,
+        )
+        outputs = {
+            "ls2_context_state": context_state,
+            "ls2_future_state": future_state,
+            "ls2_state_prediction": mean,
+            "ls2_log_sigma": log_sigma,
+            "ls2_context_assignment": context_assignment,
+            "ls2_future_assignment": future_assignment,
+            "ls2_assignment_prediction": prediction,
+            "ls2_context_residual": context_residual,
+            "ls2_generator": generator,
+            "ls2_transition_matrix": transition,
+            "ls2_stationary_distribution": stationary,
+            "ls2_detailed_balance_residual": detailed_balance,
+        }
+        if context_sequence is not None:
+            outputs["ls2_context_assignment_sequence"] = self.assignments(context_sequence)
+        return outputs
 
 
 class LaggedLinearDynamicsPredictor(nn.Module):
@@ -1326,6 +2614,200 @@ class LaggedPhyschemPredictor(nn.Module):
             raise ValueError("frame_states must be [B,T,D]")
         h = self.trunk(frame_states)
         return {lag: self.heads[str(lag)](h) for lag in self.lags}
+
+
+class E6AutoregressiveDynamics(nn.Module):
+    """
+    EVA-6: Autoregressive rollout trainer wrapping ThermodynamicMoriDynamicsV3.
+
+    Adds a learned state residual projector (JEPA latent state -> CV residual),
+    runs autoregressive rollouts, and computes training objectives for
+    end-to-end learned-state dynamics with equilibrium correctness.
+    """
+
+    def __init__(
+        self,
+        latent_dim: int,
+        cv_dim: int,
+        condition_dim: int,
+        hidden_dim: int = 256,
+        rollout_steps: int = 8,
+        noise_std: float = 0.05,
+        learned_state_noise_std: float = 0.02,
+        temperature: float = 1.0,
+        dropout: float = 0.0,
+    ):
+        super().__init__()
+        if latent_dim <= 0 or cv_dim <= 0:
+            raise ValueError("E6 latent and CV dimensions must be positive")
+        if rollout_steps < 1:
+            raise ValueError("E6 rollout steps must be at least 1")
+        self.cv_dim = int(cv_dim)
+        self.rollout_steps = int(rollout_steps)
+        self.noise_std = float(noise_std)
+        self.learned_state_noise_std = float(learned_state_noise_std)
+        self.temperature = float(temperature)
+
+        # Project learned state to CV residual
+        self.state_projector = nn.Sequential(
+            nn.LayerNorm(latent_dim),
+            nn.Linear(latent_dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, cv_dim),
+            nn.Tanh(),
+        )
+        self.residual_scale = nn.Parameter(torch.ones(cv_dim) * 0.1)
+
+        # Target projector (EMA)
+        self.target_state_projector = copy.deepcopy(self.state_projector)
+        for p in self.target_state_projector.parameters():
+            p.requires_grad = False
+
+        # Projected force corrector: state + condition -> correction
+        self.force_corrector = nn.Sequential(
+            nn.LayerNorm(cv_dim + condition_dim),
+            nn.Linear(cv_dim + condition_dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, cv_dim),
+            nn.Tanh(),
+        )
+        self.max_shift = nn.Parameter(torch.tensor(0.1))
+
+        # Equilibrium distribution: learned state -> energy (for MMD-free matching)
+        self.equilibrium_head = nn.Sequential(
+            nn.LayerNorm(latent_dim),
+            nn.Linear(latent_dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, 1),
+        )
+
+    def train(self, mode: bool = True) -> E6AutoregressiveDynamics:
+        super().train(mode)
+        self.target_state_projector.eval()
+        return self
+
+    def sync_target(self) -> None:
+        self.target_state_projector.load_state_dict(self.state_projector.state_dict())
+
+    def update_target(self, momentum: float) -> None:
+        for target, online in zip(
+            self.target_state_projector.parameters(),
+            self.state_projector.parameters(),
+        ):
+            target.data.mul_(momentum).add_(online.detach().data, alpha=1.0 - momentum)
+
+    def project_state(
+        self, learned_state: torch.Tensor, *, target: bool = False
+    ) -> torch.Tensor:
+        """Map learned state to CV residual."""
+        projector = self.target_state_projector if target else self.state_projector
+        residual = projector(learned_state)
+        return residual * self.residual_scale
+
+    @torch.no_grad()
+    def equilibrium_score(
+        self, learned_state: torch.Tensor
+    ) -> torch.Tensor:
+        """Energy landscape for equilibrium reweighting (lower = more likely)."""
+        return self.equilibrium_head(learned_state).squeeze(-1)
+
+    def forward(
+        self,
+        fixed_cv_sequence: torch.Tensor,
+        learned_state_sequence: torch.Tensor,
+        mask: torch.Tensor,
+        condition: torch.Tensor,
+        temperature: torch.Tensor,
+        horizon_time_ps: torch.Tensor,
+        v3_dynamics: nn.Module,
+        target_fixed_cv_sequence: torch.Tensor | None = None,
+        target_learned_state: torch.Tensor | None = None,
+        target_mask: torch.Tensor | None = None,
+    ) -> dict[str, torch.Tensor]:
+        B, T, D = fixed_cv_sequence.shape
+        K = self.rollout_steps
+        device = fixed_cv_sequence.device
+        dtype = fixed_cv_sequence.dtype
+
+        # Project learned state to residual
+        context_residual = self.project_state(learned_state_sequence, target=False)
+        combined_state = fixed_cv_sequence + context_residual
+
+        # Last valid context state
+        last_idx = mask.long().sum(dim=1) - 1
+        batch_idx = torch.arange(B, device=device)
+        current_state = combined_state[batch_idx, last_idx.clamp(min=0)]
+
+        # Run V3 filter on combined sequence to get auxiliary state
+        filtered = v3_dynamics.filter(
+            combined_state, mask, torch.zeros(B, T, device=device),
+            condition, temperature,
+        )
+        auxiliary_mean = filtered["mean_sequence"][batch_idx, last_idx.clamp(min=0)]
+        auxiliary_covariance = filtered["covariance_sequence"][batch_idx, last_idx.clamp(min=0)]
+        auxiliary_logvar = torch.diagonal(auxiliary_covariance, dim1=-2, dim2=-1).clamp(min=1.0e-8).log()
+
+        # Autoregressive rollout
+        rollout_predictions = []
+        rollout_ensembles = []
+        rollout_targets = []
+        rollout_aux_means = []
+        state = current_state
+        aux_mean = auxiliary_mean
+        aux_logvar = auxiliary_logvar
+
+        for step in range(K):
+            dt = horizon_time_ps  # [B] or scalar
+
+            # Projected force correction
+            correction_input = torch.cat([state, condition], dim=-1)
+            force_shift = self.force_corrector(correction_input) * self.max_shift
+            force_shift = force_shift * (1.0 - torch.exp(-dt / max(1.0, dt.mean())))**2
+
+            # V3 rollout for one step
+            samples, aux_samples = v3_dynamics.rollout(
+                state, aux_mean, aux_logvar, condition, temperature,
+                dt.unsqueeze(-1) if dt.dim() == 0 else dt,
+                auxiliary_covariance=auxiliary_covariance,
+            )
+            samples = samples + force_shift[:, None, :]
+            prediction = samples.mean(dim=1)
+
+            rollout_predictions.append(prediction)
+            rollout_ensembles.append(samples)
+
+            # Target for this step
+            if target_fixed_cv_sequence is not None and step < target_fixed_cv_sequence.shape[1]:
+                target = target_fixed_cv_sequence[:, step]
+                if target_learned_state is not None:
+                    target_residual = self.project_state(
+                        target_learned_state[:, step], target=True
+                    )
+                    target = target + target_residual
+                rollout_targets.append(target)
+            else:
+                rollout_targets.append(prediction.new_zeros(B, D))
+
+            # Prepare for next step: use prediction + noise as next state
+            if step < K - 1:
+                state = prediction + torch.randn_like(prediction) * self.noise_std
+                # Update auxiliary state
+                aux_mean = aux_samples.mean(dim=1) if aux_samples is not None else aux_mean
+
+        result = {
+            "e6_rollout_predictions": torch.stack(rollout_predictions, dim=1),
+            "e6_rollout_ensembles": torch.stack(rollout_ensembles, dim=2),
+            "e6_rollout_targets": torch.stack(rollout_targets, dim=1),
+            "e6_combined_state": combined_state,
+            "e6_current_state": current_state,
+            "e6_context_residual": context_residual,
+            "e6_auxiliary_mean": auxiliary_mean,
+            "e6_force_shift": force_shift,
+        }
+        return result
 
 
 class KineticReadoutHead(nn.Module):

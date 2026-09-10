@@ -1,0 +1,19 @@
+{
+  "vamp2": {
+    "lag_1": {
+      "mean": 1.607713596816247,
+      "std": 0.2091957576181657,
+      "n_trajs": 30
+    },
+    "lag_20": {
+      "mean": 1.498844544317517,
+      "std": 0.16660715844923896,
+      "n_trajs": 30
+    }
+  },
+  "n_trajs": 30,
+  "latent_dim": 64,
+  "checkpoint_step": "250",
+  "representation": "64D latents (mean pooled)",
+  "n_trajs_requested": 30
+}

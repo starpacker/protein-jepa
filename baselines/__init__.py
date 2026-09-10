@@ -1,0 +1,1 @@
+"""Baseline methods for Protein-JEPA-Frame comparison."""

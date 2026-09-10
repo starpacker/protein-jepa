@@ -10,7 +10,10 @@ import torch.nn.functional as F
 from protein_jepa_frame.config import ModelConfig
 from protein_jepa_frame.models.encoder import ProteinGeometryEncoder
 from protein_jepa_frame.models.predictor import (
+    E6AutoregressiveDynamics,
     HistoryConditionedTransition,
+    ContextualAdaptiveDynamics,
+    ContextualSparseMotionDynamics,
     KineticReadoutHead,
     LaggedLinearDynamicsPredictor,
     LaggedPhyschemPredictor,
@@ -23,11 +26,141 @@ from protein_jepa_frame.models.predictor import (
     MetastableStateHead,
     ObservableHead,
     PairedDeltaPredictor,
+    ReversibleKineticOUDynamics,
     SlowStateProjector,
     SpatiotemporalPredictor,
     StatePredictor,
 )
 from protein_jepa_frame.models.temporal import TemporalStateEncoder
+from protein_jepa_frame.models.thermodynamic import ThermodynamicMoriJEPA
+from protein_jepa_frame.models.thermodynamic_v3 import ThermodynamicMoriJEPAV3
+from protein_jepa_frame.models.lspwm import LSPWMProteinWorldModel
+
+
+def upgrade_tmjepa_v3_state_dict(
+    model: nn.Module,
+    state_dict: dict[str, torch.Tensor],
+) -> dict[str, torch.Tensor]:
+    """Upgrade historical V3 checkpoints without weakening strict loading."""
+    upgraded = dict(state_dict)
+    prefix = "tmjepa.dynamics.kinetics."
+    memory_global = prefix + "memory_activation_energy_raw"
+    diffusion_global = prefix + "activation_energy_raw"
+    memory_deviation = prefix + "memory_activation_deviation"
+    memory_rotation = prefix + "memory_rotation_raw"
+    target_state = model.state_dict()
+    memory_coupling_ramp = prefix + "_memory_coupling_ramp"
+    if memory_coupling_ramp in target_state and memory_coupling_ramp not in upgraded:
+        # Checkpoints predating the warmup buffer used the full memory coupling.
+        upgraded[memory_coupling_ramp] = torch.ones_like(
+            target_state[memory_coupling_ramp]
+        )
+    diffusion_floor_scale = prefix + "diffusion_floor_scale"
+    if diffusion_floor_scale in target_state and diffusion_floor_scale not in upgraded:
+        upgraded[diffusion_floor_scale] = target_state[diffusion_floor_scale].clone()
+    if memory_global in target_state and memory_global not in upgraded:
+        upgraded[memory_global] = upgraded[diffusion_global].clone()
+    if memory_deviation in target_state and memory_deviation not in upgraded:
+        upgraded[memory_deviation] = torch.zeros_like(target_state[memory_deviation])
+    if memory_rotation in target_state and memory_rotation not in upgraded:
+        upgraded[memory_rotation] = torch.zeros_like(target_state[memory_rotation])
+    observation_prefix = prefix + "observation_noise_"
+    for key in target_state:
+        if key.startswith(observation_prefix) and key not in upgraded:
+            upgraded[key] = target_state[key].clone()
+    calibration_prefix = "tmjepa.endpoint_calibration."
+    for key in target_state:
+        if key.startswith(calibration_prefix) and key not in upgraded:
+            upgraded[key] = target_state[key].clone()
+    projected_force_prefix = "tmjepa.projected_force_corrector."
+    for key in target_state:
+        if (
+            key.startswith(projected_force_prefix)
+            and (
+                key not in upgraded
+                or tuple(upgraded[key].shape) != tuple(target_state[key].shape)
+            )
+        ):
+            upgraded[key] = target_state[key].clone()
+    return upgraded
+
+
+def upgrade_lspwm_state_dict(
+    model: nn.Module,
+    state_dict: dict[str, torch.Tensor],
+) -> dict[str, torch.Tensor]:
+    """Migrate pre-temperature LSP-WM candidates without silent loading.
+
+    The temperature feature was appended to the PMF input and the unvalidated
+    history closure was removed from the canonical path. Old checkpoints keep
+    their learned columns; the new temperature column starts at zero and old
+    history-only parameters are dropped explicitly.
+
+    Also handles the transition from ConstantDiffusion to StateDependentDiffusion
+    by dropping incompatible diffusion parameters (they are re-initialised).
+    """
+    upgraded = dict(state_dict)
+    target_state = model.state_dict()
+    first_layer = "lspwm.world_model.potential.network.0.weight"
+    old_weight = upgraded.get(first_layer)
+    new_weight = target_state.get(first_layer)
+    if (
+        old_weight is not None
+        and new_weight is not None
+        and old_weight.ndim == 2
+        and new_weight.shape[0] == old_weight.shape[0]
+        and new_weight.shape[1] == old_weight.shape[1] + 1
+    ):
+        migrated = new_weight.clone()
+        migrated[:, :-1] = old_weight
+        upgraded[first_layer] = migrated
+    for key in tuple(upgraded):
+        if key.startswith("lspwm.world_model.history_closure.") and key not in target_state:
+            upgraded.pop(key)
+
+    # Handle ConstantDiffusion ↔ StateDependentDiffusion transition
+    # Drop incompatible diffusion keys (they will be re-initialised)
+    has_old_diffusion = any(
+        key.startswith("lspwm.world_model.diffusion.raw_factor") for key in upgraded
+    )
+    has_new_diffusion = any(
+        key.startswith("lspwm.world_model.diffusion.net.") for key in upgraded
+    )
+    target_has_constant = any(
+        key.startswith("lspwm.world_model.diffusion.raw_factor") for key in target_state
+    )
+    if has_old_diffusion and not target_has_constant:
+        # Old ConstantDiffusion → new StateDependentDiffusion
+        for key in tuple(upgraded):
+            if key.startswith("lspwm.world_model.diffusion."):
+                upgraded.pop(key)
+    elif has_new_diffusion and target_has_constant:
+        # New StateDependentDiffusion → old ConstantDiffusion (unlikely, but handle)
+        for key in tuple(upgraded):
+            if key.startswith("lspwm.world_model.diffusion."):
+                upgraded.pop(key)
+
+    # Handle potential network architecture changes (depth, hidden_dim)
+    old_potential_keys = [k for k in upgraded if k.startswith("lspwm.world_model.potential.network.")]
+    new_potential_keys = [k for k in target_state if k.startswith("lspwm.world_model.potential.network.")]
+    if old_potential_keys and new_potential_keys:
+        # Check if architectures match — if not, drop old potential weights
+        # and let the new architecture use its default initialization
+        has_mismatch = False
+        if len(old_potential_keys) != len(new_potential_keys):
+            has_mismatch = True
+        else:
+            for key in old_potential_keys:
+                old_shape = upgraded[key].shape
+                new_shape = target_state[key].shape
+                if old_shape != new_shape:
+                    has_mismatch = True
+                    break
+        if has_mismatch:
+            for key in old_potential_keys:
+                upgraded.pop(key)
+
+    return upgraded
 
 
 class ProteinJEPA(nn.Module):
@@ -54,6 +187,81 @@ class ProteinJEPA(nn.Module):
             raise ValueError("V4-C physics state requires frozen offline temporal features")
         if config.v4_physics_state_enabled and config.v4_slow_state_enabled:
             raise ValueError("V4-B and V4-C slow models cannot be enabled together")
+        if config.v5_contextual_dynamics_enabled and not config.paired_forecast:
+            raise ValueError("V5 contextual dynamics requires paired forecasting")
+        if config.v51_contextual_dynamics_enabled and not config.paired_forecast:
+            raise ValueError("V5.1 contextual dynamics requires paired forecasting")
+        if config.v5_contextual_dynamics_enabled and config.v51_contextual_dynamics_enabled:
+            raise ValueError("V5 and V5.1 contextual dynamics cannot be enabled together")
+        if config.tmjepa_enabled and not config.paired_forecast:
+            raise ValueError("TM-JEPA requires paired forecasting")
+        if config.lspwm_enabled and not config.paired_forecast:
+            raise ValueError("LSP-WM requires paired forecasting")
+        if config.lspwm_enabled and config.tmjepa_enabled:
+            raise ValueError("LSP-WM and TM-JEPA branches are mutually exclusive")
+        if config.lspwm_enabled and (config.temporal_depth <= 0 or not config.temporal_causal):
+            raise ValueError("LSP-WM requires a causal temporal encoder")
+        if config.lspwm_enabled and config.lspwm_learned_cv_dim != config.latent_dim:
+            raise ValueError(
+                "LSP-WM unified state dimension must equal the JEPA latent_dim"
+            )
+        if config.lspwm_enabled and len(config.lspwm_memory_times_ps) != config.lspwm_auxiliary_dim:
+            raise ValueError("LSP-WM memory times must match auxiliary_dim")
+        if config.tmjepa_enabled and (
+            config.v5_contextual_dynamics_enabled or config.v51_contextual_dynamics_enabled
+        ):
+            raise ValueError("TM-JEPA and legacy V5 dynamics cannot be enabled together")
+        if config.tmjepa_enabled and config.tmjepa_version == 3 and config.tmjepa_learned_cv_dim:
+            if config.temporal_depth <= 0 or not config.temporal_causal:
+                raise ValueError("TM-JEPA V3 learned CVs require a causal temporal encoder")
+            if config.temporal_causal_window <= 0:
+                raise ValueError("TM-JEPA V3 learned CVs require a fixed causal window")
+            causal_depth = (
+                config.causal_temporal_depth
+                if config.dual_temporal_towers and config.causal_temporal_depth > 0
+                else config.temporal_depth
+            )
+            minimum_burn_in = causal_depth * (config.temporal_causal_window - 1)
+            if config.tmjepa_learned_cv_burn_in_frames < minimum_burn_in:
+                raise ValueError(
+                    "TM-JEPA V3 learned-CV burn-in must fill the effective causal receptive field"
+                )
+        if config.tmjepa_projected_force_latent_history_features and (
+            not config.tmjepa_enabled
+            or config.tmjepa_version != 3
+            or config.temporal_depth <= 0
+            or config.tmjepa_learned_cv_dim <= 0
+        ):
+            raise ValueError(
+                "latent projected-force history requires TM-JEPA V3 learned CVs "
+                "and a temporal encoder"
+            )
+        if config.tmjepa_representation_only and (
+            not config.tmjepa_enabled or config.tmjepa_learned_cv_dim <= 0
+        ):
+            raise ValueError("TM-JEPA representation-only mode requires learned CVs")
+        if config.learned_state_training:
+            if not config.paired_forecast or not config.slow_state_enabled:
+                raise ValueError(
+                    "learned-state training requires paired forecast and a slow-state projector"
+                )
+            if config.tmjepa_enabled:
+                raise ValueError(
+                    "learned-state training cannot use the fixed-CV TM-JEPA branch"
+                )
+            if config.freeze_context_encoder or config.freeze_temporal_encoder:
+                raise ValueError("learned-state training requires trainable online encoders")
+            if config.causal_encoder_gradient_scale <= 0.0:
+                raise ValueError("learned-state training requires nonzero encoder gradients")
+            if config.slow_vamp_burn_in_frames < 0:
+                raise ValueError("slow-state VAMP burn-in must be non-negative")
+            if any(lag <= 0 for lag in config.slow_vamp_lags):
+                raise ValueError("slow-state VAMP lags must be positive")
+        if config.ls2_reversible_enabled:
+            if not config.learned_state_training:
+                raise ValueError("LS2 reversible dynamics requires learned-state training")
+            if config.ls2_num_states < 2:
+                raise ValueError("LS2 reversible dynamics requires at least two states")
         self.context_encoder = ProteinGeometryEncoder(
             latent_dim=config.latent_dim,
             depth=config.encoder_depth,
@@ -88,6 +296,7 @@ class ProteinJEPA(nn.Module):
                 time_conditioning=config.time_conditioning,
                 thermodynamic_conditioning=config.thermodynamic_conditioning,
                 causal=True if config.dual_temporal_towers else config.temporal_causal,
+                causal_window=config.temporal_causal_window,
                 position_encoding=config.temporal_position_encoding,
                 delta_features=config.temporal_delta_features,
                 motion_depth=config.motion_depth,
@@ -117,6 +326,7 @@ class ProteinJEPA(nn.Module):
                 time_conditioning=config.time_conditioning,
                 thermodynamic_conditioning=config.thermodynamic_conditioning,
                 causal=False,
+                causal_window=0,
                 position_encoding=config.temporal_position_encoding,
                 delta_features=config.temporal_delta_features,
                 motion_depth=0,
@@ -246,13 +456,26 @@ class ProteinJEPA(nn.Module):
                 dropout=config.dropout,
                 thermodynamic_conditioning=config.transition_thermodynamic_conditioning,
             )
-            if config.paired_forecast and config.slow_state_enabled
+            if config.paired_forecast and config.slow_state_enabled and not config.ls2_reversible_enabled
             else None
         )
         self.target_slow_state_projector = copy.deepcopy(self.slow_state_projector)
         if self.target_slow_state_projector is not None:
             for param in self.target_slow_state_projector.parameters():
                 param.requires_grad = False
+        self.ls2_reversible_dynamics = (
+            ReversibleKineticOUDynamics(
+                state_dim=config.slow_state_dim,
+                num_states=config.ls2_num_states,
+                base_step_ps=config.ls2_base_step_ps,
+                assignment_temperature=config.ls2_assignment_temperature,
+                stationary_floor=config.ls2_stationary_floor,
+                rate_scale=config.ls2_rate_scale,
+                dropout=config.dropout,
+            )
+            if config.ls2_reversible_enabled
+            else None
+        )
         self.metastable_state_head = (
             MetastableStateHead(
                 latent_dim=config.latent_dim,
@@ -331,6 +554,278 @@ class ProteinJEPA(nn.Module):
             if config.v4_physics_state_enabled
             else None
         )
+        self.v5_contextual_dynamics = (
+            ContextualAdaptiveDynamics(
+                latent_dim=config.latent_dim,
+                slot_dim=config.v5_slot_dim,
+                max_slots=config.v5_max_slots,
+                base_step_ps=config.v5_base_step_ps,
+                max_rollout_steps=config.v5_max_rollout_steps,
+                assignment_temperature=config.v5_assignment_temperature,
+                observable_dim=config.v5_observable_dim,
+                control_horizons_frames=config.v5_control_horizons_frames,
+                training_fixed_controls=config.v5_training_fixed_controls,
+                thermodynamic_conditioning=config.transition_thermodynamic_conditioning,
+                dropout=config.dropout,
+            )
+            if config.v5_contextual_dynamics_enabled
+            else None
+        )
+        self.v51_contextual_dynamics = (
+            ContextualSparseMotionDynamics(
+                latent_dim=config.latent_dim,
+                state_dim=config.v51_state_dim,
+                num_modes=config.v51_num_modes,
+                active_modes=config.v51_active_modes,
+                base_step_ps=config.v51_base_step_ps,
+                max_rollout_steps=config.v51_max_rollout_steps,
+                router_temperature=config.v51_router_temperature,
+                routing_noise_std=config.v51_routing_noise_std,
+                active_temperature=config.v51_active_temperature,
+                log_sigma_min=config.v51_log_sigma_min,
+                log_sigma_max=config.v51_log_sigma_max,
+                observable_dim=config.v51_observable_dim,
+                observable_state_weight=config.v51_observable_state_weight,
+                control_horizons_frames=config.v51_control_horizons_frames,
+                training_controls=config.v51_training_controls,
+                causal_prediction_enabled=config.v51_causal_prediction_enabled,
+                history_truncation_enabled=config.v51_history_truncation_enabled,
+                history_keep_fraction=config.v51_history_keep_fraction,
+                multi_scale_history_enabled=config.v53_multi_scale_history_enabled,
+                slow_history_stride=config.v53_slow_history_stride,
+                autonomous_rollout_enabled=config.v53_autonomous_rollout_enabled,
+                horizon_calibration_enabled=config.v53_horizon_calibration_enabled,
+                horizon_calibration_scale=config.v53_horizon_calibration_scale,
+                frame_local_target_enabled=config.v53_frame_local_target_enabled,
+                physical_state_anchor_enabled=config.v53_physical_state_anchor_enabled,
+                learned_state_residual_scale=config.v53_learned_state_residual_scale,
+                dropout=config.dropout,
+            )
+            if config.v51_contextual_dynamics_enabled
+            else None
+        )
+        self.e6_autoregressive_dynamics = (
+            E6AutoregressiveDynamics(
+                latent_dim=config.latent_dim,
+                cv_dim=config.e6_state_dim,
+                condition_dim=config.tmjepa_condition_dim,
+                hidden_dim=config.e6_hidden_dim,
+                rollout_steps=config.e6_rollout_steps,
+                noise_std=config.e6_noise_std,
+                learned_state_noise_std=config.e6_learned_state_noise_std,
+                temperature=config.e6_temperature,
+                dropout=config.dropout,
+            )
+            if config.e6_autoregressive_enabled
+            else None
+        )
+        if config.tmjepa_enabled and config.tmjepa_version == 2:
+            self.tmjepa = ThermodynamicMoriJEPA(
+                latent_dim=config.latent_dim,
+                num_segments=config.tmjepa_num_segments,
+                learned_cv_dim=config.tmjepa_learned_cv_dim,
+                condition_dim=config.tmjepa_condition_dim,
+                auxiliary_dim=config.tmjepa_auxiliary_dim,
+                memory_enabled=config.tmjepa_memory_enabled,
+                observation_time_scale_ps=config.tmjepa_observation_time_scale_ps,
+                base_step_ps=config.tmjepa_base_step_ps,
+                max_rollout_steps=config.tmjepa_max_rollout_steps,
+                ensemble_size=config.tmjepa_ensemble_size,
+                diffusion_floor=config.tmjepa_diffusion_floor,
+                diffusion_scale=config.tmjepa_diffusion_scale,
+                relaxation_rate_scale=config.tmjepa_relaxation_rate_scale,
+                coupling_scale=config.tmjepa_coupling_scale,
+                equilibrium_noise_std=config.tmjepa_equilibrium_noise_std,
+                contact_cutoff_angstrom=config.physchem_contact_cutoff,
+                contact_width_angstrom=config.tmjepa_contact_width_angstrom,
+            )
+        elif config.tmjepa_enabled and config.tmjepa_version == 3:
+            self.tmjepa = ThermodynamicMoriJEPAV3(
+                latent_dim=config.latent_dim,
+                num_segments=config.tmjepa_num_segments,
+                learned_cv_dim=config.tmjepa_learned_cv_dim,
+                condition_dim=config.tmjepa_condition_dim,
+                auxiliary_dim=config.tmjepa_auxiliary_dim,
+                diffusion_rank=config.tmjepa_diffusion_rank,
+                memory_enabled=config.tmjepa_memory_enabled,
+                coupled_bath_enabled=config.tmjepa_coupled_bath_enabled,
+                observation_noise_enabled=(
+                    config.tmjepa_observation_noise_enabled
+                ),
+                observation_noise_scale=config.tmjepa_observation_noise_scale,
+                observation_noise_rank=config.tmjepa_observation_noise_rank,
+                observation_noise_condition_scale=(
+                    config.tmjepa_observation_noise_condition_scale
+                ),
+                observation_noise_temperature_exponent=(
+                    config.tmjepa_observation_noise_temperature_exponent
+                ),
+                memory_intervention_enabled=(
+                    config.tmjepa_memory_intervention_enabled
+                ),
+                reference_temperature_k=config.tmjepa_reference_temperature_k,
+                activation_energy_kcal_per_mol=(
+                    config.tmjepa_activation_energy_kcal_per_mol
+                ),
+                activation_deviation_kcal_per_mol=(
+                    config.tmjepa_activation_deviation_kcal_per_mol
+                ),
+                state_mobility_scale=config.tmjepa_state_mobility_scale,
+                memory_times_ps=config.tmjepa_memory_times_ps,
+                base_step_ps=config.tmjepa_base_step_ps,
+                max_rollout_steps=config.tmjepa_max_rollout_steps,
+                ensemble_size=config.tmjepa_ensemble_size,
+                diffusion_floor=config.tmjepa_diffusion_floor,
+                learned_cv_diffusion_floor_scale=(
+                    config.tmjepa_learned_cv_diffusion_floor_scale
+                ),
+                diffusion_scale=config.tmjepa_diffusion_scale,
+                coupling_scale=config.tmjepa_coupling_scale,
+                equilibrium_noise_std=config.tmjepa_equilibrium_noise_std,
+                equilibrium_noise_samples=config.tmjepa_equilibrium_noise_samples,
+                heat_capacity_scale_over_kb=(
+                    config.tmjepa_heat_capacity_scale_over_kb
+                ),
+                endpoint_calibration_enabled=(
+                    config.tmjepa_endpoint_calibration_enabled
+                ),
+                endpoint_calibration_scale=(
+                    config.tmjepa_endpoint_calibration_scale
+                ),
+                endpoint_calibration_temperature_scale=(
+                    config.tmjepa_endpoint_calibration_temperature_scale
+                ),
+                projected_force_enabled=config.tmjepa_projected_force_enabled,
+                projected_force_hidden_dim=config.tmjepa_projected_force_hidden_dim,
+                projected_force_max_shift=config.tmjepa_projected_force_max_shift,
+                projected_force_history_features=(
+                    config.tmjepa_projected_force_history_features
+                ),
+                projected_force_latent_history_features=(
+                    config.tmjepa_projected_force_latent_history_features
+                ),
+                projected_force_horizon_gate_steps=(
+                    config.tmjepa_projected_force_horizon_gate_steps
+                ),
+                learned_cv_burn_in_frames=(
+                    config.tmjepa_learned_cv_burn_in_frames
+                ),
+                contact_cutoff_angstrom=config.physchem_contact_cutoff,
+                contact_width_angstrom=config.tmjepa_contact_width_angstrom,
+                cv_mean=config.tmjepa_cv_mean,
+                cv_scale=config.tmjepa_cv_scale,
+            )
+        elif config.tmjepa_enabled:
+            raise ValueError("tmjepa_version must be 2 or 3")
+        else:
+            self.tmjepa = None
+        self.lspwm = (
+            LSPWMProteinWorldModel(
+                latent_dim=config.latent_dim,
+                learned_cv_dim=config.lspwm_learned_cv_dim,
+                num_segments=config.lspwm_num_segments,
+                condition_dim=config.lspwm_condition_dim,
+                auxiliary_dim=config.lspwm_auxiliary_dim,
+                koopman_role_dim=config.lspwm_koopman_role_dim,
+                msm_role_dim=config.lspwm_msm_role_dim,
+                geometric_role_dim=config.lspwm_geometric_role_dim,
+                auxiliary_role_dim=config.lspwm_auxiliary_role_dim,
+                role_hidden_dim=config.lspwm_role_hidden_dim,
+                reference_temperature_k=config.lspwm_reference_temperature_k,
+                diffusion_scale=config.lspwm_diffusion_scale,
+                relaxation_times_ps=config.lspwm_memory_times_ps,
+                coupling_scale=config.lspwm_coupling_scale,
+                contact_cutoff_angstrom=config.physchem_contact_cutoff,
+                contact_width_angstrom=config.tmjepa_contact_width_angstrom,
+                cv_mean=config.lspwm_cv_mean,
+                cv_scale=config.lspwm_cv_scale,
+                mean_force_bandwidth=config.lspwm_mean_force_bandwidth,
+                history_closure_enabled=config.lspwm_history_closure_enabled,
+                rollout_enabled=config.lspwm_rollout_enabled,
+                rollout_steps=config.lspwm_rollout_steps,
+                rollout_ensemble_size=config.lspwm_rollout_ensemble_size,
+                rollout_warmup_steps=config.lspwm_rollout_warmup_steps,
+                rollout_intermediate_supervision=(
+                    config.lspwm_rollout_intermediate_supervision
+                ),
+                rollout_gaussian_nll_enabled=(
+                    config.lspwm_rollout_gaussian_nll_enabled
+                ),
+                dynamic_nll_enabled=config.lspwm_dynamic_nll_enabled,
+                force_loss_enabled=getattr(config, 'lspwm_force_loss_enabled', True),
+                state_dependent_diffusion_enabled=getattr(config, 'lspwm_state_dependent_diffusion', False),
+                potential_hidden_dim=getattr(config, 'lspwm_potential_hidden_dim', 128),
+                potential_hidden_depth=getattr(config, 'lspwm_potential_hidden_depth', 4),
+            )
+            if config.lspwm_enabled
+            else None
+        )
+        if self.lspwm is not None and config.lspwm_freeze_learned_projection:
+            for parameter in self.lspwm.learned_projection.parameters():
+                parameter.requires_grad = False
+            self.lspwm.learned_projection.eval()
+        if self.tmjepa is not None:
+            if config.tmjepa_freeze_learned_projection:
+                projection = getattr(self.tmjepa, "learned_projection", None)
+                if projection is None:
+                    raise ValueError(
+                        "tmjepa_freeze_learned_projection requires learned CVs"
+                    )
+                for parameter in projection.parameters():
+                    parameter.requires_grad = False
+            if config.tmjepa_freeze_potential:
+                potential = getattr(self.tmjepa.dynamics, "potential", None)
+                if potential is None:
+                    raise ValueError("TM-JEPA V2 does not expose a separate potential")
+                for parameter in potential.parameters():
+                    parameter.requires_grad = False
+                for parameter in self.tmjepa.condition_encoder.parameters():
+                    parameter.requires_grad = False
+            if config.tmjepa_freeze_kinetics:
+                kinetics = getattr(self.tmjepa.dynamics, "kinetics", None)
+                if kinetics is None:
+                    raise ValueError("TM-JEPA V2 does not expose separate kinetics")
+                for parameter in kinetics.parameters():
+                    parameter.requires_grad = False
+            kinetics = getattr(self.tmjepa.dynamics, "kinetics", None)
+            if config.tmjepa_freeze_diffusion:
+                if kinetics is None:
+                    raise ValueError("TM-JEPA V2 does not expose separate kinetics")
+                for module in (kinetics.mobility_head,):
+                    for parameter in module.parameters():
+                        parameter.requires_grad = False
+                for parameter in (
+                    kinetics.diffusion_basis,
+                    kinetics.activation_energy_raw,
+                    kinetics.diagonal_activation_deviation,
+                    kinetics.mode_activation_deviation,
+                ):
+                    parameter.requires_grad = False
+            if config.tmjepa_freeze_memory:
+                if kinetics is None:
+                    raise ValueError("TM-JEPA V2 does not expose separate kinetics")
+                for parameter in kinetics.memory_head.parameters():
+                    parameter.requires_grad = False
+                kinetics.coupling_vectors.requires_grad = False
+                for name in (
+                    "memory_activation_energy_raw",
+                    "memory_activation_deviation",
+                    "memory_rotation_raw",
+                ):
+                    parameter = getattr(kinetics, name, None)
+                    if parameter is not None:
+                        parameter.requires_grad = False
+            if config.tmjepa_freeze_observation_noise:
+                if kinetics is None:
+                    raise ValueError("TM-JEPA V2 does not expose separate kinetics")
+                for name, parameter in kinetics.named_parameters():
+                    if name.startswith("observation_noise_"):
+                        parameter.requires_grad = False
+            if config.tmjepa_freeze_endpoint_calibration:
+                calibration = getattr(self.tmjepa, "endpoint_calibration", None)
+                if calibration is not None:
+                    for parameter in calibration.parameters():
+                        parameter.requires_grad = False
         if config.freeze_v4_physics_representation and self.v4_physics_slow_model is not None:
             generator_prefixes = (
                 "condition_trunk.",
@@ -350,6 +845,12 @@ class ProteinJEPA(nn.Module):
             for param in self.context_encoder.parameters():
                 param.requires_grad = False
             self.context_encoder.eval()
+        if config.freeze_temporal_encoder:
+            if self.temporal_encoder is None:
+                raise ValueError("freeze_temporal_encoder requires a temporal encoder")
+            for param in self.temporal_encoder.parameters():
+                param.requires_grad = False
+            self.temporal_encoder.eval()
         if config.freeze_offline_temporal_encoder and self.offline_temporal_encoder is not None:
             for param in self.offline_temporal_encoder.parameters():
                 param.requires_grad = False
@@ -361,6 +862,22 @@ class ProteinJEPA(nn.Module):
             self.target_offline_temporal_encoder.eval()
         if self.target_slow_state_projector is not None:
             self.target_slow_state_projector.eval()
+        if self.ls2_reversible_dynamics is not None:
+            self.ls2_reversible_dynamics.target_assignment_head.eval()
+        if self.e6_autoregressive_dynamics is not None:
+            if config.e6_freeze_encoder:
+                for param in self.context_encoder.parameters():
+                    param.requires_grad = False
+                self.context_encoder.eval()
+                for param in self.temporal_encoder.parameters():
+                    param.requires_grad = False
+                self.temporal_encoder.eval()
+            if config.e6_freeze_learned_state_projector:
+                for param in self.e6_autoregressive_dynamics.state_projector.parameters():
+                    param.requires_grad = False
+            if config.e6_freeze_fixed_cv_dynamics and self.tmjepa is not None:
+                for param in self.tmjepa.parameters():
+                    param.requires_grad = False
 
     def train(self, mode: bool = True) -> ProteinJEPA:
         super().train(mode)
@@ -368,6 +885,8 @@ class ProteinJEPA(nn.Module):
         self.target_encoder.eval()
         if self.config.freeze_context_encoder:
             self.context_encoder.eval()
+        if self.config.freeze_temporal_encoder and self.temporal_encoder is not None:
+            self.temporal_encoder.eval()
         if self.config.freeze_offline_temporal_encoder and self.offline_temporal_encoder is not None:
             self.offline_temporal_encoder.eval()
         if self.config.freeze_closed_local_operator and self.closed_local_operator is not None:
@@ -378,6 +897,8 @@ class ProteinJEPA(nn.Module):
             self.target_offline_temporal_encoder.eval()
         if self.target_slow_state_projector is not None:
             self.target_slow_state_projector.eval()
+        if self.ls2_reversible_dynamics is not None:
+            self.ls2_reversible_dynamics.target_assignment_head.eval()
         if self.config.freeze_v4_physics_representation and self.v4_physics_slow_model is not None:
             for module in (
                 self.v4_physics_slow_model.frame_encoder,
@@ -404,9 +925,24 @@ class ProteinJEPA(nn.Module):
             self.target_offline_temporal_encoder.load_state_dict(self.offline_temporal_encoder.state_dict())
         if self.target_slow_state_projector is not None and self.slow_state_projector is not None:
             self.target_slow_state_projector.load_state_dict(self.slow_state_projector.state_dict())
+        if self.ls2_reversible_dynamics is not None:
+            self.ls2_reversible_dynamics.sync_target()
+        if self.v51_contextual_dynamics is not None:
+            self.v51_contextual_dynamics.sync_target_encoder()
+        if self.tmjepa is not None:
+            self.tmjepa.sync_target_projection()
+        if self.lspwm is not None:
+            self.lspwm.update_target_projection(0.0)
+        self._curriculum_step = 0
 
     @torch.no_grad()
     def update_target_encoder(self, momentum: float) -> None:
+        # A frozen-latent downstream stage must preserve the exact teacher
+        # representation used to construct its paired targets. Updating the
+        # EMA target here would silently change the prediction problem while
+        # the online encoder remains frozen.
+        if self.config.freeze_target_encoders:
+            return
         for target, context in zip(self.target_encoder.parameters(), self.context_encoder.parameters()):
             target.data.mul_(momentum).add_(context.detach().data, alpha=1.0 - momentum)
         if self.target_temporal_encoder is not None and self.temporal_encoder is not None:
@@ -418,6 +954,14 @@ class ProteinJEPA(nn.Module):
         if self.target_slow_state_projector is not None and self.slow_state_projector is not None:
             for target, context in zip(self.target_slow_state_projector.parameters(), self.slow_state_projector.parameters()):
                 target.data.mul_(momentum).add_(context.detach().data, alpha=1.0 - momentum)
+        if self.ls2_reversible_dynamics is not None:
+            self.ls2_reversible_dynamics.update_target(momentum)
+        if self.v51_contextual_dynamics is not None:
+            self.v51_contextual_dynamics.update_target_encoder(momentum)
+        if self.tmjepa is not None:
+            self.tmjepa.update_target_projection(momentum)
+        if self.lspwm is not None:
+            self.lspwm.update_target_projection(momentum)
 
     def forward(self, batch: dict, context_mask: torch.Tensor, target_mask: torch.Tensor) -> dict:
         coords = batch["coords"]
@@ -647,6 +1191,48 @@ class ProteinJEPA(nn.Module):
         batch_index = torch.arange(frame_mask.shape[0], device=frame_mask.device)
         return states["frame_states"][batch_index, last]
 
+    def forward_tmjepa(self, batch: dict) -> dict[str, torch.Tensor]:
+        """Fast fixed-CV path that does not evaluate unused JEPA encoders."""
+        if self.tmjepa is None:
+            raise ValueError("TM-JEPA is not enabled")
+        if self.tmjepa.learned_cv_dim:
+            return self.forward_paired(batch)
+        outputs = self.tmjepa(
+            context_coords=batch["context_coords"],
+            future_coords=batch["future_coords"],
+            context_atom_mask=batch["context_atom_mask"],
+            future_atom_mask=batch["future_atom_mask"],
+            context_residue_mask=batch["context_residue_mask"],
+            future_residue_mask=batch["future_residue_mask"],
+            aatype=batch["context_aatype"],
+            residue_index=batch["context_residue_index"],
+            chain_id=batch["context_chain_id"],
+            context_time_ps=batch["context_time_ps"],
+            horizon_time_ps=batch["horizon_time_ps"],
+            temperature_k=batch.get("temperature_k"),
+            dataset_index=batch.get("dataset_index"),
+        )
+        current = outputs["tmjepa_current_cv"]
+        target = outputs["tmjepa_target_cv"]
+        prediction = outputs["tmjepa_prediction"]
+        outputs.update(
+            {
+                "context_endpoint": current,
+                "context_teacher_endpoint": current,
+                "persistence_endpoint": current,
+                "future_endpoint": target,
+                "delta_target": target - current,
+                "delta_prediction": prediction - current,
+                "state_prediction": prediction,
+                "horizon_frames": batch["horizon_frames"],
+                "horizon_time_ps": batch["horizon_time_ps"],
+                "transition_head_source": current,
+            }
+        )
+        if "context_group_index" in batch:
+            outputs["context_group_index"] = batch["context_group_index"]
+        return outputs
+
     def forward_paired(self, batch: dict) -> dict[str, torch.Tensor]:
         """Encode paired windows for endpoint forecasting and slow dynamics."""
         if self.temporal_encoder is None or self.paired_delta_predictor is None:
@@ -814,6 +1400,191 @@ class ProteinJEPA(nn.Module):
             "horizon_time_ps": batch["horizon_time_ps"],
             "transition_head_source": transition_head_source,
         }
+        if "context_group_index" in batch:
+            outputs["context_group_index"] = batch["context_group_index"]
+        if self.tmjepa is not None:
+            if self.config.tmjepa_representation_only:
+                outputs.update(
+                    self.tmjepa.encode_learned_context(
+                        context_states["frame_states"],
+                        batch["context_residue_mask"].any(dim=2),
+                    )
+                )
+            else:
+                outputs.update(
+                    self.tmjepa(
+                        context_coords=batch["context_coords"],
+                        future_coords=batch["future_coords"],
+                        context_atom_mask=batch["context_atom_mask"],
+                        future_atom_mask=batch["future_atom_mask"],
+                        context_residue_mask=batch["context_residue_mask"],
+                        future_residue_mask=batch["future_residue_mask"],
+                        aatype=batch["context_aatype"],
+                        residue_index=batch["context_residue_index"],
+                        chain_id=batch["context_chain_id"],
+                        context_time_ps=batch["context_time_ps"],
+                        horizon_time_ps=batch["horizon_time_ps"],
+                        temperature_k=batch.get("temperature_k"),
+                        dataset_index=batch.get("dataset_index"),
+                        context_frame_states=context_states["frame_states"],
+                        future_frame_states=future_states["frame_states"],
+                    )
+                )
+        if self.lspwm is not None:
+            outputs.update(
+                self.lspwm(
+                    context_coords=batch["context_coords"],
+                    future_coords=batch["future_coords"],
+                    context_atom_mask=batch["context_atom_mask"],
+                    future_atom_mask=batch["future_atom_mask"],
+                    context_residue_mask=batch["context_residue_mask"],
+                    future_residue_mask=batch["future_residue_mask"],
+                    context_chain_id=batch["context_chain_id"],
+                    future_chain_id=batch["future_chain_id"],
+                    context_residue_index=batch["context_residue_index"],
+                    future_residue_index=batch["future_residue_index"],
+                    context_frame_states=context_states["frame_states"],
+                    future_frame_states=future_states["frame_states"],
+                    context_time_ps=batch["context_time_ps"],
+                    horizon_time_ps=batch["horizon_time_ps"],
+                    aatype=batch["context_aatype"],
+                    temperature_k=batch.get("temperature_k"),
+                    dataset_index=batch.get("dataset_index"),
+                    curriculum_step=self._curriculum_step if hasattr(self, '_curriculum_step') else None,
+                    curriculum_steps=self.config.lspwm_curriculum_steps if hasattr(self.config, 'lspwm_curriculum_steps') else None,
+                )
+            )
+        if self.v5_contextual_dynamics is not None:
+            outputs.update(
+                self.v5_contextual_dynamics(
+                    context_states["frame_states"],
+                    future_states["frame_states"],
+                    batch["context_residue_mask"].any(dim=2),
+                    batch["future_residue_mask"].any(dim=2),
+                    batch["horizon_time_ps"],
+                    batch["horizon_frames"],
+                    temperature_k=batch.get("temperature_k"),
+                    dataset_index=batch.get("dataset_index"),
+                )
+            )
+            outputs["v5_observable_target"] = compute_v3_paired_observable_targets(
+                batch["context_coords"], batch["future_coords"],
+                batch["context_atom_mask"], batch["future_atom_mask"],
+                batch["context_residue_mask"], batch["future_residue_mask"],
+                batch["context_chain_id"], batch["context_residue_index"],
+                contact_cutoff=self.config.physchem_contact_cutoff,
+            )
+        if self.v51_contextual_dynamics is not None:
+            context_local_mask = batch["context_residue_mask"].unsqueeze(-1).to(
+                dtype=causal_context_latents.dtype
+            )
+            context_local_states = (
+                causal_context_latents * context_local_mask
+            ).sum(dim=2) / context_local_mask.sum(dim=2).clamp(min=1.0)
+            teacher_local_mask = batch["context_residue_mask"].unsqueeze(-1).to(
+                dtype=teacher_context_latents.dtype
+            )
+            teacher_context_local_states = (
+                teacher_context_latents * teacher_local_mask
+            ).sum(dim=2) / teacher_local_mask.sum(dim=2).clamp(min=1.0)
+            future_local_mask = batch["future_residue_mask"].unsqueeze(-1).to(
+                dtype=future_latents.dtype
+            )
+            future_local_states = (
+                future_latents * future_local_mask
+            ).sum(dim=2) / future_local_mask.sum(dim=2).clamp(min=1.0)
+            context_physical_states = None
+            future_physical_states = None
+            if self.config.v53_physical_state_anchor_enabled:
+                context_physical, context_physical_mask = compute_v3_closed_local_state_sequence(
+                    batch["context_coords"],
+                    batch["context_atom_mask"],
+                    batch["context_residue_mask"],
+                    batch["context_chain_id"],
+                    batch["context_residue_index"],
+                    num_tokens=self.config.v53_physical_state_tokens,
+                    contact_cutoff=self.config.physchem_contact_cutoff,
+                )
+                future_physical, future_physical_mask = compute_v3_closed_local_state_sequence(
+                    batch["future_coords"],
+                    batch["future_atom_mask"],
+                    batch["future_residue_mask"],
+                    batch["future_chain_id"],
+                    batch["future_residue_index"],
+                    num_tokens=self.config.v53_physical_state_tokens,
+                    contact_cutoff=self.config.physchem_contact_cutoff,
+                )
+                context_physical_states = (
+                    context_physical * context_physical_mask.unsqueeze(-1)
+                ).flatten(start_dim=2)
+                future_physical_states = (
+                    future_physical * future_physical_mask.unsqueeze(-1)
+                ).flatten(start_dim=2)
+            v51_observable_target = compute_v3_paired_observable_targets(
+                batch["context_coords"], batch["future_coords"],
+                batch["context_atom_mask"], batch["future_atom_mask"],
+                batch["context_residue_mask"], batch["future_residue_mask"],
+                batch["context_chain_id"], batch["context_residue_index"],
+                contact_cutoff=self.config.physchem_contact_cutoff,
+            )
+            wrong_context_frame_states = None
+            wrong_context_frame_mask = None
+            short_context_frame_states = None
+            if self.config.v51_training_controls:
+                time_length = causal_context_latents.shape[1]
+                permutation = torch.arange(time_length, device=causal_context_latents.device)
+                permutation[:-1] = permutation[:-1].flip(0)
+                if self.config.v53_frame_local_target_enabled:
+                    # Let dynamics reverse its fused learned/physical history.
+                    wrong_context_frame_states = None
+                else:
+                    wrong_context_states = self.temporal_encoder(
+                        causal_context_latents[:, permutation],
+                        batch["context_residue_mask"][:, permutation],
+                        time_ps=batch.get("context_time_ps"),
+                        temperature_k=batch.get("temperature_k"),
+                        dataset_index=batch.get("dataset_index"),
+                    )
+                    wrong_context_frame_states = wrong_context_states["frame_states"]
+                if self.config.v51_history_truncation_enabled:
+                    keep = max(1, int(round(time_length * self.config.v51_history_keep_fraction)))
+                    wrong_context_frame_mask = batch["context_residue_mask"].any(dim=2).clone()
+                    wrong_context_frame_mask[:, :-keep] = False
+                    if self.config.v53_frame_local_target_enabled:
+                        short_context_frame_states = None
+                    else:
+                        short_context_states = self.temporal_encoder(
+                            causal_context_latents,
+                            wrong_context_frame_mask.unsqueeze(-1).expand_as(batch["context_residue_mask"]),
+                            time_ps=batch.get("context_time_ps"),
+                            temperature_k=batch.get("temperature_k"),
+                            dataset_index=batch.get("dataset_index"),
+                        )
+                        short_context_frame_states = short_context_states["frame_states"]
+            outputs.update(
+                self.v51_contextual_dynamics(
+                    context_states["frame_states"],
+                    teacher_context_states["frame_states"],
+                    future_states["frame_states"],
+                    batch["context_residue_mask"].any(dim=2),
+                    batch["future_residue_mask"].any(dim=2),
+                    batch.get("context_time_ps"),
+                    batch.get("future_time_ps"),
+                    batch["horizon_time_ps"],
+                    batch["horizon_frames"],
+                    context_local_states=context_local_states,
+                    teacher_context_local_states=teacher_context_local_states,
+                    future_local_states=future_local_states,
+                    context_physical_states=context_physical_states,
+                    future_physical_states=future_physical_states,
+                    observable_target=v51_observable_target,
+                    wrong_context_states=wrong_context_frame_states,
+                    wrong_context_mask=wrong_context_frame_mask,
+                    short_context_states=short_context_frame_states,
+                    context_group_index=batch.get("context_group_index"),
+                )
+            )
+            outputs["v51_observable_target"] = v51_observable_target
         if self.gaussian_transition is not None:
             gaussian_mean, gaussian_log_sigma = self.gaussian_transition(
                 transition_source,
@@ -1126,11 +1897,83 @@ class ProteinJEPA(nn.Module):
                         outputs["v4c_force_target"] = batch["context_forces"][force_rows, -1:]
                         outputs["v4c_force_atom_mask"] = batch["context_atom_mask"][force_rows, -1:]
                         outputs["v4c_force_state_mask"] = force_state_mask
-        if self.slow_state_projector is not None:
+        if self.slow_state_projector is not None and self.ls2_reversible_dynamics is not None:
+            context_frame_mask = batch["context_residue_mask"].any(dim=2)
+            future_frame_mask = batch["future_residue_mask"].any(dim=2)
+            context_residue_weights = batch["context_residue_mask"].unsqueeze(-1).to(
+                dtype=context_latents.dtype
+            )
+            future_residue_weights = batch["future_residue_mask"].unsqueeze(-1).to(
+                dtype=future_latents.dtype
+            )
+            teacher_residue_weights = context_residue_weights.to(dtype=teacher_context_latents.dtype)
+            context_instant_sequence = (
+                context_latents * context_residue_weights
+            ).sum(dim=2) / context_residue_weights.sum(dim=2).clamp(min=1.0)
+            with torch.no_grad():
+                teacher_context_instant_sequence = (
+                    teacher_context_latents * teacher_residue_weights
+                ).sum(dim=2) / teacher_residue_weights.sum(dim=2).clamp(min=1.0)
+                future_instant_sequence = (
+                    future_latents * future_residue_weights
+                ).sum(dim=2) / future_residue_weights.sum(dim=2).clamp(min=1.0)
+            context_slow_sequence = self.slow_state_projector(context_instant_sequence)
+            context_slow_state = self.encode_endpoint_state(
+                {"frame_states": context_slow_sequence}, context_frame_mask
+            )
+            with torch.no_grad():
+                teacher_context_slow_sequence = self.target_slow_state_projector(
+                    teacher_context_instant_sequence
+                )
+                future_slow_sequence = self.target_slow_state_projector(
+                    future_instant_sequence
+                )
+                teacher_context_slow_state = self.encode_endpoint_state(
+                    {"frame_states": teacher_context_slow_sequence}, context_frame_mask
+                )
+                future_slow_state = self.encode_endpoint_state(
+                    {"frame_states": future_slow_sequence}, future_frame_mask
+                )
+            outputs.update(
+                {
+                    "context_slow_state": context_slow_state,
+                    "teacher_context_slow_state": teacher_context_slow_state,
+                    "future_slow_state": future_slow_state,
+                    "context_slow_sequence": context_slow_sequence,
+                    "future_slow_sequence": future_slow_sequence,
+                    "context_slow_mask": context_frame_mask,
+                    "future_slow_mask": future_frame_mask,
+                }
+            )
+            ls2_outputs = self.ls2_reversible_dynamics(
+                context_slow_state,
+                future_slow_state,
+                batch["horizon_time_ps"],
+                batch["context_aatype"],
+                batch["context_residue_mask"],
+                temperature_k=batch.get("temperature_k"),
+                dataset_index=batch.get("dataset_index"),
+                context_sequence=context_slow_sequence,
+            )
+            with torch.no_grad():
+                ls2_outputs["ls2_persistence_assignment"] = (
+                    self.ls2_reversible_dynamics.assignments(
+                        teacher_context_slow_state, target=True
+                    )
+                )
+            ls2_outputs["ls2_persistence_state"] = teacher_context_slow_state
+            outputs.update(ls2_outputs)
+        elif self.slow_state_projector is not None:
             context_slow_state = self.slow_state_projector(transition_source)
             with torch.no_grad():
                 future_slow_state = self.target_slow_state_projector(future_endpoint)
                 teacher_context_slow_state = self.target_slow_state_projector(context_teacher_endpoint)
+                future_slow_sequence = self.target_slow_state_projector(
+                    future_states["frame_states"]
+                )
+            context_slow_sequence = self.slow_state_projector(
+                context_states["frame_states"]
+            )
             if self.config.paired_teacher_space_delta:
                 slow_persistence_state = teacher_context_slow_state
                 slow_delta_anchor = teacher_context_slow_state
@@ -1155,6 +1998,10 @@ class ProteinJEPA(nn.Module):
                     "slow_delta_target": slow_delta_target,
                     "slow_delta_prediction": slow_delta_prediction,
                     "slow_state_prediction": slow_prediction_anchor + slow_delta_prediction,
+                    "context_slow_sequence": context_slow_sequence,
+                    "future_slow_sequence": future_slow_sequence,
+                    "context_slow_mask": batch["context_residue_mask"].any(dim=2),
+                    "future_slow_mask": batch["future_residue_mask"].any(dim=2),
                 }
             )
         return outputs
@@ -1413,9 +2260,11 @@ def paired_forecast_terms(outputs: dict, loss_type: str = "smooth_l1") -> dict[s
     delta_loss = _latent_loss(prediction, target, loss_type)
     persistence_loss = _latent_loss(zero, target, loss_type)
     state_loss = _latent_loss(outputs["state_prediction"], outputs["future_endpoint"], loss_type)
+    relative_delta_loss = delta_loss / persistence_loss.detach().clamp(min=1.0e-6)
     return {
         "delta_loss": delta_loss,
         "state_loss": state_loss,
+        "relative_delta_loss": relative_delta_loss,
         "persistence_delta_loss": persistence_loss,
         "skill": 1.0 - delta_loss / persistence_loss.clamp(min=1.0e-8),
         "pairs": torch.tensor(target.shape[0], device=target.device),
@@ -1433,13 +2282,78 @@ def _slow_cross_entropy(prediction: torch.Tensor, target: torch.Tensor, temperat
     return 0.5 * (F.cross_entropy(logits, labels) + F.cross_entropy(logits.T, labels))
 
 
-def slow_forecast_terms(outputs: dict, loss_type: str = "smooth_l1") -> dict[str, torch.Tensor]:
+def _continuous_slow_vamp2(
+    sequence: torch.Tensor,
+    mask: torch.Tensor,
+    lags: tuple[int, ...],
+    burn_in_frames: int = 0,
+    eps: float = 1.0e-3,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """VAMP-2 on within-trajectory fluctuations of a continuous learned state."""
+    if burn_in_frames:
+        sequence = sequence[:, burn_in_frames:]
+        mask = mask[:, burn_in_frames:]
+    zero = sequence.new_tensor(0.0)
+    dim = sequence.shape[-1]
+    scores = []
+    eye = torch.eye(dim, device=sequence.device, dtype=sequence.dtype)
+    for lag in sorted(set(int(value) for value in lags)):
+        if lag <= 0 or lag >= sequence.shape[1]:
+            continue
+        x_parts = []
+        y_parts = []
+        for row in range(sequence.shape[0]):
+            pair_mask = mask[row, :-lag] & mask[row, lag:]
+            if not pair_mask.any():
+                continue
+            left = sequence[row, :-lag][pair_mask]
+            right = sequence[row, lag:][pair_mask]
+            # Remove static protein identity while retaining temporal changes.
+            center = torch.cat([left, right], dim=0).mean(dim=0, keepdim=True)
+            x_parts.append(left - center)
+            y_parts.append(right - center)
+        if not x_parts:
+            continue
+        x = torch.cat(x_parts, dim=0)
+        y = torch.cat(y_parts, dim=0)
+        if x.shape[0] <= dim + 1:
+            continue
+        denominator = max(x.shape[0] - 1, 1)
+        c00 = x.T @ x / denominator + eps * eye
+        c11 = y.T @ y / denominator + eps * eye
+        c01 = x.T @ y / denominator
+        with torch.no_grad():
+            def inverse_sqrt(covariance: torch.Tensor) -> torch.Tensor:
+                values, vectors = torch.linalg.eigh(covariance)
+                return (vectors * values.clamp(min=eps).rsqrt().unsqueeze(0)) @ vectors.T
+
+            w0 = inverse_sqrt(c00)
+            w1 = inverse_sqrt(c11)
+        koopman = w0 @ c01 @ w1
+        scores.append(koopman.square().sum())
+    score = torch.stack(scores).mean() if scores else zero
+    return -score / float(dim), score
+
+
+def slow_forecast_terms(
+    outputs: dict,
+    loss_type: str = "smooth_l1",
+    vamp_lags: tuple[int, ...] = (1, 2, 4, 8),
+    vamp_burn_in_frames: int = 0,
+) -> dict[str, torch.Tensor]:
     """Losses for a low-dimensional slow/metastable endpoint representation."""
     prediction = outputs["slow_delta_prediction"]
     target = outputs["slow_delta_target"]
     delta_loss = _latent_loss(prediction, target, loss_type)
     state_loss = _latent_loss(outputs["slow_state_prediction"], outputs["future_slow_state"], loss_type)
     persistence_loss = _latent_loss(torch.zeros_like(target), target, loss_type)
+    relative_delta_loss = (
+        (prediction - target).square().mean(dim=-1)
+        / target.detach().square().mean(dim=-1).clamp(min=1.0e-4)
+    ).mean()
+    alignment_loss = _latent_loss(
+        outputs["context_slow_state"], outputs["teacher_context_slow_state"].detach(), loss_type
+    )
     context = outputs["context_slow_state"]
     std = torch.sqrt(context.var(dim=0, unbiased=False) + 1.0e-4)
     variance_loss = torch.relu(1.0 - std).mean() if context.shape[0] > 1 else context.new_tensor(0.0)
@@ -1450,14 +2364,103 @@ def slow_forecast_terms(outputs: dict, loss_type: str = "smooth_l1") -> dict[str
         covariance_loss = off_diagonal.square().mean()
     else:
         covariance_loss = context.new_tensor(0.0)
+    vamp_loss, vamp2_score = _continuous_slow_vamp2(
+        outputs["context_slow_sequence"],
+        outputs["context_slow_mask"],
+        vamp_lags,
+        burn_in_frames=vamp_burn_in_frames,
+    )
     return {
         "delta_loss": delta_loss,
         "state_loss": state_loss,
+        "relative_delta_loss": relative_delta_loss,
+        "alignment_loss": alignment_loss,
         "persistence_loss": persistence_loss,
         "skill": 1.0 - delta_loss / persistence_loss.clamp(min=1.0e-8),
         "contrastive_loss": _slow_cross_entropy(outputs["slow_state_prediction"], outputs["future_slow_state"]),
         "variance_loss": variance_loss,
         "covariance_loss": covariance_loss,
+        "vamp_loss": vamp_loss,
+        "vamp2_score": vamp2_score,
+    }
+
+
+def reversible_kinetic_terms(
+    outputs: dict,
+    vamp_lags: tuple[int, ...] = (1, 2, 4, 8),
+) -> dict[str, torch.Tensor]:
+    """Losses and diagnostics for the LS2 reversible kinetic-OU predictor."""
+    if "ls2_state_prediction" not in outputs:
+        reference = outputs.get("delta_target", outputs.get("context_endpoint"))
+        zero = reference.new_tensor(0.0)
+        return {
+            "state_loss": zero,
+            "persistence_loss": zero,
+            "state_skill": zero,
+            "assignment_loss": zero,
+            "assignment_persistence_loss": zero,
+            "assignment_skill": zero,
+            "nll": zero,
+            "balance_loss": zero,
+            "entropy_loss": zero,
+            "vamp_loss": zero,
+            "vamp2_score": zero,
+            "detailed_balance_max": zero,
+            "stationarity_error": zero,
+        }
+    prediction = outputs["ls2_state_prediction"]
+    target = outputs["ls2_future_state"].detach()
+    persistence = outputs["ls2_persistence_state"].detach()
+    state_loss = F.smooth_l1_loss(prediction, target)
+    persistence_loss = F.smooth_l1_loss(persistence, target)
+
+    assignment_prediction = outputs["ls2_assignment_prediction"].clamp(min=1.0e-8)
+    assignment_target = outputs["ls2_future_assignment"].detach()
+    assignment_persistence = outputs["ls2_persistence_assignment"].detach()
+    assignment_loss = (
+        assignment_target
+        * (
+            assignment_target.clamp(min=1.0e-8).log()
+            - assignment_prediction.log()
+        )
+    ).sum(dim=-1).mean()
+    assignment_brier = (assignment_prediction - assignment_target).square().sum(dim=-1).mean()
+    persistence_brier = (assignment_persistence - assignment_target).square().sum(dim=-1).mean()
+
+    residual = target - prediction
+    log_sigma = outputs["ls2_log_sigma"]
+    nll = 0.5 * (
+        residual.square() * torch.exp(-2.0 * log_sigma) + 2.0 * log_sigma
+    ).mean()
+    usage = outputs["ls2_context_assignment"].mean(dim=0).clamp(min=1.0e-8)
+    balance_loss = (usage * (usage * usage.numel()).log()).sum()
+    entropy_loss = -(
+        outputs["ls2_context_assignment"].clamp(min=1.0e-8)
+        * outputs["ls2_context_assignment"].clamp(min=1.0e-8).log()
+    ).sum(dim=-1).mean()
+    vamp_loss, vamp2_score = _continuous_slow_vamp2(
+        outputs["ls2_context_assignment_sequence"],
+        outputs["context_slow_mask"],
+        vamp_lags,
+    )
+    stationary = outputs["ls2_stationary_distribution"]
+    transition = outputs["ls2_transition_matrix"]
+    stationary_after = torch.bmm(stationary.unsqueeze(1), transition).squeeze(1)
+    stationarity_error = (stationary_after - stationary).abs().max()
+    return {
+        "state_loss": state_loss,
+        "persistence_loss": persistence_loss,
+        "state_skill": 1.0 - state_loss / persistence_loss.clamp(min=1.0e-8),
+        "assignment_loss": assignment_loss,
+        "assignment_persistence_loss": persistence_brier,
+        "assignment_skill": 1.0 - assignment_brier / persistence_brier.clamp(min=1.0e-8),
+        "nll": nll,
+        "balance_loss": balance_loss,
+        "entropy_loss": entropy_loss,
+        "vamp_loss": vamp_loss,
+        "vamp2_score": vamp2_score,
+        "detailed_balance_max": outputs["ls2_detailed_balance_residual"].abs().max(),
+        "stationarity_error": stationarity_error,
     }
 
 
@@ -2655,6 +3658,1192 @@ def v4_physics_terms(
         "mean_lambda2": mean_lambda2,
         "latent_autocorrelation": latent_autocorrelation,
         "residual_autocorrelation": residual_autocorrelation,
+    }
+
+
+def v5_contextual_dynamics_terms(
+    outputs: dict,
+    horizon_ranking_margin: float = 0.002,
+) -> dict[str, torch.Tensor]:
+    """Joint representation and forecast terms for contextual V5 dynamics."""
+    if "v5_prediction" not in outputs:
+        zero = outputs["delta_target"].new_tensor(0.0)
+        return {
+            key: zero
+            for key in (
+                "transition_loss", "persistence_loss", "transition_skill",
+                "state_reconstruction_loss", "feature_forecast_loss", "transition_nll",
+                "observable_loss", "observable_zero_motion_loss", "observable_zero_motion_skill",
+                "horizon_ranking_loss", "correct_vs_best_fixed_skill",
+                "horizon_difference_loss", "target_horizon_difference",
+                "observable_horizon_difference_loss", "observable_target_horizon_difference",
+                "slot_diversity_loss", "gate_complexity_loss", "mean_active_slots",
+                "effective_slots", "detailed_balance_residual",
+            )
+        }
+
+    prediction = outputs["v5_prediction"]
+    target = outputs["v5_target_assignment"].detach()
+    current = outputs["v5_current_assignment"]
+    slots = outputs["v5_context_slots"]
+    transition_loss = F.mse_loss(prediction, target)
+    persistence_loss = F.mse_loss(current, target)
+    transition_nll = -(target * prediction.clamp(min=1.0e-8).log()).sum(dim=-1).mean()
+
+    current_decoded = torch.bmm(current.unsqueeze(1), slots).squeeze(1)
+    target_decoded = torch.bmm(target.unsqueeze(1), slots).squeeze(1)
+    state_reconstruction_loss = 0.5 * (
+        F.mse_loss(current_decoded, outputs["v5_current_feature"].detach())
+        + F.mse_loss(target_decoded, outputs["v5_target_feature"].detach())
+    )
+    feature_forecast_loss = F.mse_loss(
+        outputs["v5_predicted_feature"], outputs["v5_target_feature"].detach()
+    )
+    observable_target = outputs["v5_observable_target"].detach()
+    observable_loss = F.smooth_l1_loss(
+        outputs["v5_observable_prediction"], observable_target
+    )
+    observable_zero_motion = torch.zeros_like(observable_target)
+    observable_zero_motion[:, 0] = 1.0
+    observable_zero_motion_loss = F.smooth_l1_loss(
+        observable_zero_motion, observable_target
+    )
+
+    gram = torch.bmm(slots, slots.transpose(1, 2))
+    identity = torch.eye(slots.shape[1], device=slots.device, dtype=slots.dtype).unsqueeze(0)
+    slot_diversity_loss = ((gram - identity) * (1.0 - identity)).square().mean()
+    gates = outputs["v5_slot_gates"]
+    active_count = gates.sum(dim=-1)
+    gate_complexity_loss = gates.mean() + F.relu(2.0 - active_count).square().mean()
+    normalized_gates = gates / gates.sum(dim=-1, keepdim=True).clamp(min=1.0e-8)
+    effective_slots = torch.exp(
+        -(normalized_gates * normalized_gates.clamp(min=1.0e-8).log()).sum(dim=-1)
+    ).mean()
+
+    horizon_ranking_loss = prediction.new_tensor(0.0)
+    correct_vs_best_fixed_skill = prediction.new_tensor(0.0)
+    if "v5_fixed_predictions" in outputs:
+        fixed_predictions = outputs["v5_fixed_predictions"]
+        fixed_horizons = outputs["v5_fixed_horizons"]
+        fixed_errors = (fixed_predictions - target[:, None]).square().mean(dim=-1)
+        correct_error = (prediction - target).square().mean(dim=-1)
+        wrong_mask = fixed_horizons.unsqueeze(0) != outputs["horizon_frames"].unsqueeze(1)
+        ranking = F.relu(
+            correct_error.unsqueeze(1) - fixed_errors + horizon_ranking_margin
+        )[wrong_mask]
+        if ranking.numel():
+            horizon_ranking_loss = ranking.mean()
+        best_wrong = fixed_errors.masked_fill(~wrong_mask, float("inf")).min(dim=1).values
+        finite = torch.isfinite(best_wrong)
+        if finite.any():
+            correct_vs_best_fixed_skill = (
+                1.0 - correct_error[finite] / best_wrong[finite].clamp(min=1.0e-8)
+            ).mean()
+
+    horizon_difference_loss = prediction.new_tensor(0.0)
+    target_horizon_difference = prediction.new_tensor(0.0)
+    observable_horizon_difference_loss = prediction.new_tensor(0.0)
+    observable_target_horizon_difference = prediction.new_tensor(0.0)
+    group_index = outputs.get("context_group_index")
+    if group_index is not None:
+        difference_losses = []
+        target_differences = []
+        observable_difference_losses = []
+        observable_target_differences = []
+        for group in group_index.unique(sorted=True):
+            members = torch.nonzero(group_index == group, as_tuple=False).flatten()
+            for left_index in range(members.numel()):
+                for right_index in range(left_index + 1, members.numel()):
+                    left = members[left_index]
+                    right = members[right_index]
+                    predicted_difference = prediction[right] - prediction[left]
+                    target_difference = target[right] - target[left]
+                    difference_losses.append(
+                        (predicted_difference - target_difference).square().mean()
+                    )
+                    target_differences.append(target_difference.square().mean())
+                    predicted_observable_difference = (
+                        outputs["v5_observable_prediction"][right]
+                        - outputs["v5_observable_prediction"][left]
+                    )
+                    target_observable_difference = (
+                        observable_target[right] - observable_target[left]
+                    )
+                    observable_difference_losses.append(
+                        (predicted_observable_difference - target_observable_difference)
+                        .square().mean()
+                    )
+                    observable_target_differences.append(
+                        target_observable_difference.square().mean()
+                    )
+        if difference_losses:
+            horizon_difference_loss = torch.stack(difference_losses).mean()
+            target_horizon_difference = torch.stack(target_differences).mean()
+            observable_horizon_difference_loss = torch.stack(
+                observable_difference_losses
+            ).mean()
+            observable_target_horizon_difference = torch.stack(
+                observable_target_differences
+            ).mean()
+
+    return {
+        "transition_loss": transition_loss,
+        "persistence_loss": persistence_loss,
+        "transition_skill": 1.0 - transition_loss / persistence_loss.clamp(min=1.0e-8),
+        "state_reconstruction_loss": state_reconstruction_loss,
+        "feature_forecast_loss": feature_forecast_loss,
+        "observable_loss": observable_loss,
+        "observable_zero_motion_loss": observable_zero_motion_loss,
+        "observable_zero_motion_skill": 1.0
+        - observable_loss / observable_zero_motion_loss.clamp(min=1.0e-8),
+        "transition_nll": transition_nll,
+        "horizon_ranking_loss": horizon_ranking_loss,
+        "correct_vs_best_fixed_skill": correct_vs_best_fixed_skill,
+        "horizon_difference_loss": horizon_difference_loss,
+        "target_horizon_difference": target_horizon_difference,
+        "observable_horizon_difference_loss": observable_horizon_difference_loss,
+        "observable_target_horizon_difference": observable_target_horizon_difference,
+        "slot_diversity_loss": slot_diversity_loss,
+        "gate_complexity_loss": gate_complexity_loss,
+        "mean_active_slots": active_count.mean(),
+        "effective_slots": effective_slots,
+        "detailed_balance_residual": outputs["v5_detailed_balance_residual"].abs().mean(),
+    }
+
+
+def _trajectory_centered_learned_cv_terms(
+    learned_cv: torch.Tensor,
+    mask: torch.Tensor,
+    lags: tuple[int, ...],
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Regularize dynamics after removing per-trajectory identity offsets."""
+    weights = mask.to(learned_cv.dtype).unsqueeze(-1)
+    count = weights.sum(dim=1, keepdim=True).clamp(min=1.0)
+    trajectory_mean = (learned_cv * weights).sum(dim=1, keepdim=True) / count
+    centered = (learned_cv - trajectory_mean) * weights
+    values = centered[mask]
+    zero = learned_cv.new_tensor(0.0)
+    if values.shape[0] <= 1:
+        return zero, zero, zero, zero
+
+    std = torch.sqrt(values.var(dim=0, unbiased=False) + 1.0e-4)
+    variance_loss = F.relu(0.25 - std).mean()
+    normalized = values / std.detach().clamp(min=1.0e-3)
+    covariance = normalized.T @ normalized / max(1, normalized.shape[0] - 1)
+    off_diagonal = covariance - torch.diag_embed(torch.diagonal(covariance))
+    covariance_loss = off_diagonal.square().mean()
+
+    def inverse_sqrt(matrix: torch.Tensor) -> torch.Tensor:
+        eigenvalues, eigenvectors = torch.linalg.eigh(matrix)
+        return (eigenvectors * eigenvalues.clamp(min=1.0e-6).rsqrt()) @ eigenvectors.T
+
+    scores = []
+    dim = learned_cv.shape[-1]
+    for lag in sorted(set(int(value) for value in lags)):
+        if lag <= 0 or lag >= learned_cv.shape[1]:
+            continue
+        pair_mask = mask[:, lag:] & mask[:, :-lag]
+        x = centered[:, :-lag][pair_mask]
+        y = centered[:, lag:][pair_mask]
+        if x.shape[0] <= dim + 1:
+            continue
+        x = x - x.mean(dim=0, keepdim=True)
+        y = y - y.mean(dim=0, keepdim=True)
+        denom = max(1, x.shape[0] - 1)
+        identity = torch.eye(dim, device=x.device, dtype=x.dtype) * 1.0e-4
+        c00 = x.T @ x / denom + identity
+        c11 = y.T @ y / denom + identity
+        c01 = x.T @ y / denom
+        koopman = inverse_sqrt(c00) @ c01 @ inverse_sqrt(c11)
+        scores.append(koopman.square().sum())
+    vamp2_score = torch.stack(scores).mean() if scores else zero
+    vamp_loss = -vamp2_score / float(dim)
+    return variance_loss, covariance_loss, vamp_loss, vamp2_score
+
+
+def tmjepa_terms(
+    outputs: dict[str, torch.Tensor],
+    memory_intervention_margin: float = 0.0,
+    memory_relative_intervention_margin: float = 0.0,
+    memory_ratio_min: float = 0.0,
+    memory_ratio_max: float = 1.0e12,
+    memory_ratio_target: float = 0.08,
+    long_horizon_min_frames: int = 8,
+    long_horizon_power: float = 1.0,
+    vamp_lags: tuple[int, ...] = (1,),
+    innovation_lags: tuple[int, ...] = (1, 2, 4, 8),
+    diffusion_condition_target: float = 100.0,
+) -> dict[str, torch.Tensor]:
+    """Proper distributional and Markov-closure objectives for TM-JEPA."""
+    if "tmjepa_samples" not in outputs:
+        zero = outputs["delta_target"].new_tensor(0.0)
+        terms = {
+            key: zero
+            for key in (
+                "energy_score",
+                "forecast_relative_mse_loss",
+                "persistence_energy_score",
+                "energy_skill",
+                "transition_nll",
+                "path_nll",
+                "equilibrium_score_loss",
+                "equilibrium_score_baseline",
+                "equilibrium_score_skill",
+                "innovation_mean_loss",
+                "innovation_covariance_loss",
+                "innovation_autocorrelation_loss",
+                "innovation_covariance_spectral_loss",
+                "innovation_covariance_worst_loss",
+                "innovation_autocorrelation_worst_loss",
+                "memory_intervention_loss",
+                "memory_intervention_advantage",
+                "memory_intervention_mse_advantage",
+                "memory_relative_intervention_loss",
+                "memory_relative_intervention_advantage",
+                "memory_ratio_band_loss",
+                "memory_log_ratio_loss",
+                "memory_long_horizon_intervention_loss",
+                "memory_long_horizon_intervention_advantage",
+                "memory_long_horizon_relative_intervention_loss",
+                "memory_long_horizon_relative_intervention_advantage",
+                "memory_residual_loss",
+                "memory_long_horizon_residual_loss",
+                "long_horizon_energy_score",
+                "long_horizon_forecast_relative_mse_loss",
+                "long_horizon_transition_nll",
+                "long_horizon_path_nll",
+                "projected_force_regularization_loss",
+                "auxiliary_kl_loss",
+                "auxiliary_transition_kl_loss",
+                "learned_cv_variance_loss",
+                "learned_cv_covariance_loss",
+                "vamp_loss",
+                "vamp2_score",
+                "mean_coverage_90",
+                "soft_coverage_90",
+                "coverage_calibration_loss",
+                "minimum_diffusion_eigenvalue",
+                "diffusion_condition_number",
+                "diffusion_condition_loss",
+                "mean_observation_noise_variance",
+                "observation_to_diffusion_increment_variance_ratio",
+                "correlated_observation_variance_fraction",
+                "mean_endpoint_calibration_log_scale",
+                "mean_endpoint_calibration_variance_multiplier",
+                "integrated_memory_to_diffusion_ratio",
+                "bath_information_fraction",
+                "mean_relaxation_time_ps",
+            )
+        }
+        learned_cv = outputs.get("tmjepa_learned_cv")
+        if learned_cv is not None:
+            mask = outputs["tmjepa_context_mask"]
+            group_index = outputs.get("context_group_index")
+            if group_index is not None:
+                rows = torch.stack(
+                    [
+                        torch.nonzero(group_index == group, as_tuple=False).flatten()[0]
+                        for group in group_index.unique(sorted=True)
+                    ]
+                )
+                learned_cv = learned_cv[rows]
+                mask = mask[rows]
+            (
+                terms["learned_cv_variance_loss"],
+                terms["learned_cv_covariance_loss"],
+                terms["vamp_loss"],
+                terms["vamp2_score"],
+            ) = _trajectory_centered_learned_cv_terms(
+                learned_cv, mask, vamp_lags
+            )
+        return terms
+
+    samples = outputs["tmjepa_samples"]
+    target = outputs["tmjepa_target_cv"].detach()
+    current = outputs["tmjepa_current_cv"].detach()
+    observed_current = outputs.get("tmjepa_observed_current_cv", current).detach()
+    projected_force_shift = outputs.get("tmjepa_projected_force_shift")
+    projected_force_regularization_loss = (
+        projected_force_shift.square().mean()
+        if projected_force_shift is not None
+        else samples.new_tensor(0.0)
+    )
+    horizon_frames = outputs.get("horizon_frames")
+    if horizon_frames is not None:
+        horizon = horizon_frames.detach().to(device=samples.device, dtype=samples.dtype)
+        long_mask = horizon >= float(long_horizon_min_frames)
+        if long_mask.any():
+            normalized_horizon = horizon / horizon[long_mask].mean().clamp(min=1.0)
+            long_horizon_weights = torch.where(
+                long_mask,
+                normalized_horizon.clamp(min=1.0e-6).pow(float(long_horizon_power)),
+                torch.zeros_like(horizon),
+            )
+            long_horizon_weights = long_horizon_weights / long_horizon_weights[
+                long_mask
+            ].mean().clamp(min=1.0e-8)
+        else:
+            long_horizon_weights = torch.zeros(samples.shape[0], device=samples.device, dtype=samples.dtype)
+    else:
+        long_horizon_weights = torch.ones(samples.shape[0], device=samples.device, dtype=samples.dtype)
+
+    def _row_weighted_mean(values: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
+        weights = weights.to(values)
+        while weights.ndim < values.ndim:
+            weights = weights.unsqueeze(-1)
+        numerator = (values * weights).sum()
+        denominator = weights.expand_as(values).sum().clamp(min=1.0e-8)
+        return numerator / denominator
+
+    target_distance = torch.linalg.vector_norm(samples - target[:, None], dim=-1)
+    pair_distance = torch.cdist(samples, samples)
+    ensemble = samples.shape[1]
+    if ensemble > 1:
+        off_diagonal = ~torch.eye(ensemble, dtype=torch.bool, device=samples.device)
+        diversity_by_row = pair_distance[:, off_diagonal].mean(dim=-1)
+        diversity = diversity_by_row.mean()
+    else:
+        diversity_by_row = pair_distance.new_zeros(samples.shape[0])
+        diversity = pair_distance.new_tensor(0.0)
+    energy_score_by_row = target_distance.mean(dim=-1) - 0.5 * diversity_by_row
+    energy_score = energy_score_by_row.mean()
+    persistence_energy_score = torch.linalg.vector_norm(
+        observed_current - target, dim=-1
+    ).mean()
+    energy_skill = 1.0 - energy_score / persistence_energy_score.clamp(min=1.0e-8)
+    long_horizon_energy_score = _row_weighted_mean(
+        energy_score_by_row, long_horizon_weights
+    )
+
+    prediction = outputs["tmjepa_prediction"]
+    forecast_mse_by_row = (prediction - target).square().mean(dim=-1)
+    persistence_mse_by_row = (observed_current - target).square().mean(dim=-1)
+    forecast_relative_mse_by_row = forecast_mse_by_row / persistence_mse_by_row.clamp(
+        min=1.0e-8
+    )
+    forecast_relative_mse_loss = forecast_relative_mse_by_row.mean()
+    long_horizon_forecast_relative_mse_loss = _row_weighted_mean(
+        forecast_relative_mse_by_row, long_horizon_weights
+    )
+    variance = outputs["tmjepa_sample_variance"].clamp(min=1.0e-8)
+    transition_nll_by_value = 0.5 * (
+        (target - prediction).square() / variance + variance.log() + math.log(2.0 * math.pi)
+    )
+    transition_nll = transition_nll_by_value.mean()
+    long_horizon_transition_nll = _row_weighted_mean(
+        transition_nll_by_value, long_horizon_weights
+    )
+    path_mask = outputs["tmjepa_innovation_mask"]
+    path_values = outputs["tmjepa_path_nll"]
+    path_nll = path_values[path_mask].mean() if path_mask.any() else samples.new_tensor(0.0)
+    if path_mask.any():
+        path_weights = long_horizon_weights[:, None].expand_as(path_values)
+        long_horizon_path_nll = (
+            path_values[path_mask] * path_weights[path_mask]
+        ).sum() / path_weights[path_mask].sum().clamp(min=1.0e-8)
+    else:
+        long_horizon_path_nll = samples.new_tensor(0.0)
+    equilibrium_score_loss = F.mse_loss(
+        outputs["tmjepa_score_prediction"], outputs["tmjepa_score_target"].detach()
+    )
+    equilibrium_score_baseline = outputs["tmjepa_score_target"].detach().square().mean()
+    equilibrium_score_skill = 1.0 - equilibrium_score_loss / equilibrium_score_baseline.clamp(
+        min=1.0e-8
+    )
+
+    innovation = outputs["tmjepa_innovation"]
+    innovation_mask = outputs["tmjepa_innovation_mask"]
+    temperature = outputs.get("tmjepa_temperature_k")
+    closure_groups = (
+        [temperature.round().long() == value for value in temperature.round().long().unique()]
+        if temperature is not None
+        else [torch.ones(innovation.shape[0], dtype=torch.bool, device=innovation.device)]
+    )
+    mean_losses = []
+    covariance_losses = []
+    covariance_spectral_losses = []
+    autocorrelation_losses = []
+    for group in closure_groups:
+        group_innovation = innovation[group]
+        group_mask = innovation_mask[group]
+        valid_innovation = group_innovation[group_mask]
+        if valid_innovation.shape[0] > 1:
+            innovation_mean = valid_innovation.mean(dim=0)
+            mean_losses.append(innovation_mean.square().mean())
+            centered = valid_innovation - innovation_mean
+            covariance = centered.T @ centered / max(1, centered.shape[0] - 1)
+            identity = torch.eye(
+                covariance.shape[0], device=covariance.device, dtype=covariance.dtype
+            )
+            covariance_losses.append((covariance - identity).square().mean())
+            if valid_innovation.shape[0] > covariance.shape[0] + 1:
+                covariance_eigenvalues = torch.linalg.eigvalsh(
+                    0.5 * (covariance + covariance.T) + 1.0e-5 * identity
+                ).clamp(min=1.0e-5)
+                covariance_spectral_losses.append(
+                    0.5
+                    * (
+                        covariance_eigenvalues
+                        - covariance_eigenvalues.log()
+                        - 1.0
+                    ).mean()
+                )
+        for lag in innovation_lags:
+            if lag <= 0 or lag >= group_innovation.shape[1]:
+                continue
+            lag_mask = group_mask[:, lag:] & group_mask[:, :-lag]
+            if not lag_mask.any():
+                continue
+            lagged = group_innovation[:, lag:][lag_mask]
+            previous = group_innovation[:, :-lag][lag_mask]
+            lagged = lagged - lagged.mean(dim=0, keepdim=True)
+            previous = previous - previous.mean(dim=0, keepdim=True)
+            lagged_covariance = lagged.T @ previous / max(1, lagged.shape[0] - 1)
+            lagged_scale = lagged.std(dim=0, unbiased=False).clamp(min=1.0e-4)
+            previous_scale = previous.std(dim=0, unbiased=False).clamp(min=1.0e-4)
+            lagged_correlation = lagged_covariance / (
+                lagged_scale[:, None] * previous_scale[None, :]
+            )
+            diagonal_correlation = torch.diagonal(lagged_correlation)
+            off_diagonal_correlation = lagged_correlation - torch.diag_embed(
+                diagonal_correlation
+            )
+            off_diagonal_count = max(
+                lagged_correlation.shape[0]
+                * (lagged_correlation.shape[0] - 1),
+                1,
+            )
+            autocorrelation_losses.append(
+                diagonal_correlation.square().mean()
+                + off_diagonal_correlation.square().sum() / off_diagonal_count
+            )
+    innovation_mean_loss = (
+        torch.stack(mean_losses).mean() if mean_losses else samples.new_tensor(0.0)
+    )
+    innovation_covariance_loss = (
+        torch.stack(covariance_losses).mean()
+        if covariance_losses
+        else samples.new_tensor(0.0)
+    )
+    innovation_autocorrelation_loss = (
+        torch.stack(autocorrelation_losses).mean()
+        if autocorrelation_losses
+        else samples.new_tensor(0.0)
+    )
+    innovation_covariance_spectral_loss = (
+        torch.stack(covariance_spectral_losses).mean()
+        if covariance_spectral_losses
+        else samples.new_tensor(0.0)
+    )
+    innovation_covariance_worst_loss = (
+        torch.stack(covariance_losses).max()
+        if covariance_losses
+        else samples.new_tensor(0.0)
+    )
+    innovation_autocorrelation_worst_loss = (
+        torch.stack(autocorrelation_losses).max()
+        if autocorrelation_losses
+        else samples.new_tensor(0.0)
+    )
+
+    if bool(outputs.get("tmjepa_memory_enabled", samples.new_zeros(1)).any()):
+        filtered_error = (
+            outputs["tmjepa_deterministic_filtered_prediction"] - target
+        ).square().mean(dim=-1)
+        reset_error = (
+            outputs["tmjepa_deterministic_reset_prediction"] - target
+        ).square().mean(dim=-1)
+        memory_intervention_advantage = (reset_error - filtered_error).mean()
+        memory_intervention_loss = F.relu(
+            filtered_error - reset_error + memory_intervention_margin
+        ).mean()
+        memory_long_horizon_intervention_advantage = _row_weighted_mean(
+            reset_error - filtered_error, long_horizon_weights
+        )
+        memory_long_horizon_intervention_loss = _row_weighted_mean(
+            F.relu(filtered_error - reset_error + memory_intervention_margin),
+            long_horizon_weights,
+        )
+        relative_advantage = (reset_error - filtered_error) / reset_error.clamp(
+            min=1.0e-8
+        )
+        memory_relative_intervention_advantage = relative_advantage.mean()
+        memory_relative_intervention_loss = F.relu(
+            float(memory_relative_intervention_margin) - relative_advantage
+        ).mean()
+        memory_long_horizon_relative_intervention_advantage = _row_weighted_mean(
+            relative_advantage, long_horizon_weights
+        )
+        memory_long_horizon_relative_intervention_loss = _row_weighted_mean(
+            F.relu(float(memory_relative_intervention_margin) - relative_advantage),
+            long_horizon_weights,
+        )
+        # Identify the history-dependent component directly.  The reset rollout
+        # is a stop-gradient Markov baseline; only the filtered-minus-reset
+        # correction receives gradients from this target.
+        reset_detached = outputs[
+            "tmjepa_deterministic_reset_prediction"
+        ].detach()
+        target_correction = (target - reset_detached).detach()
+        correction_scale = (
+            (target - current).square().mean(dim=-1).sqrt().detach().clamp(min=0.05)
+        )
+        correction = (
+            outputs["tmjepa_deterministic_filtered_prediction"] - reset_detached
+        )
+        memory_residual_loss_by_row = F.smooth_l1_loss(
+            correction / correction_scale[:, None],
+            target_correction / correction_scale[:, None],
+            reduction="none",
+        ).mean(dim=-1)
+        memory_residual_loss = memory_residual_loss_by_row.mean()
+        memory_long_horizon_residual_loss = _row_weighted_mean(
+            memory_residual_loss_by_row, long_horizon_weights
+        )
+    else:
+        memory_intervention_advantage = samples.new_tensor(0.0)
+        memory_intervention_loss = samples.new_tensor(0.0)
+        memory_relative_intervention_advantage = samples.new_tensor(0.0)
+        memory_relative_intervention_loss = samples.new_tensor(0.0)
+        memory_long_horizon_intervention_advantage = samples.new_tensor(0.0)
+        memory_long_horizon_intervention_loss = samples.new_tensor(0.0)
+        memory_long_horizon_relative_intervention_advantage = samples.new_tensor(0.0)
+        memory_long_horizon_relative_intervention_loss = samples.new_tensor(0.0)
+        memory_residual_loss = samples.new_tensor(0.0)
+        memory_long_horizon_residual_loss = samples.new_tensor(0.0)
+
+    auxiliary_mean = outputs["tmjepa_auxiliary_mean"]
+    auxiliary_logvar = outputs["tmjepa_auxiliary_logvar"]
+    auxiliary_kl_loss = -0.5 * (
+        1.0 + auxiliary_logvar - auxiliary_mean.square() - auxiliary_logvar.exp()
+    ).mean()
+    auxiliary_transition_kl = outputs["tmjepa_auxiliary_transition_kl"]
+    auxiliary_transition_kl_loss = (
+        auxiliary_transition_kl[innovation_mask].mean()
+        if innovation_mask.any()
+        else samples.new_tensor(0.0)
+    )
+
+    learned_cv_variance_loss = samples.new_tensor(0.0)
+    learned_cv_covariance_loss = samples.new_tensor(0.0)
+    vamp_loss = samples.new_tensor(0.0)
+    vamp2_score = samples.new_tensor(0.0)
+    learned_cv = outputs.get("tmjepa_learned_cv")
+    if learned_cv is not None:
+        mask = outputs["tmjepa_context_mask"]
+        group_index = outputs.get("context_group_index")
+        if group_index is not None:
+            rows = torch.stack(
+                [
+                    torch.nonzero(group_index == group, as_tuple=False).flatten()[0]
+                    for group in group_index.unique(sorted=True)
+                ]
+            )
+            learned_cv = learned_cv[rows]
+            mask = mask[rows]
+        (
+            learned_cv_variance_loss,
+            learned_cv_covariance_loss,
+            vamp_loss,
+            vamp2_score,
+        ) = _trajectory_centered_learned_cv_terms(learned_cv, mask, vamp_lags)
+
+    std = variance.sqrt()
+    covered = (target - prediction).abs() <= 1.6448536269514722 * std
+    standardized_abs_error = (target - prediction).abs() / std.clamp(min=1.0e-6)
+    per_value_soft_coverage = torch.sigmoid(
+        (1.6448536269514722 - standardized_abs_error) / 0.1
+    )
+    soft_coverage_90 = per_value_soft_coverage.mean()
+    coverage_losses = []
+    temperature_k = outputs.get("tmjepa_temperature_k")
+    if horizon_frames is not None and temperature_k is not None:
+        rounded_temperature = temperature_k.round().long()
+        for horizon in horizon_frames.detach().unique(sorted=True):
+            horizon_mask = horizon_frames == horizon
+            for temperature in rounded_temperature.detach().unique(sorted=True):
+                group_mask = horizon_mask & (rounded_temperature == temperature)
+                if group_mask.any():
+                    group_coverage = per_value_soft_coverage[group_mask].mean()
+                    coverage_losses.append((group_coverage - 0.9).square())
+    if not coverage_losses and horizon_frames is not None:
+        for horizon in horizon_frames.detach().unique(sorted=True):
+            group_mask = horizon_frames == horizon
+            if group_mask.any():
+                group_coverage = per_value_soft_coverage[group_mask].mean()
+                coverage_losses.append((group_coverage - 0.9).square())
+    coverage_calibration_loss = (
+        torch.stack(coverage_losses).mean()
+        if coverage_losses
+        else (soft_coverage_90 - 0.9).square()
+    )
+    diffusion_eigenvalues = torch.linalg.eigvalsh(outputs["tmjepa_diffusion"])
+    minimum_diffusion_eigenvalue = diffusion_eigenvalues.min()
+    diffusion_condition_numbers = (
+        diffusion_eigenvalues[:, -1]
+        / diffusion_eigenvalues[:, 0].clamp(min=1.0e-12)
+    )
+    diffusion_condition_number = diffusion_condition_numbers.mean()
+    condition_target = max(float(diffusion_condition_target), 1.0)
+    diffusion_condition_loss = F.relu(
+        torch.log(diffusion_condition_numbers / condition_target)
+    ).square().mean()
+    observation_covariance = outputs.get("tmjepa_observation_noise_covariance")
+    observation_noise_variance = (
+        torch.diagonal(observation_covariance, dim1=-2, dim2=-1).mean()
+        if observation_covariance is not None
+        else samples.new_tensor(0.0)
+    )
+    observation_trace = (
+        torch.diagonal(observation_covariance, dim1=-2, dim2=-1).sum(dim=-1)
+        if observation_covariance is not None
+        else samples.new_zeros(samples.shape[0])
+    )
+    diffusion_trace = torch.diagonal(
+        outputs["tmjepa_diffusion"], dim1=-2, dim2=-1
+    ).sum(dim=-1)
+    base_step_ps = outputs.get(
+        "tmjepa_base_step_ps", diffusion_trace.new_ones(diffusion_trace.shape)
+    )
+    observation_to_diffusion_increment_variance_ratio = (
+        observation_trace
+        / (base_step_ps * diffusion_trace).clamp(min=1.0e-12)
+    ).mean()
+    observation_mode_variance = outputs.get(
+        "tmjepa_observation_noise_mode_variance"
+    )
+    correlated_observation_variance_fraction = (
+        observation_mode_variance.sum(dim=-1)
+        .div(observation_trace.clamp(min=1.0e-12))
+        .mean()
+        if observation_mode_variance is not None
+        else samples.new_tensor(0.0)
+    )
+    calibration_log_scale = outputs.get("tmjepa_endpoint_calibration_log_scale")
+    mean_endpoint_calibration_log_scale = (
+        calibration_log_scale.mean()
+        if calibration_log_scale is not None
+        else samples.new_tensor(0.0)
+    )
+    mean_endpoint_calibration_variance_multiplier = (
+        torch.exp(2.0 * calibration_log_scale).mean()
+        if calibration_log_scale is not None
+        else samples.new_tensor(1.0)
+    )
+    coupling = outputs["tmjepa_coupling_basis"] * outputs[
+        "tmjepa_coupling_rates"
+    ][:, None, :]
+    integrated_memory_trace = (
+        coupling.square().sum(dim=1)
+        / outputs["tmjepa_relaxation_rates"].clamp(min=1.0e-12)
+    ).sum(dim=-1)
+    diffusion_trace = torch.diagonal(
+        outputs["tmjepa_diffusion"], dim1=-2, dim2=-1
+    ).sum(dim=-1)
+    memory_ratio = integrated_memory_trace / diffusion_trace.clamp(min=1.0e-12)
+    integrated_memory_to_diffusion_ratio = memory_ratio.mean()
+    memory_ratio_lower = min(float(memory_ratio_min), float(memory_ratio_max))
+    memory_ratio_upper = max(float(memory_ratio_min), float(memory_ratio_max))
+    memory_ratio_band_loss = (
+        F.relu(memory_ratio_lower - memory_ratio).square()
+        + F.relu(memory_ratio - memory_ratio_upper).square()
+    ).mean()
+    memory_ratio_target = max(float(memory_ratio_target), 1.0e-8)
+    memory_log_ratio_loss = (
+        memory_ratio.clamp(min=1.0e-12).log()
+        - math.log(memory_ratio_target)
+    ).square().mean()
+    auxiliary_covariance = outputs.get("tmjepa_auxiliary_covariance")
+    if auxiliary_covariance is None:
+        auxiliary_covariance = torch.diag_embed(auxiliary_logvar.exp())
+    bath_information_fraction = (
+        1.0
+        - torch.diagonal(
+            auxiliary_covariance, dim1=-2, dim2=-1
+        ).mean(dim=-1)
+    ).mean()
+    mean_relaxation_time_ps = outputs["tmjepa_relaxation_rates"].clamp(min=1.0e-12).reciprocal().mean()
+    return {
+        "energy_score": energy_score,
+        "forecast_relative_mse_loss": forecast_relative_mse_loss,
+        "persistence_energy_score": persistence_energy_score,
+        "energy_skill": energy_skill,
+        "transition_nll": transition_nll,
+        "path_nll": path_nll,
+        "equilibrium_score_loss": equilibrium_score_loss,
+        "equilibrium_score_baseline": equilibrium_score_baseline,
+        "equilibrium_score_skill": equilibrium_score_skill,
+        "innovation_mean_loss": innovation_mean_loss,
+        "innovation_covariance_loss": innovation_covariance_loss,
+        "innovation_autocorrelation_loss": innovation_autocorrelation_loss,
+        "innovation_covariance_spectral_loss": (
+            innovation_covariance_spectral_loss
+        ),
+        "innovation_covariance_worst_loss": innovation_covariance_worst_loss,
+        "innovation_autocorrelation_worst_loss": (
+            innovation_autocorrelation_worst_loss
+        ),
+        "memory_intervention_loss": memory_intervention_loss,
+        "memory_intervention_advantage": memory_intervention_advantage,
+        "memory_intervention_mse_advantage": memory_intervention_advantage,
+        "memory_relative_intervention_loss": memory_relative_intervention_loss,
+        "memory_relative_intervention_advantage": (
+            memory_relative_intervention_advantage
+        ),
+        "memory_ratio_band_loss": memory_ratio_band_loss,
+        "memory_log_ratio_loss": memory_log_ratio_loss,
+        "memory_long_horizon_intervention_loss": (
+            memory_long_horizon_intervention_loss
+        ),
+        "memory_long_horizon_intervention_advantage": (
+            memory_long_horizon_intervention_advantage
+        ),
+        "memory_long_horizon_relative_intervention_loss": (
+            memory_long_horizon_relative_intervention_loss
+        ),
+        "memory_long_horizon_relative_intervention_advantage": (
+            memory_long_horizon_relative_intervention_advantage
+        ),
+        "memory_residual_loss": memory_residual_loss,
+        "memory_long_horizon_residual_loss": memory_long_horizon_residual_loss,
+        "long_horizon_energy_score": long_horizon_energy_score,
+        "long_horizon_forecast_relative_mse_loss": (
+            long_horizon_forecast_relative_mse_loss
+        ),
+        "long_horizon_transition_nll": long_horizon_transition_nll,
+        "long_horizon_path_nll": long_horizon_path_nll,
+        "projected_force_regularization_loss": projected_force_regularization_loss,
+        "auxiliary_kl_loss": auxiliary_kl_loss,
+        "auxiliary_transition_kl_loss": auxiliary_transition_kl_loss,
+        "learned_cv_variance_loss": learned_cv_variance_loss,
+        "learned_cv_covariance_loss": learned_cv_covariance_loss,
+        "vamp_loss": vamp_loss,
+        "vamp2_score": vamp2_score,
+        "mean_coverage_90": covered.to(samples.dtype).mean(),
+        "soft_coverage_90": soft_coverage_90,
+        "coverage_calibration_loss": coverage_calibration_loss,
+        "minimum_diffusion_eigenvalue": minimum_diffusion_eigenvalue,
+        "diffusion_condition_number": diffusion_condition_number,
+        "diffusion_condition_loss": diffusion_condition_loss,
+        "mean_observation_noise_variance": observation_noise_variance,
+        "observation_to_diffusion_increment_variance_ratio": (
+            observation_to_diffusion_increment_variance_ratio
+        ),
+        "correlated_observation_variance_fraction": (
+            correlated_observation_variance_fraction
+        ),
+        "mean_endpoint_calibration_log_scale": mean_endpoint_calibration_log_scale,
+        "mean_endpoint_calibration_variance_multiplier": mean_endpoint_calibration_variance_multiplier,
+        "integrated_memory_to_diffusion_ratio": integrated_memory_to_diffusion_ratio,
+        "bath_information_fraction": bath_information_fraction,
+        "mean_relaxation_time_ps": mean_relaxation_time_ps,
+    }
+
+
+def v51_sparse_motion_terms(
+    outputs: dict,
+    ranking_margin: float = 0.01,
+) -> dict[str, torch.Tensor]:
+    """Predictive, anti-collapse, and causal-control terms for V5.1."""
+    if "v51_predicted_delta" not in outputs:
+        zero = outputs["delta_target"].new_tensor(0.0)
+        return {
+            key: zero
+            for key in (
+                "delta_loss", "persistence_loss", "delta_skill", "nll_loss",
+                "normalized_delta_loss", "online_delta_loss",
+                "online_normalized_delta_loss", "displacement_magnitude_loss",
+                "current_alignment_loss", "observable_loss", "oracle_observable_loss",
+                "online_oracle_observable_loss", "observable_zero_motion_loss",
+                "observable_skill", "oracle_observable_skill",
+                "online_oracle_observable_skill", "horizon_ranking_loss",
+                "correct_vs_best_wrong_skill", "history_ranking_loss", "history_advantage",
+                "variance_loss", "covariance_loss", "load_balance_loss",
+                "active_load_balance_loss", "mean_active_modes", "target_displacement",
+                "predicted_displacement", "displacement_ratio", "causal_next_loss",
+                "causal_next_skill", "horizon_consistency_loss", "horizon_consistency_skill",
+                "history_truncation_loss", "history_truncation_advantage",
+                "physical_horizon_consistency_loss", "physical_horizon_consistency_skill",
+                "semigroup_loss", "semigroup_skill",
+                "horizon_calibration_loss", "mode_diversity_loss",
+                "mode_orthogonality_loss",
+            )
+        }
+
+    prediction = outputs["v51_predicted_delta"]
+    target = outputs["v51_target_delta"].detach()
+    squared_error = (prediction - target).square()
+    delta_loss = F.smooth_l1_loss(prediction, target)
+    prediction_mse = squared_error.mean()
+    persistence_loss = target.square().mean()
+    per_sample_target_mse = target.square().mean(dim=-1).detach().clamp(min=1.0e-6)
+    normalized_delta_loss = (
+        squared_error.mean(dim=-1) / per_sample_target_mse
+    ).mean()
+    # Grouped training repeats one context at every horizon. Normalize within
+    # each horizon before averaging so long-horizon displacement does not
+    # erase the short-horizon calibration signal.
+    horizon_calibration_terms = []
+    horizon_frames = outputs.get("horizon_frames")
+    if horizon_frames is not None:
+        for horizon in horizon_frames.unique(sorted=True):
+            mask = horizon_frames == horizon
+            if mask.any():
+                horizon_calibration_terms.append(
+                    (squared_error[mask].mean(dim=-1) / per_sample_target_mse[mask]).mean()
+                )
+    horizon_calibration_loss = (
+        torch.stack(horizon_calibration_terms).mean()
+        if horizon_calibration_terms else prediction.new_tensor(0.0)
+    )
+    online_target = outputs["v51_online_target_delta"].detach()
+    online_squared_error = (prediction - online_target).square()
+    online_delta_loss = F.smooth_l1_loss(prediction, online_target)
+    online_target_mse = online_target.square().mean(dim=-1).detach().clamp(min=1.0e-6)
+    online_normalized_delta_loss = (
+        online_squared_error.mean(dim=-1) / online_target_mse
+    ).mean()
+    target_norm = target.square().mean(dim=-1).sqrt().detach().clamp(min=1.0e-6)
+    predicted_norm = prediction.square().mean(dim=-1).sqrt().clamp(min=1.0e-6)
+    displacement_magnitude_loss = (
+        predicted_norm.log() - target_norm.log()
+    ).square().mean()
+    log_sigma = outputs["v51_prediction_log_sigma"]
+    nll_loss = 0.5 * (
+        squared_error * torch.exp(-2.0 * log_sigma) + 2.0 * log_sigma
+    ).mean()
+    current_alignment_loss = F.mse_loss(
+        outputs["v51_online_current_feature"],
+        outputs["v51_teacher_current_feature"].detach(),
+    )
+
+    observable_target = outputs["v51_observable_target"].detach()
+    observable_prediction = outputs["v51_observable_prediction"]
+    observable_loss = F.smooth_l1_loss(observable_prediction, observable_target)
+    oracle_observable_loss = F.smooth_l1_loss(
+        outputs["v51_oracle_observable"], observable_target
+    )
+    online_oracle_observable_loss = F.smooth_l1_loss(
+        outputs["v51_online_oracle_observable"], observable_target
+    )
+    observable_zero_motion_loss = F.smooth_l1_loss(
+        outputs["v51_no_rollout_observable"], observable_target
+    )
+
+    horizon_ranking_loss = prediction.new_tensor(0.0)
+    correct_vs_best_wrong_skill = prediction.new_tensor(0.0)
+    if "v51_fixed_predictions" in outputs:
+        fixed = outputs["v51_fixed_predictions"]
+        fixed_observable = outputs["v51_fixed_observable_predictions"]
+        fixed_horizons = outputs["v51_fixed_horizons"]
+        feature_errors = (
+            fixed - outputs["v51_target_feature"].detach().unsqueeze(1)
+        ).square().mean(dim=-1)
+        correct_feature_error = (
+            outputs["v51_predicted_feature"] - outputs["v51_target_feature"].detach()
+        ).square().mean(dim=-1)
+        observable_errors = (
+            fixed_observable - observable_target.unsqueeze(1)
+        ).square().mean(dim=-1)
+        correct_observable_error = (
+            observable_prediction - observable_target
+        ).square().mean(dim=-1)
+        wrong = fixed_horizons.unsqueeze(0) != outputs["horizon_frames"].unsqueeze(1)
+        scale = target.square().mean(dim=-1).detach().clamp(min=1.0e-5)
+        observable_scale = (
+            outputs["v51_no_rollout_observable"] - observable_target
+        ).square().mean(dim=-1).detach().clamp(min=1.0e-5)
+        ranking = F.relu(
+            correct_feature_error.unsqueeze(1) - feature_errors
+            + ranking_margin * scale.unsqueeze(1)
+        )
+        observable_ranking = F.relu(
+            correct_observable_error.unsqueeze(1) - observable_errors
+            + ranking_margin * observable_scale.unsqueeze(1)
+        )
+        if wrong.any():
+            horizon_ranking_loss = ranking[wrong].mean() + observable_ranking[wrong].mean()
+            best_wrong = feature_errors.masked_fill(~wrong, float("inf")).min(dim=1).values
+            finite = torch.isfinite(best_wrong)
+            if finite.any():
+                correct_vs_best_wrong_skill = (
+                    1.0
+                    - correct_feature_error[finite]
+                    / best_wrong[finite].clamp(min=1.0e-8)
+                ).mean()
+
+    history_ranking_loss = prediction.new_tensor(0.0)
+    history_advantage = prediction.new_tensor(0.0)
+    if "v51_wrong_history_prediction" in outputs:
+        wrong_feature_error = (
+            outputs["v51_wrong_history_prediction"]
+            - outputs["v51_target_feature"].detach()
+        ).square().mean(dim=-1)
+        correct_feature_error = (
+            outputs["v51_predicted_feature"] - outputs["v51_target_feature"].detach()
+        ).square().mean(dim=-1)
+        wrong_observable_error = (
+            outputs["v51_wrong_history_observable_prediction"] - observable_target
+        ).square().mean(dim=-1)
+        correct_observable_error = (
+            observable_prediction - observable_target
+        ).square().mean(dim=-1)
+        feature_scale = target.square().mean(dim=-1).detach().clamp(min=1.0e-5)
+        observable_scale = (
+            outputs["v51_no_rollout_observable"] - observable_target
+        ).square().mean(dim=-1).detach().clamp(min=1.0e-5)
+        history_ranking_loss = (
+            F.relu(
+                correct_feature_error - wrong_feature_error
+                + ranking_margin * feature_scale
+            ).mean()
+            + F.relu(
+                correct_observable_error - wrong_observable_error
+                + ranking_margin * observable_scale
+            ).mean()
+        )
+        history_advantage = (
+            1.0
+            - correct_feature_error
+            / wrong_feature_error.clamp(min=1.0e-8)
+        ).mean()
+
+    history_truncation_loss = prediction.new_tensor(0.0)
+    history_truncation_advantage = prediction.new_tensor(0.0)
+    if "v51_short_history_prediction" in outputs:
+        short_feature_error = (
+            outputs["v51_short_history_prediction"]
+            - outputs["v51_target_feature"].detach()
+        ).square().mean(dim=-1)
+        correct_feature_error = (
+            outputs["v51_predicted_feature"] - outputs["v51_target_feature"].detach()
+        ).square().mean(dim=-1)
+        short_observable_error = (
+            outputs["v51_short_history_observable_prediction"] - observable_target
+        ).square().mean(dim=-1)
+        correct_observable_error = (
+            observable_prediction - observable_target
+        ).square().mean(dim=-1)
+        feature_scale = target.square().mean(dim=-1).detach().clamp(min=1.0e-5)
+        observable_scale = (
+            outputs["v51_no_rollout_observable"] - observable_target
+        ).square().mean(dim=-1).detach().clamp(min=1.0e-5)
+        history_truncation_loss = (
+            F.relu(
+                correct_feature_error - short_feature_error
+                + ranking_margin * feature_scale
+            ).mean()
+            + F.relu(
+                correct_observable_error - short_observable_error
+                + ranking_margin * observable_scale
+            ).mean()
+        )
+        history_truncation_advantage = (
+            1.0
+            - correct_feature_error / short_feature_error.clamp(min=1.0e-8)
+        ).mean()
+
+    causal_next_loss = prediction.new_tensor(0.0)
+    causal_next_skill = prediction.new_tensor(0.0)
+    if "v51_causal_next_prediction" in outputs:
+        causal_prediction = outputs["v51_causal_next_prediction"]
+        causal_target = outputs["v51_causal_next_target"]
+        if causal_prediction.numel():
+            causal_error = (causal_prediction - causal_target).square().mean()
+            causal_persistence = causal_target.square().mean().clamp(min=1.0e-8)
+            causal_next_loss = F.smooth_l1_loss(causal_prediction, causal_target)
+            causal_next_skill = 1.0 - causal_error / causal_persistence
+
+    # Grouped paired samples contain the same observed context at several
+    # horizons. Match differences between horizons so the rollout represents a
+    # trajectory, rather than independently fitting an average endpoint.
+    horizon_consistency_loss = prediction.new_tensor(0.0)
+    horizon_consistency_skill = prediction.new_tensor(0.0)
+    physical_horizon_consistency_loss = prediction.new_tensor(0.0)
+    physical_horizon_consistency_skill = prediction.new_tensor(0.0)
+    group_index = outputs.get("context_group_index")
+    if group_index is not None:
+        pair_predictions = []
+        pair_targets = []
+        physical_pair_predictions = []
+        physical_pair_targets = []
+        for group in group_index.unique(sorted=True):
+            members = torch.nonzero(group_index == group, as_tuple=False).flatten()
+            if members.numel() < 2:
+                continue
+            pair_mask = torch.triu(
+                torch.ones((members.numel(), members.numel()), dtype=torch.bool, device=prediction.device),
+                diagonal=1,
+            )
+            pred_diff = prediction[members][:, None, :] - prediction[members][None, :, :]
+            target_diff = target[members][:, None, :] - target[members][None, :, :]
+            pair_predictions.append(pred_diff[pair_mask])
+            pair_targets.append(target_diff[pair_mask])
+            physical_prediction = outputs["v51_observable_prediction"][members]
+            physical_target = observable_target[members]
+            physical_diff = physical_prediction[:, None, :] - physical_prediction[None, :, :]
+            physical_target_diff = physical_target[:, None, :] - physical_target[None, :, :]
+            physical_pair_predictions.append(physical_diff[pair_mask])
+            physical_pair_targets.append(physical_target_diff[pair_mask])
+        if pair_predictions:
+            pair_prediction = torch.cat(pair_predictions, dim=0)
+            pair_target = torch.cat(pair_targets, dim=0)
+            horizon_consistency_loss = F.smooth_l1_loss(pair_prediction, pair_target)
+            horizon_consistency_skill = 1.0 - (
+                (pair_prediction - pair_target).square().mean()
+                / pair_target.square().mean().clamp(min=1.0e-8)
+            )
+            physical_pair_prediction = torch.cat(physical_pair_predictions, dim=0)
+            physical_pair_target = torch.cat(physical_pair_targets, dim=0)
+            # Physical channels have very different units and some horizon
+            # pairs are nearly stationary. Robust channel normalization keeps
+            # the observable constraint informative without overpowering the
+            # latent trajectory loss.
+            physical_scale = physical_pair_target.detach().abs().median(dim=0).values
+            # Observable differences can be close to zero for stationary
+            # channels. A physical floor prevents those channels from
+            # dominating the shared latent trajectory objective.
+            physical_scale = physical_scale.clamp(min=5.0e-2)
+            normalized_physical_prediction = physical_pair_prediction / physical_scale
+            normalized_physical_target = physical_pair_target / physical_scale
+            pair_weight = physical_pair_target.detach().square().mean(dim=-1).sqrt()
+            pair_weight = pair_weight / pair_weight.detach().median().clamp(min=1.0e-3)
+            pair_weight = pair_weight.clamp(min=0.25, max=4.0)
+            physical_pair_loss = F.smooth_l1_loss(
+                normalized_physical_prediction,
+                normalized_physical_target,
+                reduction="none",
+            ).mean(dim=-1)
+            physical_horizon_consistency_loss = (
+                physical_pair_loss * pair_weight
+            ).mean()
+            physical_horizon_consistency_skill = 1.0 - (
+                (physical_pair_prediction - physical_pair_target).square().mean()
+                / physical_pair_target.square().mean().clamp(min=1.0e-8)
+            )
+
+    semigroup_loss = prediction.new_tensor(0.0)
+    semigroup_skill = prediction.new_tensor(0.0)
+    if "v51_semigroup_prediction" in outputs:
+        semigroup_prediction = outputs["v51_semigroup_prediction"]
+        semigroup_target = outputs["v51_semigroup_target"]
+        semigroup_loss = F.smooth_l1_loss(semigroup_prediction, semigroup_target)
+        semigroup_skill = 1.0 - (
+            (semigroup_prediction - semigroup_target).square().mean()
+            / semigroup_target.square().mean().clamp(min=1.0e-8)
+        )
+
+    tokens = outputs["v51_dynamic_tokens"][outputs["v51_dynamic_token_mask"]]
+    if tokens.shape[0] > 1:
+        std = torch.sqrt(tokens.var(dim=0, unbiased=False) + 1.0e-4)
+        variance_loss = F.relu(1.0 - std).mean()
+        normalized = (tokens - tokens.mean(dim=0)) / std.clamp(min=1.0e-4)
+        covariance = normalized.T @ normalized / max(1, normalized.shape[0] - 1)
+        covariance = covariance - torch.diag_embed(torch.diagonal(covariance))
+        covariance_loss = covariance.square().sum() / tokens.shape[1]
+    else:
+        variance_loss = prediction.new_tensor(0.0)
+        covariance_loss = prediction.new_tensor(0.0)
+
+    routing = outputs["v51_router_probabilities"]
+    group_index = outputs.get("context_group_index")
+    if group_index is not None:
+        representatives = []
+        for group in group_index.unique(sorted=True):
+            members = torch.nonzero(group_index == group, as_tuple=False).flatten()
+            if members.numel():
+                representatives.append(members[0])
+        representative_index = torch.stack(representatives) if representatives else None
+    else:
+        representative_index = None
+    context_routing = (
+        routing.index_select(0, representative_index)
+        if representative_index is not None else routing
+    )
+    mean_routing = context_routing.mean(dim=0)
+    load_balance_loss = (
+        mean_routing - 1.0 / routing.shape[-1]
+    ).square().mean() * routing.shape[-1]
+    active_mask = outputs["v51_active_mode_mask"].to(routing.dtype)
+    soft_active_mask = outputs.get("v51_soft_active_mode_mask", active_mask)
+    active_modes = active_mask.index_select(0, representative_index).sum(dim=-1).float().mean() if representative_index is not None else active_mask.sum(dim=-1).float().mean()
+    target_active_frequency = active_modes.detach() / float(routing.shape[-1])
+    context_entropy = -(context_routing.clamp(min=1.0e-8) * context_routing.clamp(min=1.0e-8).log()).sum(dim=-1)
+    target_entropy = math.log(max(float(active_modes.detach()), 1.0))
+    mode_diversity_loss = (
+        (mean_routing - 1.0 / routing.shape[-1]).square().mean() * routing.shape[-1]
+        + F.relu(context_entropy - target_entropy).mean() / math.log(float(routing.shape[-1]))
+    )
+    router_logits = outputs.get("v51_router_logits")
+    if router_logits is not None:
+        if representative_index is not None:
+            router_logits = router_logits.index_select(0, representative_index)
+        top = router_logits.topk(int(active_modes.detach()), dim=-1).values.mean(dim=-1)
+        rest = router_logits.topk(
+            router_logits.shape[-1] - int(active_modes.detach()), dim=-1
+        ).values.mean(dim=-1)
+        # Entropy minimization is flat at a uniform router. A top-vs-rest
+        # margin supplies a non-zero gradient there while global balance keeps
+        # different contexts from selecting one mode forever.
+        mode_diversity_loss = mode_diversity_loss + F.relu(0.05 - (top - rest)).mean()
+    active_load_balance_loss = (
+        soft_active_mask.mean(dim=0) - target_active_frequency
+    ).square().mean() * routing.shape[-1]
+    mode_seed = outputs.get("v51_mode_seed")
+    if mode_seed is not None and mode_seed.shape[0] > 1:
+        normalized_seed = F.normalize(mode_seed, dim=-1)
+        gram = normalized_seed @ normalized_seed.T
+        gram = gram - torch.diag_embed(torch.diagonal(gram))
+        mode_orthogonality_loss = gram.square().mean()
+    else:
+        mode_orthogonality_loss = prediction.new_tensor(0.0)
+
+    return {
+        "delta_loss": delta_loss,
+        "persistence_loss": persistence_loss,
+        "delta_skill": 1.0 - prediction_mse / persistence_loss.clamp(min=1.0e-8),
+        "normalized_delta_loss": normalized_delta_loss,
+        "horizon_calibration_loss": horizon_calibration_loss,
+        "online_delta_loss": online_delta_loss,
+        "online_normalized_delta_loss": online_normalized_delta_loss,
+        "displacement_magnitude_loss": displacement_magnitude_loss,
+        "nll_loss": nll_loss,
+        "current_alignment_loss": current_alignment_loss,
+        "observable_loss": observable_loss,
+        "oracle_observable_loss": oracle_observable_loss,
+        "online_oracle_observable_loss": online_oracle_observable_loss,
+        "observable_zero_motion_loss": observable_zero_motion_loss,
+        "observable_skill": 1.0
+        - observable_loss / observable_zero_motion_loss.clamp(min=1.0e-8),
+        "oracle_observable_skill": 1.0
+        - oracle_observable_loss / observable_zero_motion_loss.clamp(min=1.0e-8),
+        "online_oracle_observable_skill": 1.0
+        - online_oracle_observable_loss
+        / observable_zero_motion_loss.clamp(min=1.0e-8),
+        "horizon_ranking_loss": horizon_ranking_loss,
+        "correct_vs_best_wrong_skill": correct_vs_best_wrong_skill,
+        "history_ranking_loss": history_ranking_loss,
+        "history_advantage": history_advantage,
+        "history_truncation_loss": history_truncation_loss,
+        "history_truncation_advantage": history_truncation_advantage,
+        "causal_next_loss": causal_next_loss,
+        "causal_next_skill": causal_next_skill,
+        "horizon_consistency_loss": horizon_consistency_loss,
+        "horizon_consistency_skill": horizon_consistency_skill,
+        "physical_horizon_consistency_loss": physical_horizon_consistency_loss,
+        "physical_horizon_consistency_skill": physical_horizon_consistency_skill,
+        "semigroup_loss": semigroup_loss,
+        "semigroup_skill": semigroup_skill,
+        "variance_loss": variance_loss,
+        "covariance_loss": covariance_loss,
+        "load_balance_loss": load_balance_loss,
+        "active_load_balance_loss": active_load_balance_loss,
+        "mode_diversity_loss": mode_diversity_loss,
+        "mode_orthogonality_loss": mode_orthogonality_loss,
+        "mean_active_modes": active_modes,
+        "target_displacement": target.square().mean().sqrt(),
+        "predicted_displacement": prediction.square().mean().sqrt(),
+        "displacement_ratio": predicted_norm.mean() / target_norm.mean().clamp(min=1.0e-8),
     }
 
 
