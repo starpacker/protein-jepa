@@ -1,0 +1,147 @@
+# LSP-WM v4.4 Stage B DetSkill Fix: Targeted improvement for Deterministic Skill.
+#
+# Theory: DetSkill measures the JEPA paired_delta_predictor. In v3:
+#   - time_conditioning: none → temporal encoder has NO temporal awareness
+#   - paired_delta_weight: 0.0  → PairedDeltaPredictor is NOT trained
+#   - predictor_depth: 1       → SpatiotemporalPredictor is shallow (affects Stage A)
+#
+# Changes from v3:
+#   - time_conditioning: none → physical  (LogTimeEmbedding for temporal encoder)
+#   - predictor_depth: 1 → 3  (deeper JEPA predictor, as per README §11.5 Rev-5)
+#   - paired_predictor_depth: 2 → 3  (more capacity for PairedDeltaPredictor)
+#   - paired_delta_weight: 0.0 → 0.005  (ENABLE PairedDeltaPredictor training)
+#
+# Kept frozen (no latent collapse risk):
+#   - freeze_context_encoder: true
+#   - freeze_temporal_encoder: true
+#   - freeze_target_encoders: true
+#   - encoder_lr_scale: 0.0
+seed: 6444
+device: cuda:0
+output_dir: /liuyutian/protein_jepa_frame/artifacts/lspwm_v44_stage_b_detskill_fix
+init_checkpoint: /liuyutian/protein_jepa_frame/artifacts/lspwm_v44_stage_a_representation/checkpoint_latest.pt
+init_exclude_prefixes:
+  - "lspwm.world_model.diffusion."
+strict_init: false
+sync_target_after_init: false
+log_every: 10
+save_every: 1
+checkpoint_every_steps: 100
+
+data:
+  manifest_path: /liuyutian/protein_jepa_frame/manifests/tmjepa_v3.train.jsonl
+  batch_size: 8
+  num_workers: 0
+  num_frames: 24
+  frame_stride: 1
+  window_stride: 8
+  max_residues: 384
+  sampling_mode: hierarchical
+  training_mode: paired_window
+  paired_horizons_frames: [24, 48, 96]
+  paired_nonoverlap_only: true
+  paired_all_horizons: true
+
+model:
+  latent_dim: 256
+  encoder_depth: 2
+  temporal_depth: 2
+  predictor_depth: 3             # Increased from 1 → deeper JEPA predictor (Rev-5)
+  state_predictor_depth: 2
+  frame_pooling: kinetic_query
+  frame_pool_queries: 4
+  lag_predictor_depth: 2
+  time_conditioning: physical    # Was "none" → LogTimeEmbedding for temporal encoder
+  thermodynamic_conditioning: false
+  orientation_features: true
+  temporal_causal: true
+  temporal_causal_window: 4
+  temporal_position_encoding: none
+  temporal_delta_features: false
+  motion_depth: 0
+  transition_source: state
+  num_heads: 8
+  num_rbf: 16
+  dropout: 0.0
+  max_frames: 256
+  max_residues: 4096
+  feature_norm: true
+  paired_forecast: true
+  paired_predictor_depth: 3      # Increased from 2 → more PairedDeltaPredictor capacity
+  freeze_context_encoder: true   # Kept frozen — no latent collapse risk
+  freeze_temporal_encoder: true  # Kept frozen
+  freeze_target_encoders: true   # Kept frozen
+  tmjepa_enabled: false
+
+  # LSP-WM core
+  lspwm_enabled: true
+  lspwm_num_segments: 3
+  lspwm_learned_cv_dim: 256
+  lspwm_condition_dim: 64
+  lspwm_auxiliary_dim: 4
+  lspwm_koopman_role_dim: 64
+  lspwm_msm_role_dim: 32
+  lspwm_geometric_role_dim: 96
+  lspwm_auxiliary_role_dim: 64
+  lspwm_role_hidden_dim: 256
+  lspwm_reference_temperature_k: 348.0
+  lspwm_diffusion_scale: 5.0e-5
+  lspwm_coupling_scale: 1.0e-4
+  lspwm_memory_times_ps: [4000.0, 16000.0, 64000.0, 128000.0]
+  lspwm_mean_force_bandwidth: 0.1
+  lspwm_observation_model: false
+  lspwm_history_closure_enabled: false
+  lspwm_rollout_enabled: false
+  lspwm_dynamic_nll_enabled: true
+  lspwm_force_loss_enabled: true
+  lspwm_state_dependent_diffusion: true
+  lspwm_freeze_learned_projection: true
+
+  # Potential architecture
+  lspwm_potential_hidden_dim: 128
+  lspwm_potential_hidden_depth: 2
+
+  # Curriculum
+  lspwm_curriculum_steps: [500, 1500, 3000, 10000, 10000]
+
+  # CV normalization
+  lspwm_cv_mean: [0.5808744431, 1.0378025770, -3.5378422730, -1.6780833006, 0.3800410033, -2.7798459530, 0.3983616233, -2.7939324379, 0.3888407946, -2.7732858658, 0.4555905461, 0.3484444022, 1.0433561802, -0.0431454852, -0.0774244592, -0.2054995447]
+  lspwm_cv_scale: [0.0796646103, 0.5420896411, 0.1517379731, 0.3564364311, 0.1541653872, 0.2375139445, 0.1466855109, 0.2658485472, 0.1382870525, 0.2666960061, 0.3291336298, 0.4681170881, 0.1254781187, 0.0886877403, 0.1492052078, 0.2059004903]
+
+optimization:
+  epochs: 3
+  steps_per_epoch: 1000
+  lr: 1.0e-5
+  encoder_lr_scale: 0.0          # Kept at 0 — no encoder fine-tuning
+  weight_decay: 1.0e-4
+  warmup_steps: 100
+  ema_start: 0.996
+  ema_end: 0.999
+  grad_clip: 1.0
+  precision: float32
+
+  # Paired prediction weights ← NOW ENABLED for PairedDeltaPredictor training
+  paired_delta_weight: 0.005     # Was 0.0 → enables PairedDeltaPredictor training
+  paired_state_weight: 0.0
+  paired_relative_delta_weight: 0.0
+  paired_endpoint_variance_weight: 0.0
+
+  # LSP-WM loss weights
+  lspwm_dynamic_weight: 0.01
+  lspwm_force_weight: 0.05
+  lspwm_koopman_weight: 0.1
+  lspwm_msm_weight: 0.0
+  lspwm_sequence_vamp_weight: 0.0
+  lspwm_sequence_vamp_lag: 1
+  lspwm_geometric_weight: 0.0
+  lspwm_auxiliary_weight: 0.0
+  lspwm_observation_weight: 0.0
+
+  # Rollout weights (disabled)
+  lspwm_rollout_energy_weight: 0.0
+  lspwm_rollout_endpoint_weight: 0.0
+  lspwm_rollout_gaussian_nll_weight: 0.0
+  lspwm_rollout_distribution_weight: 0.0
+  lspwm_rollout_koopman_weight: 0.0
+  lspwm_rollout_force_weight: 0.0
+  lspwm_rollout_trajectory_nll_weight: 0.0
