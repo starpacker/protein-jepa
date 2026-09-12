@@ -264,6 +264,12 @@ class ModelConfig:
     lspwm_coupling_scale: float = 1.0e-3
     lspwm_memory_times_ps: tuple[float, ...] = (1000.0, 2000.0, 4000.0, 8000.0)
     lspwm_mean_force_bandwidth: float = 1.5
+    # Runtime KDE-buffer settings used by the DetSkill v3 experiment.  The
+    # canonical world-model module does not consume these fields, but keeping
+    # them in the config schema preserves checkpoint/config reproducibility.
+    lspwm_kde_buffer_enabled: bool = False
+    lspwm_kde_buffer_size: int = 0
+    lspwm_kde_buffer_warmup: int = 0
     lspwm_freeze_learned_projection: bool = False
     lspwm_cv_mean: tuple[float, ...] = ()
     lspwm_cv_scale: tuple[float, ...] = ()
@@ -288,6 +294,20 @@ class ModelConfig:
     lspwm_state_dependent_diffusion: bool = False  # heteroscedastic diffusion head
     lspwm_potential_hidden_dim: int = 128      # PMF potential hidden dimension
     lspwm_potential_hidden_depth: int = 4      # PMF potential number of hidden layers
+    # Frozen-latent physical transition calibration.  The calibration module
+    # changes only the overdamped transition law; it never changes z.
+    lspwm_physical_calibration_enabled: bool = False
+    lspwm_physical_mobility_init: float = 1.0
+    lspwm_physical_free_energy_init: float = 1.0
+    lspwm_physical_log_scale_min: float = -12.0
+    lspwm_physical_log_scale_max: float = 12.0
+    lspwm_conservative_correction_enabled: bool = False
+    lspwm_conservative_correction_rank: int = 16
+    lspwm_conservative_correction_scale: float = 1.0
+    lspwm_conservative_correction_rescale_with_free_energy: bool = False
+    lspwm_reset_conservative_correction_on_init: bool = False
+    lspwm_freeze_base_dynamics: bool = False
+    lspwm_freeze_calibration_scales: bool = False
 
     # LSP-WM v4.1 curriculum phase switch steps (representation, thermodynamic_identification, dynamics, rollout, observation)
 
@@ -340,6 +360,10 @@ class OptimizationConfig:
     paired_relative_delta_weight: float = 0.0
     paired_endpoint_variance_weight: float = 0.02
     lspwm_dynamic_weight: float = 0.0
+    lspwm_calibrated_dynamic_weight: float = 0.0
+    lspwm_calibrated_endpoint_weight: float = 0.0
+    lspwm_calibrated_force_weight: float = 0.0
+    lspwm_calibration_regularization_weight: float = 0.0
     lspwm_force_weight: float = 0.0
     lspwm_koopman_weight: float = 0.0
     lspwm_msm_weight: float = 0.0

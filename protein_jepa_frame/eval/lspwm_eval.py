@@ -242,12 +242,17 @@ def eval_force_matching(
     mse = (f_pred - f_target).square().mean().item()
     norm_pred = f_pred.norm(dim=-1).mean().item()
     norm_target = f_target.norm(dim=-1).mean().item()
+    target_std = f_target.std(dim=0, unbiased=False).mean().item()
+    target_degenerate = norm_target < 1.0e-6
 
     return {
         "force_mse": mse,
         "force_cosine": cosine_mean,
         "force_pred_norm": norm_pred,
         "force_target_norm": norm_target,
+        "force_target_component_std": target_std,
+        "force_target_degenerate": target_degenerate,
+        "force_cosine_valid": not target_degenerate,
         "n_force_samples": force_pred.shape[0],
     }
 

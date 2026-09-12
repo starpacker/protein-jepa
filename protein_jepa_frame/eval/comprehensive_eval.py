@@ -12,13 +12,15 @@ import os
 import subprocess
 import sys
 import time
+from dataclasses import replace
 from pathlib import Path
 
 import torch
 
 
 def run_lspwm_eval(checkpoint: Path, config: Path, output_dir: Path,
-                    max_batches: int, bandwidth: float, device: str) -> dict:
+                    max_batches: int, bandwidth: float, device: str,
+                    manifest: Path | None, batch_size: int, seed: int) -> dict:
     """Run the 5-module LSP-WM internal evaluation."""
     print("\n" + "=" * 60)
     print("LSP-WM INTERNAL EVALUATION")
@@ -28,6 +30,7 @@ def run_lspwm_eval(checkpoint: Path, config: Path, output_dir: Path,
     from protein_jepa_frame.config import load_config
     from protein_jepa_frame.data.dataset import build_dataset
     from protein_jepa_frame.data.collate import collate_paired_windows
+    from protein_jepa_frame.data.sampler import HierarchicalClipSampler
     from torch.utils.data import DataLoader
     from protein_jepa_frame.models.jepa import ProteinJEPA, upgrade_lspwm_state_dict
     from protein_jepa_frame.eval.lspwm_eval import (
@@ -35,7 +38,17 @@ def run_lspwm_eval(checkpoint: Path, config: Path, output_dir: Path,
         eval_energy_conservation, eval_koopman, eval_lspwm_components,
     )
 
+    torch.manual_seed(seed)
     cfg = load_config(config)
+    data_config = replace(
+        cfg.data,
+        manifest_path=str(manifest) if manifest is not None else cfg.data.manifest_path,
+        batch_size=batch_size,
+        num_workers=0,
+        paired_all_horizons=True,
+        sampling_mode="hierarchical",
+        training_mode="paired_window",
+    )
     model = ProteinJEPA(cfg.model).to(device)
     ckpt = torch.load(checkpoint, map_location=device, weights_only=True)
     state = upgrade_lspwm_state_dict(model, ckpt.get("model", ckpt))
@@ -44,11 +57,20 @@ def run_lspwm_eval(checkpoint: Path, config: Path, output_dir: Path,
         print(f"  Missing keys: {incompatible.missing_keys}")
     model.eval()
 
-    dataset = build_dataset(cfg.data)
+    dataset = build_dataset(data_config)
+    sampler = HierarchicalClipSampler(
+        dataset,
+        num_samples=max_batches * batch_size,
+        seed=seed,
+        dataset_weights=data_config.dataset_weights,
+    )
     loader = DataLoader(
-        dataset, batch_size=min(4, cfg.data.batch_size),
-        shuffle=True, num_workers=0,
-        collate_fn=collate_paired_windows, drop_last=False,
+        dataset,
+        batch_size=batch_size,
+        sampler=sampler,
+        num_workers=0,
+        collate_fn=collate_paired_windows,
+        drop_last=True,
     )
 
     results = {}
@@ -197,7 +219,15 @@ def main():
     parser.add_argument("--checkpoint", type=str, required=True)
     parser.add_argument("--config", type=str, required=True)
     parser.add_argument("--output-dir", type=str, required=True)
+    parser.add_argument(
+        "--manifest",
+        type=str,
+        default=None,
+        help="Explicit evaluation manifest. Required for held-out protocol runs.",
+    )
     parser.add_argument("--max-batches", type=int, default=20)
+    parser.add_argument("--batch-size", type=int, default=4)
+    parser.add_argument("--seed", type=int, default=6303)
     parser.add_argument("--bandwidth", type=float, default=0.1)
     parser.add_argument("--device", type=str, default="cuda:0")
     parser.add_argument("--fastfolding-labels", type=str,
@@ -219,6 +249,9 @@ def main():
         max_batches=args.max_batches,
         bandwidth=args.bandwidth,
         device=device,
+        manifest=Path(args.manifest) if args.manifest else None,
+        batch_size=args.batch_size,
+        seed=args.seed,
     )
 
     # Run FastFolding benchmark
@@ -238,6 +271,15 @@ def main():
 
     combined = {
         "checkpoint": str(checkpoint),
+        "protocol": {
+            "manifest": str(Path(args.manifest).resolve()) if args.manifest else None,
+            "config": str(config.resolve()),
+            "seed": args.seed,
+            "batch_size": args.batch_size,
+            "max_batches": args.max_batches,
+            "bandwidth": args.bandwidth,
+            "heldout_manifest_explicit": args.manifest is not None,
+        },
         "lspwm_eval": lspwm_results,
         "fastfolding": ff_results,
     }

@@ -64,6 +64,9 @@ def _set_reproducibility(seed: int, deterministic: bool) -> None:
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
     os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+    torch.backends.cudnn.benchmark = not deterministic
+    torch.backends.cudnn.deterministic = deterministic
+    torch.use_deterministic_algorithms(deterministic)
 
 
 def _lspwm_sequence_vamp_loss(
@@ -85,9 +88,25 @@ def _lspwm_sequence_vamp_loss(
     source = sequence[:, :-lag][pair_mask]
     target = sequence[:, lag:][pair_mask]
     return vamp2_loss(source, target, ridge=1.0e-3)
-    torch.backends.cudnn.benchmark = not deterministic
-    torch.backends.cudnn.deterministic = deterministic
-    torch.use_deterministic_algorithms(deterministic)
+
+
+def _balanced_calibrated_endpoint_mse(outputs: dict) -> torch.Tensor:
+    """Match the endpoint evaluator's deterministic mean, equally by horizon."""
+    prediction = outputs.get("lspwm_calibrated_transition_mean")
+    if prediction is None:
+        reference = outputs["lspwm_target_state"]
+        return reference.new_zeros(())
+    target = outputs["lspwm_target_state"].detach()
+    per_row = (prediction - target).square().mean(dim=-1)
+    horizons = outputs["horizon_frames"]
+    horizon_losses = []
+    for horizon in torch.unique(horizons, sorted=True):
+        mask = horizons == horizon
+        if mask.any():
+            horizon_losses.append(per_row[mask].mean())
+    if not horizon_losses:
+        return per_row.new_zeros(())
+    return torch.stack(horizon_losses).mean()
 
 
 def _move_batch(batch: dict, device: torch.device) -> dict:
@@ -247,6 +266,61 @@ def _validate_init_freeze_contract(config: TrainConfig) -> None:
         raise ValueError(
             "lspwm_dynamic_weight requires lspwm_dynamic_nll_enabled=true"
         )
+    if (
+        config.optimization.lspwm_calibrated_dynamic_weight > 0.0
+        and not config.model.lspwm_physical_calibration_enabled
+    ):
+        raise ValueError(
+            "lspwm_calibrated_dynamic_weight requires physical calibration"
+        )
+    if (
+        config.optimization.lspwm_calibrated_endpoint_weight > 0.0
+        and not config.model.lspwm_physical_calibration_enabled
+    ):
+        raise ValueError(
+            "lspwm_calibrated_endpoint_weight requires physical calibration"
+        )
+    if (
+        config.optimization.lspwm_calibrated_force_weight > 0.0
+        and not config.model.lspwm_physical_calibration_enabled
+    ):
+        raise ValueError(
+            "lspwm_calibrated_force_weight requires physical calibration"
+        )
+    if (
+        config.optimization.lspwm_calibration_regularization_weight > 0.0
+        and not config.model.lspwm_physical_calibration_enabled
+    ):
+        raise ValueError(
+            "lspwm_calibration_regularization_weight requires physical calibration"
+        )
+    if config.model.lspwm_freeze_base_dynamics:
+        if not config.model.lspwm_physical_calibration_enabled:
+            raise ValueError(
+                "lspwm_freeze_base_dynamics requires physical calibration"
+            )
+        if not config.init_checkpoint and not config.resume_checkpoint:
+            raise ValueError(
+                "freezing base dynamics requires an initialized checkpoint"
+            )
+    if config.model.lspwm_freeze_calibration_scales:
+        if not config.model.lspwm_physical_calibration_enabled:
+            raise ValueError(
+                "lspwm_freeze_calibration_scales requires physical calibration"
+            )
+        if not config.model.lspwm_freeze_base_dynamics:
+            raise ValueError(
+                "lspwm_freeze_calibration_scales requires frozen base dynamics"
+            )
+    if config.model.lspwm_reset_conservative_correction_on_init:
+        if not config.model.lspwm_conservative_correction_enabled:
+            raise ValueError(
+                "lspwm_reset_conservative_correction_on_init requires a correction head"
+            )
+        if not config.init_checkpoint:
+            raise ValueError(
+                "lspwm_reset_conservative_correction_on_init requires init_checkpoint"
+            )
     if config.model.learned_state_training:
         if config.optimization.encoder_lr_scale <= 0.0:
             raise ValueError("learned-state training requires a positive encoder LR scale")
@@ -500,6 +574,31 @@ def _load_resume_checkpoint(
     return step
 
 
+def _reset_lspwm_conservative_correction(model: ProteinJEPA) -> None:
+    if model.lspwm is None or not model.lspwm.physical_calibration_enabled:
+        raise ValueError("resetting the LSP-WM correction requires physical calibration")
+    correction = (
+        model.lspwm.world_model.physical_calibration.conservative_correction
+    )
+    if correction is None:
+        raise ValueError("resetting the LSP-WM correction requires a correction head")
+    with torch.no_grad():
+        correction.raw_state_basis.normal_(mean=0.0, std=0.02)
+        correction.bias.zero_()
+        correction.condition_basis.zero_()
+    print(
+        json.dumps(
+            {
+                "event": "reset_lspwm_conservative_correction",
+                "raw_state_basis_std": 0.02,
+                "bias": "zero",
+                "condition_basis": "zero",
+            }
+        ),
+        flush=True,
+    )
+
+
 def train_paired(config: TrainConfig) -> Path:
     """Train the V2.2 paired endpoint and slow-state objectives."""
     _set_reproducibility(config.seed, config.deterministic)
@@ -542,6 +641,8 @@ def train_paired(config: TrainConfig) -> Path:
             config.init_exclude_prefixes,
             config.init_copy_temporal_to_offline,
         )
+        if config.model.lspwm_reset_conservative_correction_on_init:
+            _reset_lspwm_conservative_correction(model)
         if config.sync_target_after_init:
             model.sync_target_encoders()
     fixed_cv_tmjepa = model.tmjepa is not None and model.tmjepa.learned_cv_dim == 0
@@ -653,12 +754,21 @@ def train_paired(config: TrainConfig) -> Path:
         else:
             param_groups.extend(tmjepa_groups)
     if model.lspwm is not None:
+        lspwm_parameters = (
+            model.lspwm.calibration_parameters()
+            if config.model.lspwm_freeze_base_dynamics
+            else model.lspwm.parameters()
+        )
         param_groups.append(
             {
-                "params": model.lspwm.parameters(),
+                "params": lspwm_parameters,
                 "lr": config.optimization.lr,
                 "base_lr_scale": 1.0,
-                "group_name": "lspwm",
+                "group_name": (
+                    "lspwm_physical_calibration"
+                    if config.model.lspwm_freeze_base_dynamics
+                    else "lspwm"
+                ),
             }
         )
     param_groups = [
@@ -782,6 +892,18 @@ def train_paired(config: TrainConfig) -> Path:
             lspwm_dynamic_loss = outputs.get(
                 "lspwm_dynamic_nll", terms["delta_loss"].new_zeros(())
             )
+            lspwm_calibrated_dynamic_loss = outputs.get(
+                "lspwm_calibrated_dynamic_nll", terms["delta_loss"].new_zeros(())
+            )
+            lspwm_calibrated_endpoint_loss = _balanced_calibrated_endpoint_mse(
+                outputs
+            )
+            lspwm_calibrated_force_loss = outputs.get(
+                "lspwm_calibrated_force_loss", terms["delta_loss"].new_zeros(())
+            )
+            lspwm_calibration_regularization = outputs.get(
+                "lspwm_calibration_regularization", terms["delta_loss"].new_zeros(())
+            )
             lspwm_force_loss = outputs.get(
                 "lspwm_force_loss", terms["delta_loss"].new_zeros(())
             )
@@ -857,6 +979,17 @@ def train_paired(config: TrainConfig) -> Path:
                 * terms["relative_delta_loss"]
                 + config.optimization.paired_endpoint_variance_weight * endpoint_reg
                 + config.optimization.lspwm_dynamic_weight * lspwm_dynamic_loss * lspwm_phase_dynamic_weight
+                + config.optimization.lspwm_calibrated_dynamic_weight
+                * lspwm_calibrated_dynamic_loss
+                * lspwm_phase_dynamic_weight
+                + config.optimization.lspwm_calibrated_endpoint_weight
+                * lspwm_calibrated_endpoint_loss
+                * lspwm_phase_dynamic_weight
+                + config.optimization.lspwm_calibrated_force_weight
+                * lspwm_calibrated_force_loss
+                * lspwm_phase_force_weight
+                + config.optimization.lspwm_calibration_regularization_weight
+                * lspwm_calibration_regularization
                 + config.optimization.lspwm_force_weight * lspwm_force_loss * lspwm_phase_force_weight
                 + config.optimization.lspwm_koopman_weight * lspwm_koopman_loss * lspwm_phase_koopman_weight
                 + config.optimization.lspwm_msm_weight * lspwm_msm_loss * lspwm_phase_koopman_weight
@@ -1136,6 +1269,15 @@ def train_paired(config: TrainConfig) -> Path:
                         if model.tmjepa is not None
                         else None
                     ),
+                    "grad_norm_lspwm_calibration": _module_gradient_norm(
+                        getattr(
+                            getattr(model.lspwm, "world_model", None),
+                            "physical_calibration",
+                            None,
+                        )
+                        if model.lspwm is not None
+                        else None
+                    ),
                 }
             if config.optimization.grad_clip is not None:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), config.optimization.grad_clip)
@@ -1184,6 +1326,18 @@ def train_paired(config: TrainConfig) -> Path:
                     "paired_skill": float(terms["skill"].detach().cpu()),
                     "paired_endpoint_variance": float(endpoint_reg.detach().cpu()),
                     "lspwm_dynamic_nll": float(lspwm_dynamic_loss.detach().cpu()),
+                    "lspwm_calibrated_dynamic_nll": float(
+                        lspwm_calibrated_dynamic_loss.detach().cpu()
+                    ),
+                    "lspwm_calibrated_endpoint_mse": float(
+                        lspwm_calibrated_endpoint_loss.detach().cpu()
+                    ),
+                    "lspwm_calibrated_force_loss": float(
+                        lspwm_calibrated_force_loss.detach().cpu()
+                    ),
+                    "lspwm_calibration_regularization": float(
+                        lspwm_calibration_regularization.detach().cpu()
+                    ),
                     "lspwm_force_loss": float(lspwm_force_loss.detach().cpu()),
                     "lspwm_koopman_loss": float(lspwm_koopman_loss.detach().cpu()),
                     "lspwm_msm_loss": float(lspwm_msm_loss.detach().cpu()),
@@ -1203,6 +1357,18 @@ def train_paired(config: TrainConfig) -> Path:
                     "lspwm_endpoint_energy_skill": float(lspwm_endpoint_energy_skill.detach().cpu()),
                     "lspwm_deterministic_skill": float(lspwm_deterministic_skill.detach().cpu()),
                     "lspwm_active_phase": lspwm_active_phase,
+                    "lspwm_physical_mobility_scale": float(
+                        outputs.get(
+                            "lspwm_physical_mobility_scale",
+                            terms["delta_loss"].new_zeros(()),
+                        ).detach().cpu()
+                    ),
+                    "lspwm_physical_free_energy_scale": float(
+                        outputs.get(
+                            "lspwm_physical_free_energy_scale",
+                            terms["delta_loss"].new_zeros(()),
+                        ).detach().cpu()
+                    ),
                     "causal_alignment_loss": float(alignment_loss.detach().cpu()),
                     "gaussian_nll": float(gaussian_loss.detach().cpu()),
                     "observable_loss": float(observable_loss.detach().cpu()),

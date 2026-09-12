@@ -26,7 +26,10 @@ from protein_jepa_frame.data.collate import collate_paired_windows
 from protein_jepa_frame.data.dataset import build_dataset
 from protein_jepa_frame.data.sampler import HierarchicalClipSampler
 from protein_jepa_frame.models.jepa import ProteinJEPA, upgrade_lspwm_state_dict
-from protein_jepa_frame.models.lspwm import overdamped_transition_nll
+from protein_jepa_frame.models.lspwm import (
+    calibrated_overdamped_transition_nll,
+    overdamped_transition_nll,
+)
 
 
 def _move(batch: dict, device: torch.device) -> dict:
@@ -97,14 +100,23 @@ def evaluate(args: argparse.Namespace) -> dict:
         dt = values["horizon_time_ps"]
         auxiliary = current.new_zeros(current.shape[0], model.lspwm.world_model.config.auxiliary_dim)
 
-        deterministic = model.lspwm.world_model.step(
-            current,
-            auxiliary,
-            condition,
-            dt,
-            temperature,
-            stochastic=False,
-        )["q"]
+        if model.lspwm.world_model.physical_calibration.enabled:
+            deterministic = model.lspwm.world_model.calibrated_transition(
+                current,
+                condition,
+                dt,
+                temperature,
+                history_features=outputs["lspwm_history_features"],
+            )["mean"]
+        else:
+            deterministic = model.lspwm.world_model.step(
+                current,
+                auxiliary,
+                condition,
+                dt,
+                temperature,
+                stochastic=False,
+            )["q"]
         samples = model.lspwm.sample_endpoint(
             current,
             condition,
@@ -117,7 +129,12 @@ def evaluate(args: argparse.Namespace) -> dict:
         persistence_mse = (current - target).square().mean(dim=-1)
         energy_score = _energy_score(samples, target)
         persistence_energy = torch.linalg.vector_norm(current - target, dim=-1)
-        nll = overdamped_transition_nll(
+        nll_fn = (
+            calibrated_overdamped_transition_nll
+            if model.lspwm.world_model.physical_calibration.enabled
+            else overdamped_transition_nll
+        )
+        nll = nll_fn(
             model.lspwm.world_model,
             current,
             target,
@@ -148,6 +165,23 @@ def evaluate(args: argparse.Namespace) -> dict:
             totals[f"{key}.persistence_energy"] += float(persistence_energy[mask].sum())
             totals[f"{key}.msm_accuracy"] += float(msm_accuracy[mask].sum())
             totals[f"{key}.msm_overlap"] += float(msm_overlap[mask].sum())
+            totals[f"{key}.target_displacement_norm"] += float(
+                torch.linalg.vector_norm(target[mask] - current[mask], dim=-1).sum()
+            )
+            totals[f"{key}.deterministic_displacement_norm"] += float(
+                torch.linalg.vector_norm(deterministic[mask] - current[mask], dim=-1).sum()
+            )
+            totals[f"{key}.ensemble_mean_displacement_norm"] += float(
+                torch.linalg.vector_norm(
+                    samples[mask].mean(dim=1) - current[mask], dim=-1
+                ).sum()
+            )
+            totals[f"{key}.ensemble_spread_norm"] += float(
+                torch.linalg.vector_norm(
+                    samples[mask] - samples[mask].mean(dim=1, keepdim=True),
+                    dim=-1,
+                ).mean(dim=1).sum()
+            )
         totals["nll"] += float(nll) * current.shape[0]
         rows += current.shape[0]
 
@@ -168,6 +202,14 @@ def evaluate(args: argparse.Namespace) -> dict:
             "energy_skill_vs_persistence": 1.0 - score / max(persistence_energy, 1.0e-12),
             "msm_endpoint_accuracy": totals[f"{key}.msm_accuracy"] / count,
             "msm_soft_overlap": totals[f"{key}.msm_overlap"] / count,
+            "target_displacement_norm": totals[f"{key}.target_displacement_norm"] / count,
+            "deterministic_displacement_norm": (
+                totals[f"{key}.deterministic_displacement_norm"] / count
+            ),
+            "ensemble_mean_displacement_norm": (
+                totals[f"{key}.ensemble_mean_displacement_norm"] / count
+            ),
+            "ensemble_spread_norm": totals[f"{key}.ensemble_spread_norm"] / count,
         }
 
     return {

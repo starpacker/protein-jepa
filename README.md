@@ -70,10 +70,24 @@ bath under a fixed environment condition. It is trained in two stages:
   trained on top of the frozen Stage-A encoder, using dynamic NLL,
   mean-force KDE matching, and VAMP-2 regularization.
 
-Stage B v3 (the current best checkpoint) trains 3000 steps (3 epochs × 1000 steps)
+Stage B v3 (the reference thermodynamic checkpoint) trains 3000 steps (3 epochs × 1000 steps)
 with a curriculum that enables force learning only after step 1500. The final
 checkpoint `checkpoint_step3000.pt` achieves measurable force correlation and
 thermodynamic consistency.
+
+The current best **held-out one-step endpoint candidate** is the Phase 3
+frozen-latent refinement:
+
+```text
+artifacts/lspwm_v44_phase3_endpoint_refinement_pilot/checkpoint_step500.pt
+```
+
+On the protein-disjoint validation protocol, it improves deterministic endpoint
+skill over the scalar-calibrated checkpoint at H24/H48/H96 from
+`0.1429/0.2266/0.2413` to `0.2101/0.3233/0.2923`, improves energy skill at all
+three horizons, and reduces mean transition NLL from `396.17` to `328.96`.
+This is a validated v4.4 endpoint refinement, not yet a complete
+protein-environment world model or a literature-wide SOTA claim.
 
 The complete LSP-WM target extends it to
 
@@ -690,6 +704,7 @@ above. To run the earlier v3 baseline, substitute
 | action/control state | absent from v4.4 | no counterfactual intervention claim |
 | scalar PMF | implemented candidate | must be measure-aware and temperature-consistent |
 | global diffusion | parameterized candidate | PSD is not FDT or path validation |
+| frozen-latent physical calibration | implemented candidate | scalar FDT calibration plus bounded conservative drift refinement |
 | finite Mori bath | partial candidate | finite exponential approximation, not complete hidden physics |
 | nonlinear/operator memory | absent | kernel-family adequacy remains open |
 | structural mechanics layer | incomplete | coordinate generation requires geometry constraints |
@@ -706,7 +721,7 @@ for the full protein-environment LSP-WM target.
 
 ### 14.1 Stage B v3 — Evaluation Results
 
-The current best checkpoint (`checkpoint_step3000.pt`) was evaluated on
+The Stage B v3 reference checkpoint (`checkpoint_step3000.pt`) was evaluated on
 two complementary benchmarks:
 
 **LSPWM Internal Evaluation** (240 trajectory samples, bandwidth 0.1)
@@ -916,19 +931,21 @@ python -m protein_jepa_frame.eval.lspwm_eval \
 The correct current claim is:
 
 > Protein-JEPA-Frame contains an experimental thermodynamic latent-dynamics
-> subsystem (v4.4, Stage B v3 and DetSkill Fix) and a design path toward an
-> intervenable, multiscale protein-environment LSP-WM. The v4.4 Stage B v3
-> checkpoint demonstrates measurable thermodynamic consistency: VAMP-2 = 47
-> (target >20), positive force cosine (+0.033), and FastFolding committor
-> accuracy of 0.87 on scaffold-disjoint held-out proteins.
+> subsystem (v4.4, Stage B v3, DetSkill Fix, and frozen-latent Phase 3
+> physical refinement) and a design path toward an intervenable, multiscale
+> protein-environment LSP-WM. The Phase 3 endpoint candidate improves
+> protein-disjoint validation deterministic skill at H24/H48/H96 to
+> `0.2101/0.3233/0.2923` and mean transition NLL to `328.96`, while preserving
+> the frozen latent representation and FDT-tied covariance.
 >
 > The DetSkill Fix checkpoint (`lspwm_v44_stage_b_detskill_fix`) resolves the
 > DetSkill gap in Stage B v3 by enabling PairedDeltaPredictor training (was
 > disabled by `paired_delta_weight: 0.0`), achieving DetSkill = 0.889 max
 > (target ≥0.85) and final DetSkill = 0.820 with all three horizons exceeding
 > their targets, while maintaining zero latent collapse risk (all encoders
-> frozen). Comprehensive evaluation (VAMP-2, force matching, FastFolding
-> benchmarks) on this checkpoint is pending.
+> frozen). Comprehensive evaluation (VAMP-2, force matching, FastFolding,
+> rollout, and covariance-closure benchmarks) on the Phase 3 candidate is
+> still pending.
 >
 > It has not yet established a complete protein world model, a unique physical
 > decomposition, protein-scale intervention validity, or literature-wide SOTA.

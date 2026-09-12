@@ -483,9 +483,21 @@ def _estimate_kde_bandwidth(
         ref_sample = reference[idx]
         # Pairwise distances between query and reference sample
         dists = torch.cdist(query, ref_sample)  # [batch, sample_size]
+        # Query points are often drawn from the same set as the KDE reference.
+        # Excluding exact self/duplicate matches prevents the adaptive
+        # bandwidth from collapsing to the clamp floor and producing a
+        # meaningless zero force target.
+        dists = dists.masked_fill(dists <= 1.0e-8, float("inf"))
         # Median of minimum distances per query point
         min_dists, _ = dists.min(dim=1)
-        median_min_dist = min_dists.median()
+        finite = torch.isfinite(min_dists)
+        if finite.any():
+            median_min_dist = min_dists[finite].median()
+        else:
+            # A completely collapsed reference has no identifiable local
+            # scale; retain the lower clamp and let the caller mark the
+            # resulting force target as degenerate.
+            median_min_dist = query.new_tensor(0.0)
         # Use a fraction of the median nearest-neighbour distance.
         # This gives a local kernel that adapts to the data density.
         bw = nearest_fraction * median_min_dist.clamp(min=1e-8)
@@ -554,50 +566,51 @@ def mean_force_matching_loss(
     return (per_sample * weights).sum() / weights.sum().clamp(min=1.0e-8)
 
 
-def overdamped_transition_nll(
+def calibrated_mean_force_matching_loss(
     world_model: "LSPWMWorldModel",
     q: torch.Tensor,
-    target_q: torch.Tensor,
-    condition: torch.Tensor | None,
-    dt_ps: float | torch.Tensor,
+    target_mean_force: torch.Tensor,
+    condition: torch.Tensor | None = None,
     temperature_k: torch.Tensor | float | None = None,
-    history_features: torch.Tensor | None = None,
+    *,
+    weights: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Gaussian one-step NLL for the overdamped state with zero bath mean.
+    """Match the FDT-calibrated total mean force to a KDE score target.
 
-    This is the canonical ``L_dyn`` term. The bath remains available for
-    multi-step rollouts, while the one-step likelihood is well-defined even
-    before a history filter has been fitted.
-
-    Efficiently handles diagonal diffusion matrices (from StateDependentDiffusion)
-    by using element-wise operations instead of full matrix solve + slogdet.
+    The target is a score estimate in the fixed latent coordinates.  The
+    prediction includes both the calibrated base PMF force and the exact
+    gradient of the bounded conservative correction, so the force objective
+    is aligned with the transition mean used by the endpoint evaluator.
     """
-    if q.shape != target_q.shape or q.ndim != 2:
-        raise ValueError("q and target_q must have shape [batch, state_dim]")
-    dt = torch.as_tensor(dt_ps, device=q.device, dtype=q.dtype)
-    if dt.ndim == 0:
-        dt = dt.expand(q.shape[0])
-    if dt.shape != (q.shape[0],) or torch.any(dt <= 0.0):
-        raise ValueError("dt_ps must be positive scalar or shape [batch]")
-    temperature = _as_batch_temperature(
-        temperature_k,
-        q.shape[0],
-        q,
-        world_model.config.reference_temperature_k,
+    if target_mean_force.shape != q.shape:
+        raise ValueError("target_mean_force must have the same shape as q")
+    predicted = world_model.calibrated_mean_force(
+        q, condition, temperature_k, create_graph=True
     )
-    gradient = -world_model.potential.mean_force(
-        q, condition, temperature, create_graph=True
-    )
-    diffusion = world_model.diffusion(q.shape[0], temperature, reference=q)
-    mean = q - torch.einsum("bij,bj->bi", diffusion, gradient) * dt[:, None]
-    mean = mean + world_model.history_correction(
-        q,
-        history_features,
-        dt,
-        temperature,
-    )
+    residual = predicted - target_mean_force.detach()
+    per_sample = residual.square().mean(dim=-1)
+    if weights is None:
+        return per_sample.mean()
+    if weights.shape != per_sample.shape:
+        raise ValueError("weights must have shape [batch]")
+    return (per_sample * weights).sum() / weights.sum().clamp(min=1.0e-8)
+
+
+def _gaussian_transition_nll_from_parameters(
+    mean: torch.Tensor,
+    target_q: torch.Tensor,
+    diffusion: torch.Tensor,
+    dt: torch.Tensor,
+) -> torch.Tensor:
+    """Evaluate a Gaussian transition NLL from a mean and PSD diffusion."""
+    if mean.shape != target_q.shape or mean.ndim != 2:
+        raise ValueError("mean and target_q must have shape [batch, state_dim]")
+    if diffusion.shape != (mean.shape[0], mean.shape[1], mean.shape[1]):
+        raise ValueError("diffusion must have shape [batch, state_dim, state_dim]")
+    if dt.shape != (mean.shape[0],) or torch.any(dt <= 0.0):
+        raise ValueError("dt must be positive and have shape [batch]")
     residual = target_q - mean
-    d = q.shape[-1]
+    d = mean.shape[-1]
 
     # Check if the diffusion matrix is effectively diagonal (from StateDependentDiffusion)
     # Heuristic: mean |off_diag| / mean |diag| < 5e-4 → use cheap diagonal path
@@ -625,6 +638,70 @@ def overdamped_transition_nll(
             raise ValueError("transition covariance is not positive definite")
 
     return 0.5 * (quadratic + logdet + d * math.log(2.0 * math.pi)).mean()
+
+
+def overdamped_transition_nll(
+    world_model: "LSPWMWorldModel",
+    q: torch.Tensor,
+    target_q: torch.Tensor,
+    condition: torch.Tensor | None,
+    dt_ps: float | torch.Tensor,
+    temperature_k: torch.Tensor | float | None = None,
+    history_features: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Gaussian one-step NLL for the uncalibrated overdamped state."""
+    if q.shape != target_q.shape or q.ndim != 2:
+        raise ValueError("q and target_q must have shape [batch, state_dim]")
+    dt = torch.as_tensor(dt_ps, device=q.device, dtype=q.dtype)
+    if dt.ndim == 0:
+        dt = dt.expand(q.shape[0])
+    if dt.shape != (q.shape[0],) or torch.any(dt <= 0.0):
+        raise ValueError("dt_ps must be positive scalar or shape [batch]")
+    temperature = _as_batch_temperature(
+        temperature_k,
+        q.shape[0],
+        q,
+        world_model.config.reference_temperature_k,
+    )
+    gradient = -world_model.potential.mean_force(
+        q, condition, temperature, create_graph=True
+    )
+    diffusion = world_model.diffusion(q.shape[0], temperature, reference=q)
+    mean = q - torch.einsum("bij,bj->bi", diffusion, gradient) * dt[:, None]
+    mean = mean + world_model.history_correction(
+        q,
+        history_features,
+        dt,
+        temperature,
+    )
+    return _gaussian_transition_nll_from_parameters(mean, target_q, diffusion, dt)
+
+
+def calibrated_overdamped_transition_nll(
+    world_model: "LSPWMWorldModel",
+    q: torch.Tensor,
+    target_q: torch.Tensor,
+    condition: torch.Tensor | None,
+    dt_ps: float | torch.Tensor,
+    temperature_k: torch.Tensor | float | None = None,
+    history_features: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Gaussian NLL for the trainable FDT-consistent calibrated transition."""
+    if q.shape != target_q.shape or q.ndim != 2:
+        raise ValueError("q and target_q must have shape [batch, state_dim]")
+    parameters = world_model.calibrated_transition(
+        q,
+        condition,
+        dt_ps,
+        temperature_k,
+        history_features=history_features,
+    )
+    return _gaussian_transition_nll_from_parameters(
+        parameters["mean"],
+        target_q,
+        parameters["diffusion"],
+        parameters["dt_ps"],
+    )
 
 
 def fdt_residual(
@@ -1138,6 +1215,184 @@ def koopman_diagnostics(
     }
 
 
+class BoundedConservativePotential(nn.Module):
+    """Low-rank bounded free-energy correction in the existing latent space.
+
+    The correction is a scalar potential, so its force is integrable by
+    construction.  ``tanh`` bounds both the state features and the
+    condition-dependent amplitudes.  Zero initialization of the amplitudes
+    makes the calibrated model exactly reduce to scalar calibration at step 0.
+    """
+
+    def __init__(
+        self,
+        state_dim: int,
+        condition_dim: int,
+        *,
+        rank: int = 16,
+        scale: float = 1.0,
+    ) -> None:
+        super().__init__()
+        if state_dim < 1 or condition_dim < 0 or rank < 1 or scale < 0.0:
+            raise ValueError("invalid conservative correction dimensions or scale")
+        self.state_dim = int(state_dim)
+        self.condition_dim = int(condition_dim)
+        self.rank = int(rank)
+        self.scale = float(scale)
+        self.raw_state_basis = nn.Parameter(
+            torch.randn(state_dim, rank) * 0.02
+        )
+        self.bias = nn.Parameter(torch.zeros(rank))
+        self.condition_basis = nn.Parameter(torch.zeros(condition_dim, rank))
+
+    def _condition(self, q: torch.Tensor, condition: torch.Tensor | None) -> torch.Tensor:
+        if self.condition_dim == 0:
+            return q.new_zeros(q.shape[0], 0)
+        if condition is None:
+            return q.new_zeros(q.shape[0], self.condition_dim)
+        if condition.shape != (q.shape[0], self.condition_dim):
+            raise ValueError("condition shape does not match conservative correction")
+        return condition.to(device=q.device, dtype=q.dtype)
+
+    def _state_basis(self) -> torch.Tensor:
+        # Keep the force field bounded even if optimization is aggressive.
+        return torch.tanh(self.raw_state_basis)
+
+    def forward(
+        self,
+        q: torch.Tensor,
+        condition: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if q.ndim != 2 or q.shape[-1] != self.state_dim:
+            raise ValueError("q has the wrong conservative correction shape")
+        state_features = torch.tanh(q @ self._state_basis())
+        condition_features = self._condition(q, condition)
+        amplitudes = self.bias
+        if self.condition_dim > 0:
+            amplitudes = amplitudes + condition_features @ self.condition_basis
+        amplitudes = torch.tanh(amplitudes) / math.sqrt(float(self.rank))
+        return self.scale * (state_features * amplitudes).sum(dim=-1)
+
+    def gradient(
+        self,
+        q: torch.Tensor,
+        condition: torch.Tensor | None = None,
+        *,
+        create_graph: bool = False,
+    ) -> torch.Tensor:
+        """Return ``grad DeltaA``; the corresponding mean force is ``-gradient``."""
+        with torch.enable_grad():
+            q_leaf = q if q.requires_grad else q.detach().requires_grad_(True)
+            energy = self(q_leaf, condition)
+            return torch.autograd.grad(
+                energy.sum(),
+                q_leaf,
+                create_graph=create_graph,
+                retain_graph=create_graph,
+            )[0]
+
+
+class PhysicalTransitionCalibration(nn.Module):
+    """FDT-consistent scalar and conservative transition calibration.
+
+    For the overdamped Langevin law
+
+        dq = -D grad(A) dt + sqrt(2 D dt) dW,
+
+    this module uses ``D_cal = m D`` and
+        ``grad(A_cal) = s grad(A) + grad(DeltaA)``.  An optional mode treats
+    ``DeltaA`` as being expressed in the same dimensionless energy units as
+    ``A`` and applies ``s`` to both terms.  The same mobility scale therefore
+    controls both drift mobility and covariance, preserving the
+    Einstein/FDT relationship.
+    """
+
+    def __init__(
+        self,
+        state_dim: int,
+        condition_dim: int,
+        *,
+        enabled: bool = False,
+        mobility_init: float = 1.0,
+        free_energy_init: float = 1.0,
+        log_scale_min: float = -12.0,
+        log_scale_max: float = 12.0,
+        conservative_enabled: bool = False,
+        conservative_rank: int = 16,
+        conservative_scale: float = 1.0,
+        conservative_rescale_with_free_energy: bool = False,
+    ) -> None:
+        super().__init__()
+        if mobility_init <= 0.0 or free_energy_init <= 0.0:
+            raise ValueError("physical calibration scales must be positive")
+        if log_scale_min >= log_scale_max:
+            raise ValueError("physical calibration log-scale bounds are invalid")
+        self.enabled = bool(enabled)
+        self.log_scale_min = float(log_scale_min)
+        self.log_scale_max = float(log_scale_max)
+        self.conservative_enabled = bool(conservative_enabled)
+        self.conservative_rescale_with_free_energy = bool(
+            conservative_rescale_with_free_energy
+        )
+        self.log_mobility_scale = nn.Parameter(
+            torch.tensor(math.log(float(mobility_init)))
+        )
+        self.log_free_energy_scale = nn.Parameter(
+            torch.tensor(math.log(float(free_energy_init)))
+        )
+        self.conservative_correction = (
+            BoundedConservativePotential(
+                state_dim,
+                condition_dim,
+                rank=conservative_rank,
+                scale=conservative_scale,
+            )
+            if self.conservative_enabled
+            else None
+        )
+
+    def _scale(self, value: torch.Tensor) -> torch.Tensor:
+        return value.clamp(self.log_scale_min, self.log_scale_max).exp()
+
+    @property
+    def mobility_scale(self) -> torch.Tensor:
+        return self._scale(self.log_mobility_scale)
+
+    @property
+    def free_energy_scale(self) -> torch.Tensor:
+        return self._scale(self.log_free_energy_scale)
+
+    def correction_gradient(
+        self,
+        q: torch.Tensor,
+        condition: torch.Tensor | None,
+        *,
+        create_graph: bool = True,
+    ) -> torch.Tensor:
+        if self.conservative_correction is None:
+            return q.new_zeros(q.shape)
+        return self.conservative_correction.gradient(
+            q,
+            condition,
+            create_graph=create_graph,
+        )
+
+    def regularization_loss(
+        self,
+        q: torch.Tensor,
+        condition: torch.Tensor | None,
+    ) -> torch.Tensor:
+        if self.conservative_correction is None:
+            return q.new_zeros(())
+        correction_gradient = self.correction_gradient(
+            q,
+            condition,
+            create_graph=True,
+        )
+        correction_energy = self.conservative_correction(q, condition)
+        return correction_gradient.square().mean() + 0.01 * correction_energy.square().mean()
+
+
 @dataclass(frozen=True)
 class LSPWMConfig:
     """Small serializable contract for the standalone LSP-WM core."""
@@ -1182,6 +1437,17 @@ class LSPWMConfig:
 
     # Separate force-loss flag (decoupled from dynamic_nll_enabled)
     force_loss_enabled: bool = True
+
+    # FDT-consistent physical transition calibration
+    physical_calibration_enabled: bool = False
+    physical_mobility_init: float = 1.0
+    physical_free_energy_init: float = 1.0
+    physical_log_scale_min: float = -12.0
+    physical_log_scale_max: float = 12.0
+    conservative_correction_enabled: bool = False
+    conservative_correction_rank: int = 16
+    conservative_correction_scale: float = 1.0
+    conservative_correction_rescale_with_free_energy: bool = False
 
     # ──────────────────────────────────────────────────────────────
     # v4.4 architectural extensions (first-principles revisions)
@@ -1249,6 +1515,21 @@ class LSPWMWorldModel(nn.Module):
                 reference_temperature_k=config.reference_temperature_k,
                 diffusion_scale=config.diffusion_scale,
             )
+        self.physical_calibration = PhysicalTransitionCalibration(
+            config.state_dim,
+            config.condition_dim,
+            enabled=config.physical_calibration_enabled,
+            mobility_init=config.physical_mobility_init,
+            free_energy_init=config.physical_free_energy_init,
+            log_scale_min=config.physical_log_scale_min,
+            log_scale_max=config.physical_log_scale_max,
+            conservative_enabled=config.conservative_correction_enabled,
+            conservative_rank=config.conservative_correction_rank,
+            conservative_scale=config.conservative_correction_scale,
+            conservative_rescale_with_free_energy=(
+                config.conservative_correction_rescale_with_free_energy
+            ),
+        )
         self.bath = GaugeFixedBath(
             config.state_dim,
             config.auxiliary_dim,
@@ -1311,6 +1592,116 @@ class LSPWMWorldModel(nn.Module):
         )
         bath = self.bath.parameters_at(dtype=q.dtype, device=q.device)
         return {"diffusion": diffusion, **bath}
+
+    def calibrated_transition(
+        self,
+        q: torch.Tensor,
+        condition: torch.Tensor | None,
+        dt_ps: torch.Tensor | float,
+        temperature_k: torch.Tensor | float | None = None,
+        *,
+        history_features: torch.Tensor | None = None,
+    ) -> dict[str, torch.Tensor]:
+        """Return the FDT-consistent calibrated one-step Gaussian parameters."""
+        calibration = self.physical_calibration
+        if not calibration.enabled:
+            raise ValueError("physical transition calibration is disabled")
+        if q.ndim != 2 or q.shape[-1] != self.config.state_dim:
+            raise ValueError("q must have shape [batch, state_dim]")
+        dt = torch.as_tensor(dt_ps, device=q.device, dtype=q.dtype)
+        if dt.ndim == 0:
+            dt = dt.expand(q.shape[0])
+        if dt.shape != (q.shape[0],) or torch.any(dt <= 0.0):
+            raise ValueError("dt_ps must be positive scalar or shape [batch]")
+        temperature = _as_batch_temperature(
+            temperature_k,
+            q.shape[0],
+            q,
+            self.config.reference_temperature_k,
+        )
+        raw_gradient = -self.potential.mean_force(
+            q,
+            condition,
+            temperature,
+            create_graph=True,
+        )
+        correction_gradient = calibration.correction_gradient(
+            q,
+            condition,
+            create_graph=True,
+        )
+        diffusion = self.diffusion(
+            q.shape[0],
+            temperature,
+            reference=q,
+        ) * calibration.mobility_scale
+        if calibration.conservative_rescale_with_free_energy:
+            total_gradient = calibration.free_energy_scale * (
+                raw_gradient + correction_gradient
+            )
+        else:
+            total_gradient = (
+                calibration.free_energy_scale * raw_gradient
+                + correction_gradient
+            )
+        mean = q - torch.einsum(
+            "bij,bj->bi", diffusion, total_gradient
+        ) * dt[:, None]
+        if history_features is not None and self.history_closure is not None:
+            mean = mean + self.history_correction(
+                q,
+                history_features,
+                dt,
+                temperature,
+            )
+        return {
+            "mean": mean,
+            "diffusion": diffusion,
+            "gradient": total_gradient,
+            "raw_gradient": raw_gradient,
+            "correction_gradient": correction_gradient,
+            "temperature_k": temperature,
+            "dt_ps": dt,
+            "mobility_scale": calibration.mobility_scale,
+            "free_energy_scale": calibration.free_energy_scale,
+        }
+
+    def calibrated_mean_force(
+        self,
+        q: torch.Tensor,
+        condition: torch.Tensor | None = None,
+        temperature_k: torch.Tensor | float | None = None,
+        *,
+        create_graph: bool = False,
+    ) -> torch.Tensor:
+        """Return the calibrated conservative force in latent coordinates."""
+        calibration = self.physical_calibration
+        if not calibration.enabled:
+            raise ValueError("physical transition calibration is disabled")
+        if q.ndim != 2 or q.shape[-1] != self.config.state_dim:
+            raise ValueError("q must have shape [batch, state_dim]")
+        temperature = _as_batch_temperature(
+            temperature_k,
+            q.shape[0],
+            q,
+            self.config.reference_temperature_k,
+        )
+        base_force = self.potential.mean_force(
+            q,
+            condition,
+            temperature,
+            create_graph=create_graph,
+        )
+        correction_gradient = calibration.correction_gradient(
+            q,
+            condition,
+            create_graph=create_graph,
+        )
+        if calibration.conservative_rescale_with_free_energy:
+            return calibration.free_energy_scale * (
+                base_force - correction_gradient
+            )
+        return calibration.free_energy_scale * base_force - correction_gradient
 
     def step(
         self,
@@ -1960,6 +2351,17 @@ class LSPWMProteinWorldModel(nn.Module):
         state_dependent_diffusion_enabled: bool = False,
         potential_hidden_dim: int = 128,
         potential_hidden_depth: int = 4,
+        physical_calibration_enabled: bool = False,
+        physical_mobility_init: float = 1.0,
+        physical_free_energy_init: float = 1.0,
+        physical_log_scale_min: float = -12.0,
+        physical_log_scale_max: float = 12.0,
+        conservative_correction_enabled: bool = False,
+        conservative_correction_rank: int = 16,
+        conservative_correction_scale: float = 1.0,
+        conservative_correction_rescale_with_free_energy: bool = False,
+        freeze_base_dynamics: bool = False,
+        freeze_calibration_scales: bool = False,
     ) -> None:
         super().__init__()
         if latent_dim < 1 or learned_cv_dim < 1:
@@ -1978,6 +2380,9 @@ class LSPWMProteinWorldModel(nn.Module):
         self.dynamic_nll_enabled = bool(dynamic_nll_enabled)
         self.force_loss_enabled = bool(force_loss_enabled)
         self.state_dependent_diffusion_enabled = bool(state_dependent_diffusion_enabled)
+        self.physical_calibration_enabled = bool(physical_calibration_enabled)
+        self.freeze_base_dynamics = bool(freeze_base_dynamics)
+        self.freeze_calibration_scales = bool(freeze_calibration_scales)
         self.collective_variables = FixedBackboneCollectiveVariables(
             num_segments=num_segments,
             contact_cutoff_angstrom=contact_cutoff_angstrom,
@@ -2034,11 +2439,35 @@ class LSPWMProteinWorldModel(nn.Module):
                 force_loss_enabled=force_loss_enabled,
                 potential_hidden_dim=potential_hidden_dim,
                 potential_hidden_depth=potential_hidden_depth,
+                physical_calibration_enabled=physical_calibration_enabled,
+                physical_mobility_init=physical_mobility_init,
+                physical_free_energy_init=physical_free_energy_init,
+                physical_log_scale_min=physical_log_scale_min,
+                physical_log_scale_max=physical_log_scale_max,
+                conservative_correction_enabled=conservative_correction_enabled,
+                conservative_correction_rank=conservative_correction_rank,
+                conservative_correction_scale=conservative_correction_scale,
+                conservative_correction_rescale_with_free_energy=(
+                    conservative_correction_rescale_with_free_energy
+                ),
                 midpoint_integration=False,      # Rev-1: configurable per experiment
                 rollout_trajectory_steps=0,      # Rev-2: set >0 to enable
                 semigroup_consistency_weight=0.0, # Rev-4: set >0 to enable
             )
         )
+        if self.freeze_base_dynamics:
+            if not self.physical_calibration_enabled:
+                raise ValueError(
+                    "freeze_base_dynamics requires physical calibration"
+                )
+            self.freeze_base_dynamics_parameters()
+        if self.freeze_calibration_scales:
+            if not self.physical_calibration_enabled:
+                raise ValueError(
+                    "freeze_calibration_scales requires physical calibration"
+                )
+            self.world_model.physical_calibration.log_mobility_scale.requires_grad = False
+            self.world_model.physical_calibration.log_free_energy_scale.requires_grad = False
 
         # ── Rev-3: Learned auxiliary state initializer ──────────────
         # Predicts the bath (memory) state from the last N context frames,
@@ -2054,6 +2483,22 @@ class LSPWMProteinWorldModel(nn.Module):
     @property
     def state_dim(self) -> int:
         return self.learned_cv_dim
+
+    def freeze_base_dynamics_parameters(self) -> None:
+        """Freeze every LSP-WM parameter except the physical calibration head."""
+        for parameter in self.parameters():
+            parameter.requires_grad = False
+        for parameter in self.world_model.physical_calibration.parameters():
+            parameter.requires_grad = True
+
+    def calibration_parameters(self) -> list[nn.Parameter]:
+        if not self.physical_calibration_enabled:
+            return []
+        return [
+            parameter
+            for parameter in self.world_model.physical_calibration.parameters()
+            if parameter.requires_grad
+        ]
 
     @torch.no_grad()
     def update_target_projection(self, momentum: float) -> None:
@@ -2269,6 +2714,17 @@ class LSPWMProteinWorldModel(nn.Module):
                     temperature,
                 )
                 outputs["lspwm_force_loss"] = force_loss
+                if self.physical_calibration_enabled:
+                    calibrated_force = self.world_model.calibrated_mean_force(
+                        current,
+                        condition,
+                        temperature,
+                        create_graph=True,
+                    )
+                    outputs["lspwm_calibrated_mean_force"] = calibrated_force
+                    outputs["lspwm_calibrated_force_loss"] = (
+                        calibrated_force - mean_force_target.detach()
+                    ).square().mean(dim=-1).mean()
 
         # Dynamic NLL (L_dyn) — overdamped transition likelihood
         # Active in: thermodynamic_identification, dynamics, rollout
@@ -2283,6 +2739,40 @@ class LSPWMProteinWorldModel(nn.Module):
                 history_features=history,
             )
             outputs["lspwm_dynamic_nll"] = dynamic_nll
+            if self.physical_calibration_enabled:
+                calibrated_parameters = self.world_model.calibrated_transition(
+                    current,
+                    condition,
+                    horizon_time_ps,
+                    temperature,
+                    history_features=history,
+                )
+                outputs["lspwm_calibrated_transition_mean"] = calibrated_parameters[
+                    "mean"
+                ]
+                outputs["lspwm_calibrated_dynamic_nll"] = (
+                    calibrated_overdamped_transition_nll(
+                        self.world_model,
+                        current,
+                        target,
+                        condition,
+                        horizon_time_ps,
+                        temperature,
+                        history_features=history,
+                    )
+                )
+                outputs["lspwm_calibration_regularization"] = (
+                    self.world_model.physical_calibration.regularization_loss(
+                        current,
+                        condition,
+                    )
+                )
+                outputs["lspwm_physical_mobility_scale"] = (
+                    self.world_model.physical_calibration.mobility_scale.detach()
+                )
+                outputs["lspwm_physical_free_energy_scale"] = (
+                    self.world_model.physical_calibration.free_energy_scale.detach()
+                )
 
         # Koopman VAMP-2 loss (L_koop) — Ch.7 (always active for representation shaping)
         role_losses, current_roles = self.role_readout.losses(
@@ -2339,18 +2829,23 @@ class LSPWMProteinWorldModel(nn.Module):
             # Deterministic skill (mean-drift only, no noise)
             # This separates PMF quality from noise and provides a cleaner
             # diagnostic for whether the learned PMF improves predictions.
-            deterministic = self.world_model.step(
-                current,
-                auxiliary=current.new_zeros(current.shape[0], self.world_model.config.auxiliary_dim),
-                condition=condition,
-                dt_ps=horizon_time_ps,
-                temperature_k=temperature,
-                stochastic=False,
-            )["q"]
-            correction = self.world_model.history_correction(
-                current, history, horizon_time_ps, temperature,
-            )
-            deterministic_q = deterministic + correction
+            if self.physical_calibration_enabled:
+                deterministic_q = outputs["lspwm_calibrated_transition_mean"]
+            else:
+                deterministic = self.world_model.step(
+                    current,
+                    auxiliary=current.new_zeros(
+                        current.shape[0], self.world_model.config.auxiliary_dim
+                    ),
+                    condition=condition,
+                    dt_ps=horizon_time_ps,
+                    temperature_k=temperature,
+                    stochastic=False,
+                )["q"]
+                correction = self.world_model.history_correction(
+                    current, history, horizon_time_ps, temperature,
+                )
+                deterministic_q = deterministic + correction
             deterministic_distance = torch.linalg.vector_norm(
                 deterministic_q - target, dim=-1
             )
@@ -2673,18 +3168,38 @@ class LSPWMProteinWorldModel(nn.Module):
         expanded_horizon = horizon_time_ps.repeat_interleave(ensemble_size)
         expanded_temperature = temperature_k.repeat_interleave(ensemble_size)
         auxiliary = current.new_zeros(batch * ensemble_size, self.world_model.config.auxiliary_dim)
-        result = self.world_model.step(
-            expanded_current,
-            auxiliary,
-            expanded_condition,
-            expanded_horizon,
-            expanded_temperature,
-            stochastic=True,
-        )
-        correction = self.world_model.history_correction(
-            current,
-            history_features,
-            horizon_time_ps,
-            temperature_k,
-        )
-        return result["q"].reshape(batch, ensemble_size, -1) + correction[:, None, :]
+        if self.world_model.physical_calibration.enabled:
+            parameters = self.world_model.calibrated_transition(
+                expanded_current,
+                expanded_condition,
+                expanded_horizon,
+                expanded_temperature,
+                history_features=expanded_history,
+            )
+            covariance = 2.0 * parameters["diffusion"] * expanded_horizon[:, None, None]
+            cholesky = torch.linalg.cholesky(covariance)
+            noise = torch.einsum(
+                "bi,bji->bj",
+                torch.randn_like(expanded_current),
+                cholesky,
+            )
+            samples = parameters["mean"] + noise
+        else:
+            result = self.world_model.step(
+                expanded_current,
+                auxiliary,
+                expanded_condition,
+                expanded_horizon,
+                expanded_temperature,
+                stochastic=True,
+            )
+            correction = self.world_model.history_correction(
+                current,
+                history_features,
+                horizon_time_ps,
+                temperature_k,
+            )
+            samples = result["q"] + correction.repeat_interleave(
+                ensemble_size, dim=0
+            )
+        return samples.reshape(batch, ensemble_size, -1)

@@ -140,6 +140,28 @@ def upgrade_lspwm_state_dict(
             if key.startswith("lspwm.world_model.diffusion."):
                 upgraded.pop(key)
 
+    # The auxiliary initializer was added after the original Stage B
+    # checkpoints.  It is not used by the single-step endpoint evaluator, so
+    # initialize only this new optional module from the target model.
+    auxiliary_prefix = "lspwm.auxiliary_initializer."
+    for key in target_state:
+        if key.startswith(auxiliary_prefix) and key not in upgraded:
+            upgraded[key] = target_state[key].clone()
+
+    # The physical calibration head is intentionally absent from historical
+    # checkpoints.  Initialize its missing keys from the new model so strict
+    # loading remains possible without reinitializing the frozen latent path.
+    calibration_prefix = "lspwm.world_model.physical_calibration."
+    for key in target_state:
+        if key.startswith(calibration_prefix) and key not in upgraded:
+            upgraded[key] = target_state[key].clone()
+
+    # KDE buffers are runtime state from the buffered DetSkill experiment and
+    # are not part of the canonical LSP-WM model architecture.
+    for key in tuple(upgraded):
+        if key.startswith("lspwm._kde_buffer") and key not in target_state:
+            upgraded.pop(key)
+
     # Handle potential network architecture changes (depth, hidden_dim)
     old_potential_keys = [k for k in upgraded if k.startswith("lspwm.world_model.potential.network.")]
     new_potential_keys = [k for k in target_state if k.startswith("lspwm.world_model.potential.network.")]
@@ -756,6 +778,41 @@ class ProteinJEPA(nn.Module):
                 state_dependent_diffusion_enabled=getattr(config, 'lspwm_state_dependent_diffusion', False),
                 potential_hidden_dim=getattr(config, 'lspwm_potential_hidden_dim', 128),
                 potential_hidden_depth=getattr(config, 'lspwm_potential_hidden_depth', 4),
+                physical_calibration_enabled=getattr(
+                    config, "lspwm_physical_calibration_enabled", False
+                ),
+                physical_mobility_init=getattr(
+                    config, "lspwm_physical_mobility_init", 1.0
+                ),
+                physical_free_energy_init=getattr(
+                    config, "lspwm_physical_free_energy_init", 1.0
+                ),
+                physical_log_scale_min=getattr(
+                    config, "lspwm_physical_log_scale_min", -12.0
+                ),
+                physical_log_scale_max=getattr(
+                    config, "lspwm_physical_log_scale_max", 12.0
+                ),
+                conservative_correction_enabled=getattr(
+                    config, "lspwm_conservative_correction_enabled", False
+                ),
+                conservative_correction_rank=getattr(
+                    config, "lspwm_conservative_correction_rank", 16
+                ),
+                conservative_correction_scale=getattr(
+                    config, "lspwm_conservative_correction_scale", 1.0
+                ),
+                conservative_correction_rescale_with_free_energy=getattr(
+                    config,
+                    "lspwm_conservative_correction_rescale_with_free_energy",
+                    False,
+                ),
+                freeze_base_dynamics=getattr(
+                    config, "lspwm_freeze_base_dynamics", False
+                ),
+                freeze_calibration_scales=getattr(
+                    config, "lspwm_freeze_calibration_scales", False
+                ),
             )
             if config.lspwm_enabled
             else None
@@ -878,6 +935,19 @@ class ProteinJEPA(nn.Module):
             if config.e6_freeze_fixed_cv_dynamics and self.tmjepa is not None:
                 for param in self.tmjepa.parameters():
                     param.requires_grad = False
+        if config.lspwm_freeze_base_dynamics:
+            if self.lspwm is None or not self.lspwm.physical_calibration_enabled:
+                raise ValueError(
+                    "lspwm_freeze_base_dynamics requires an enabled calibration head"
+                )
+            for parameter in self.parameters():
+                parameter.requires_grad = False
+            for parameter in self.lspwm.world_model.physical_calibration.parameters():
+                parameter.requires_grad = True
+            if config.lspwm_freeze_calibration_scales:
+                calibration = self.lspwm.world_model.physical_calibration
+                calibration.log_mobility_scale.requires_grad = False
+                calibration.log_free_energy_scale.requires_grad = False
 
     def train(self, mode: bool = True) -> ProteinJEPA:
         super().train(mode)

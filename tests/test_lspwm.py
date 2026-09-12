@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import torch
 
+from protein_jepa_frame.config import ModelConfig
+from protein_jepa_frame.models.jepa import ProteinJEPA
 from protein_jepa_frame.models.lspwm import (
     ConstantDiffusion,
     GaugeFixedBath,
@@ -9,6 +11,7 @@ from protein_jepa_frame.models.lspwm import (
     LSPWMWorldModel,
     LSPWMProteinWorldModel,
     MeanForcePotential,
+    PhysicalTransitionCalibration,
     FlowMatchObservationModel,
     PoissonOperator,
     DissipationOperator,
@@ -21,6 +24,8 @@ from protein_jepa_frame.models.lspwm import (
     mean_force_matching_loss,
     msm_consistency_loss,
     overdamped_transition_nll,
+    calibrated_overdamped_transition_nll,
+    calibrated_mean_force_matching_loss,
     vamp2_loss,
     asymmetric_cycle_loss,
     local_density_weights,
@@ -66,6 +71,13 @@ def test_kde_mean_force_has_gaussian_score_direction():
     assert torch.allclose(force, expected, atol=0.45, rtol=0.2)
 
 
+def test_adaptive_kde_bandwidth_ignores_exact_self_matches():
+    reference = torch.tensor([[-2.0, 0.0], [-0.5, 0.0], [0.0, 0.0], [2.0, 0.0]])
+    force = kde_mean_force(reference[:3], reference, bandwidth=0.0)
+    assert torch.isfinite(force).all()
+    assert torch.linalg.vector_norm(force, dim=-1).sum() > 1.0e-4
+
+
 def test_scalar_potential_force_matching_is_differentiable():
     torch.manual_seed(4)
     potential = MeanForcePotential(2, condition_dim=1, hidden_dim=16)
@@ -106,6 +118,190 @@ def test_overdamped_transition_nll_is_finite_and_trainable():
     loss.backward()
     assert torch.isfinite(loss)
     assert any(parameter.grad is not None for parameter in model.parameters())
+
+
+def test_calibrated_transition_preserves_fdt_and_is_trainable():
+    torch.manual_seed(17)
+    model = LSPWMWorldModel(
+        LSPWMConfig(
+            state_dim=3,
+            condition_dim=2,
+            auxiliary_dim=1,
+            relaxation_times_ps=(2.0,),
+            diffusion_scale=1.0e-2,
+            physical_calibration_enabled=True,
+            physical_mobility_init=0.25,
+            physical_free_energy_init=4.0,
+            conservative_correction_enabled=True,
+            conservative_correction_rank=2,
+        )
+    )
+    q = torch.randn(6, 3)
+    condition = torch.randn(6, 2)
+    target = q + 0.01 * torch.randn_like(q)
+    loss = calibrated_overdamped_transition_nll(
+        model, q, target, condition, 0.1
+    )
+    loss.backward()
+    calibration = model.physical_calibration
+    assert torch.isfinite(loss)
+    assert torch.allclose(
+        calibration.mobility_scale, torch.tensor(0.25), atol=1.0e-6
+    )
+    assert torch.allclose(
+        calibration.free_energy_scale, torch.tensor(4.0), atol=1.0e-6
+    )
+    assert calibration.log_mobility_scale.grad is not None
+    assert calibration.log_free_energy_scale.grad is not None
+    assert calibration.conservative_correction.bias.grad is not None
+    parameters = model.calibrated_transition(
+        q,
+        condition,
+        0.1,
+    )
+    base_diffusion = model.diffusion(
+        q.shape[0], reference=q
+    )
+    assert torch.allclose(
+        parameters["diffusion"],
+        0.25 * base_diffusion,
+        atol=1.0e-6,
+    )
+
+
+def test_conservative_correction_is_zero_at_initialization():
+    correction = PhysicalTransitionCalibration(
+        state_dim=4,
+        condition_dim=3,
+        enabled=True,
+        conservative_enabled=True,
+        conservative_rank=2,
+    )
+    q = torch.randn(5, 4)
+    condition = torch.randn(5, 3)
+    energy = correction.conservative_correction(q, condition)
+    gradient = correction.correction_gradient(q, condition)
+    assert torch.allclose(energy, torch.zeros_like(energy))
+    assert torch.allclose(gradient, torch.zeros_like(gradient))
+
+
+def test_calibrated_force_matching_uses_total_conservative_force():
+    torch.manual_seed(19)
+    model = LSPWMWorldModel(
+        LSPWMConfig(
+            state_dim=3,
+            condition_dim=2,
+            auxiliary_dim=1,
+            relaxation_times_ps=(2.0,),
+            physical_calibration_enabled=True,
+            physical_mobility_init=0.5,
+            physical_free_energy_init=3.0,
+            conservative_correction_enabled=True,
+            conservative_correction_rank=2,
+        )
+    )
+    with torch.no_grad():
+        model.physical_calibration.conservative_correction.bias.fill_(0.2)
+    q = torch.randn(5, 3)
+    condition = torch.randn(5, 2)
+    target = torch.randn(5, 3)
+    force = model.calibrated_mean_force(q, condition, 348.0, create_graph=True)
+    loss = calibrated_mean_force_matching_loss(
+        model, q, target, condition, 348.0
+    )
+    loss.backward()
+    assert torch.isfinite(force).all()
+    assert torch.isfinite(loss)
+    assert model.physical_calibration.conservative_correction.bias.grad is not None
+
+
+def test_conservative_correction_can_share_free_energy_scale():
+    torch.manual_seed(23)
+    model = LSPWMWorldModel(
+        LSPWMConfig(
+            state_dim=3,
+            condition_dim=2,
+            auxiliary_dim=1,
+            relaxation_times_ps=(2.0,),
+            physical_calibration_enabled=True,
+            physical_mobility_init=0.5,
+            physical_free_energy_init=3.0,
+            conservative_correction_enabled=True,
+            conservative_correction_rank=2,
+            conservative_correction_rescale_with_free_energy=True,
+        )
+    )
+    with torch.no_grad():
+        model.physical_calibration.conservative_correction.bias.fill_(0.2)
+    q = torch.randn(5, 3)
+    condition = torch.randn(5, 2)
+    base_force = model.potential.mean_force(
+        q, condition, 348.0, create_graph=True
+    )
+    correction_gradient = model.physical_calibration.correction_gradient(
+        q, condition, create_graph=True
+    )
+    expected = model.physical_calibration.free_energy_scale * (
+        base_force - correction_gradient
+    )
+    actual = model.calibrated_mean_force(
+        q, condition, 348.0, create_graph=True
+    )
+    assert torch.allclose(actual, expected, atol=1.0e-6, rtol=1.0e-6)
+
+
+def test_force_field_stage_can_freeze_validated_calibration_scales():
+    model = LSPWMProteinWorldModel(
+        latent_dim=4,
+        learned_cv_dim=4,
+        num_segments=3,
+        condition_dim=8,
+        auxiliary_dim=1,
+        relaxation_times_ps=(2.0,),
+        physical_calibration_enabled=True,
+        conservative_correction_enabled=True,
+        freeze_base_dynamics=True,
+        freeze_calibration_scales=True,
+    )
+    calibration = model.world_model.physical_calibration
+    assert not calibration.log_mobility_scale.requires_grad
+    assert not calibration.log_free_energy_scale.requires_grad
+    assert calibration.conservative_correction.bias.requires_grad
+    assert model.calibration_parameters() == list(
+        calibration.conservative_correction.parameters()
+    )
+
+
+def test_proteinjepa_freeze_contract_keeps_calibration_scales_frozen():
+    model = ProteinJEPA(
+        ModelConfig(
+            latent_dim=8,
+            encoder_depth=1,
+            temporal_depth=1,
+            predictor_depth=1,
+            num_heads=1,
+            max_frames=8,
+            paired_forecast=True,
+            temporal_causal=True,
+            lspwm_enabled=True,
+            lspwm_learned_cv_dim=8,
+            lspwm_condition_dim=8,
+            lspwm_koopman_role_dim=2,
+            lspwm_msm_role_dim=2,
+            lspwm_geometric_role_dim=2,
+            lspwm_auxiliary_role_dim=2,
+            lspwm_role_hidden_dim=8,
+            lspwm_physical_calibration_enabled=True,
+            lspwm_conservative_correction_enabled=True,
+            lspwm_conservative_correction_rank=2,
+            lspwm_freeze_base_dynamics=True,
+            lspwm_freeze_calibration_scales=True,
+        )
+    )
+    calibration = model.lspwm.world_model.physical_calibration
+    assert not calibration.log_mobility_scale.requires_grad
+    assert not calibration.log_free_energy_scale.requires_grad
+    assert calibration.conservative_correction.bias.requires_grad
 
 
 def test_koopman_diagnostics_recovers_linear_operator():
