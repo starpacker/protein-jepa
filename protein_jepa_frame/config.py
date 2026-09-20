@@ -309,6 +309,18 @@ class ModelConfig:
     lspwm_freeze_base_dynamics: bool = False
     lspwm_freeze_calibration_scales: bool = False
 
+    # THM-JEPA: reversible (divergence-free) dynamics (v21)
+    lspwm_reversible_dynamics_enabled: bool = False
+    lspwm_reversible_operator_rank: int = 16
+    lspwm_reversible_hidden_dim: int = 128
+    lspwm_reversible_hidden_depth: int = 4
+
+    # LSP-WM v4.4 first-principles architectural extensions
+    # (used by LSPWMConfig via getattr in jepa.py construction)
+    lspwm_midpoint_integration: bool = False
+    lspwm_rollout_trajectory_steps: int = 0
+    lspwm_semigroup_consistency_weight: float = 0.0
+
     # LSP-WM v4.1 curriculum phase switch steps (representation, thermodynamic_identification, dynamics, rollout, observation)
 
     lspwm_curriculum_steps: tuple[int, ...] = (0, 500, 1000, 1500, 2500)

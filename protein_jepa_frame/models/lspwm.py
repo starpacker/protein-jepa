@@ -93,8 +93,8 @@ class MeanForcePotential(nn.Module):
             layers.append(nn.SiLU())
         layers.append(nn.Linear(hidden_dim, 1))
         self.network = nn.Sequential(*layers)
-        nn.init.zeros_(self.network[-1].weight)
-        nn.init.zeros_(self.network[-1].bias)
+        nn.init.normal_(self.network[-1].weight, std=0.01)
+        nn.init.normal_(self.network[-1].bias, std=0.01)
 
     def _condition(self, q: torch.Tensor, condition: torch.Tensor | None) -> torch.Tensor:
         if self.condition_dim == 0:
@@ -145,6 +145,144 @@ class MeanForcePotential(nn.Module):
                 retain_graph=create_graph,
             )[0]
         return -gradient
+
+
+class ReversiblePotential(nn.Module):
+    """A scalar Helmholtz potential H(q) for the reversible (divergence-free) drift.
+
+    This is the ``H`` in the term ``J ∇H`` that generates rotational/
+    divergence-free dynamics.  ``H`` has its own independent network and is
+    zero-initialized so the model starts at pure overdamped dynamics, and the
+    optimizer must learn a non-trivial H to improve the path likelihood.
+
+    ``ReversiblePotential`` uses the same architecture as ``MeanForcePotential``
+    but is a separate instance so the reversible free-energy landscape is
+    parameterized independently from the dissipative one.
+    """
+
+    def __init__(
+        self,
+        state_dim: int,
+        condition_dim: int = 0,
+        hidden_dim: int = 128,
+        hidden_depth: int = 2,
+        reference_temperature_k: float = 348.0,
+    ) -> None:
+        super().__init__()
+        if state_dim < 1 or condition_dim < 0 or hidden_dim < 4 or reference_temperature_k <= 0.0:
+            raise ValueError("invalid reversible potential dimensions")
+        if hidden_depth < 1:
+            raise ValueError("hidden_depth must be at least 1")
+        self.state_dim = int(state_dim)
+        self.condition_dim = int(condition_dim)
+        self.reference_temperature_k = float(reference_temperature_k)
+        input_dim = self.state_dim + self.condition_dim + 1
+        layers = []
+        layers.append(nn.Linear(input_dim, hidden_dim))
+        layers.append(nn.SiLU())
+        for _ in range(hidden_depth - 1):
+            layers.append(nn.Linear(hidden_dim, hidden_dim))
+            layers.append(nn.SiLU())
+        layers.append(nn.Linear(hidden_dim, 1))
+        self.network = nn.Sequential(*layers)
+        nn.init.normal_(self.network[-1].weight, std=0.01)
+        nn.init.normal_(self.network[-1].bias, std=0.01)
+
+    def _condition(self, q: torch.Tensor, condition: torch.Tensor | None) -> torch.Tensor:
+        if self.condition_dim == 0:
+            return q.new_zeros(*q.shape[:-1], 0)
+        if condition is None:
+            return q.new_zeros(*q.shape[:-1], self.condition_dim)
+        if condition.shape != (*q.shape[:-1], self.condition_dim):
+            raise ValueError("condition shape does not match the reversible potential")
+        return condition.to(dtype=q.dtype, device=q.device)
+
+    def forward(
+        self,
+        q: torch.Tensor,
+        condition: torch.Tensor | None = None,
+        temperature_k: torch.Tensor | float | None = None,
+    ) -> torch.Tensor:
+        if q.shape[-1] != self.state_dim:
+            raise ValueError("q has the wrong state dimension for the reversible potential")
+        temperature = _as_batch_temperature(
+            temperature_k, q.shape[0], q, self.reference_temperature_k,
+        )
+        temperature_feature = torch.log(
+            temperature / self.reference_temperature_k
+        ).reshape(*q.shape[:-1], 1)
+        return self.network(
+            torch.cat([q, self._condition(q, condition), temperature_feature], dim=-1)
+        ).squeeze(-1)
+
+    def mean_force(
+        self,
+        q: torch.Tensor,
+        condition: torch.Tensor | None = None,
+        temperature_k: torch.Tensor | float | None = None,
+        *,
+        create_graph: bool = False,
+    ) -> torch.Tensor:
+        """Return ``-grad H`` (reversible force)."""
+        with torch.enable_grad():
+            q_leaf = q if q.requires_grad else q.detach().requires_grad_(True)
+            energy = self(q_leaf, condition, temperature_k)
+            gradient = torch.autograd.grad(
+                energy.sum(), q_leaf,
+                create_graph=create_graph, retain_graph=create_graph,
+            )[0]
+        return -gradient
+
+
+class SkewSymmetricOperator(nn.Module):
+    """Low-rank skew-symmetric operator J = P Q^T - Q P^T.
+
+    This generates divergence-free / rotational drift.  In combination with the
+    dissipative operator ``-M ∇F``, the full drift is ``-M ∇F + J ∇H`` where
+    ``J`` is skew-symmetric and ``M`` is symmetric PSD.
+
+    The low-rank parameterization ensures that the operator does not introduce
+    more than ``2 * rank`` effective degrees of freedom, which acts as an
+    implicit regularizer against learning spurious high-frequency rotation.
+    """
+
+    def __init__(self, state_dim: int, rank: int = 16) -> None:
+        super().__init__()
+        if state_dim < 1 or rank < 1 or rank > state_dim:
+            raise ValueError(
+                f"skew operator rank must be between 1 and state_dim ({state_dim}), got {rank}"
+            )
+        self.state_dim = int(state_dim)
+        self.rank = int(rank)
+        # P, Q each [state_dim, rank], zero-init so dynamics starts reversible-free.
+        self.P = nn.Parameter(torch.zeros(state_dim, rank))
+        self.Q = nn.Parameter(torch.zeros(state_dim, rank))
+
+    def forward(self, batch: int | None = None) -> torch.Tensor:
+        """Return the skew-symmetric matrix J = P Q^T - Q P^T.
+
+        Args:
+            batch: if given, return ``[batch, state_dim, state_dim]`` (batched identity).
+
+        Returns:
+            J tensor of shape ``[state_dim, state_dim]`` or ``[batch, state_dim, state_dim]``.
+        """
+        J = self.P @ self.Q.T - self.Q @ self.P.T
+        if batch is not None:
+            J = J.unsqueeze(0).expand(batch, -1, -1)
+        return J
+
+    def apply(self, gradient: torch.Tensor) -> torch.Tensor:
+        """Apply J to a gradient vector ``J @ grad``.
+
+        Args:
+            gradient: ``[batch, state_dim]`` vector.
+
+        Returns:
+            J @ gradient of shape ``[batch, state_dim]``.
+        """
+        J = self.forward(batch=gradient.shape[0])
+        return torch.einsum("bqd,bd->bq", J, gradient)
 
 
 class ConstantDiffusion(nn.Module):
@@ -890,8 +1028,8 @@ class FlowMatchObservationModel(nn.Module):
             input_dim = hidden_dim
         layers.append(nn.Linear(hidden_dim, coord_dim))
         self.network = nn.Sequential(*layers)
-        nn.init.zeros_(self.network[-1].weight)
-        nn.init.zeros_(self.network[-1].bias)
+        nn.init.normal_(self.network[-1].weight, std=0.01)
+        nn.init.normal_(self.network[-1].bias, std=0.01)
 
     def forward(self, z: torch.Tensor) -> torch.Tensor:
         """Decode latent state to observable coordinates."""
@@ -1475,6 +1613,18 @@ class LSPWMConfig:
     sliced_score_matching_enabled: bool = False
     sliced_score_matching_noise: float = 0.05
 
+    # ──────────────────────────────────────────────────────────────
+    # v21 THM-JEPA: reversible (divergence-free) dynamics
+    # ──────────────────────────────────────────────────────────────
+
+    # When enabled, adds ``+ J ∇H`` to the q-drift where J is a learned
+    # skew-symmetric operator and H is a separate ``ReversiblePotential``.
+    # The dissipative drift becomes ``-M ∇F + J ∇H`` (instead of only ``-M ∇F``).
+    reversible_dynamics_enabled: bool = False
+    reversible_operator_rank: int = 16
+    reversible_hidden_dim: int = 128
+    reversible_hidden_depth: int = 4
+
 
 class LSPWMWorldModel(nn.Module):
     """Canonical passive Markovian Mori embedding.
@@ -1536,6 +1686,22 @@ class LSPWMWorldModel(nn.Module):
             relaxation_times_ps=config.relaxation_times_ps,
             coupling_scale=config.coupling_scale,
         )
+        # v21 THM-JEPA: reversible (divergence-free) dynamics
+        if config.reversible_dynamics_enabled:
+            self.reversible_potential = ReversiblePotential(
+                config.state_dim,
+                config.condition_dim,
+                hidden_dim=config.reversible_hidden_dim,
+                hidden_depth=config.reversible_hidden_depth,
+                reference_temperature_k=config.reference_temperature_k,
+            )
+            self.skew_operator = SkewSymmetricOperator(
+                config.state_dim,
+                rank=config.reversible_operator_rank,
+            )
+        else:
+            self.reversible_potential = None
+            self.skew_operator = None
         self.history_closure = (
             ProjectedForceClosure(
                 config.state_dim,
@@ -1750,6 +1916,13 @@ class LSPWMWorldModel(nn.Module):
         q_drift = q_drift + torch.einsum(
             "bqa,ba->bq", coupling.expand(q.shape[0], -1, -1), auxiliary
         )
+        # THM-JEPA: add reversible (divergence-free) drift J∇H
+        if self.skew_operator is not None:
+            reversible_gradient = self.reversible_potential.mean_force(
+                q, condition, temperature, create_graph=self.training,
+            )
+            reversible_drift = self.skew_operator.apply(reversible_gradient)
+            q_drift = q_drift + reversible_drift
         auxiliary_drift = -auxiliary * rates.unsqueeze(0)
         auxiliary_drift = auxiliary_drift - torch.einsum(
             "bqa,bq->ba",
@@ -1779,6 +1952,13 @@ class LSPWMWorldModel(nn.Module):
                 "use a validated memory state instead"
             )
         next_auxiliary = auxiliary + auxiliary_drift * dt[:, None] + auxiliary_noise
+
+        # Collect reversible diagnostics if enabled
+        reversible_info = {}
+        if self.skew_operator is not None:
+            reversible_info["reversible_gradient"] = reversible_gradient
+            reversible_info["reversible_drift"] = reversible_drift
+
         return {
             "q": next_q,
             "auxiliary": next_auxiliary,
@@ -1789,6 +1969,7 @@ class LSPWMWorldModel(nn.Module):
             "coupling": coupling,
             "rates": rates,
             "temperature_k": temperature,
+            **reversible_info,
         }
 
     def step_midpoint(
@@ -1860,6 +2041,13 @@ class LSPWMWorldModel(nn.Module):
         q_drift = q_drift + torch.einsum(
             "bqa,ba->bq", coupling.expand(q.shape[0], -1, -1), auxiliary
         )
+        # THM-JEPA: add reversible (divergence-free) drift J∇H at midpoint
+        if self.skew_operator is not None:
+            reversible_gradient = self.reversible_potential.mean_force(
+                q_half, condition, temperature, create_graph=self.training,
+            )
+            reversible_drift = self.skew_operator.apply(reversible_gradient)
+            q_drift = q_drift + reversible_drift
 
         auxiliary_drift = -auxiliary * rates.unsqueeze(0)
         auxiliary_drift = auxiliary_drift - torch.einsum(
@@ -1889,6 +2077,12 @@ class LSPWMWorldModel(nn.Module):
                 "use a validated memory state instead"
             )
 
+        # Collect reversible diagnostics if enabled
+        reversible_info = {}
+        if self.skew_operator is not None:
+            reversible_info["reversible_gradient"] = reversible_gradient
+            reversible_info["reversible_drift"] = reversible_drift
+
         return {
             "q": next_q,
             "auxiliary": next_auxiliary,
@@ -1899,6 +2093,7 @@ class LSPWMWorldModel(nn.Module):
             "coupling": coupling,
             "rates": rates,
             "temperature_k": temperature,
+            **reversible_info,
         }
 
     def rollout(
@@ -2362,6 +2557,15 @@ class LSPWMProteinWorldModel(nn.Module):
         conservative_correction_rescale_with_free_energy: bool = False,
         freeze_base_dynamics: bool = False,
         freeze_calibration_scales: bool = False,
+        # Rollout / curriculum (v4.4)
+        rollout_trajectory_steps: int = 0,
+        semigroup_consistency_weight: float = 0.0,
+        midpoint_integration: bool = False,
+        # THM-JEPA: reversible (divergence-free) dynamics
+        reversible_dynamics_enabled: bool = False,
+        reversible_operator_rank: int = 16,
+        reversible_hidden_dim: int = 128,
+        reversible_hidden_depth: int = 4,
     ) -> None:
         super().__init__()
         if latent_dim < 1 or learned_cv_dim < 1:
@@ -2450,9 +2654,13 @@ class LSPWMProteinWorldModel(nn.Module):
                 conservative_correction_rescale_with_free_energy=(
                     conservative_correction_rescale_with_free_energy
                 ),
-                midpoint_integration=False,      # Rev-1: configurable per experiment
-                rollout_trajectory_steps=0,      # Rev-2: set >0 to enable
-                semigroup_consistency_weight=0.0, # Rev-4: set >0 to enable
+                midpoint_integration=midpoint_integration, # Rev-1: BAOAB path
+                rollout_trajectory_steps=rollout_trajectory_steps, # Rev-2: multi-step NLL
+                semigroup_consistency_weight=semigroup_consistency_weight, # Rev-4
+                reversible_dynamics_enabled=reversible_dynamics_enabled,
+                reversible_operator_rank=reversible_operator_rank,
+                reversible_hidden_dim=reversible_hidden_dim,
+                reversible_hidden_depth=reversible_hidden_depth,
             )
         )
         if self.freeze_base_dynamics:
@@ -2868,6 +3076,64 @@ class LSPWMProteinWorldModel(nn.Module):
 
         # Record which phase is active
         outputs["lspwm_active_phase"] = phase
+
+        # ── v21 THM-JEPA: reversible force diagnostics ──
+        # When reversible dynamics are enabled, decompose the total drift into its
+        # three components and report their magnitudes and cosine alignment with
+        # the observed increment.  This lets us watch the reversible force
+        # emerge from zero during training.
+        if (phase not in ("representation",)
+                and self.world_model.skew_operator is not None
+                and current.shape[0] >= 2):
+            extra_aux = current.new_zeros(
+                current.shape[0], self.world_model.config.auxiliary_dim
+            )
+            dt_ps = horizon_time_ps
+            with torch.no_grad():
+                coeffs = self.world_model.coefficients(current, temperature)
+                diffusion = coeffs["diffusion"]
+                coupling = coeffs["coupling"]
+                _grad = -self.world_model.potential.mean_force(
+                    current, condition, temperature, create_graph=False,
+                )
+                dissipative_drift = -torch.einsum("bij,bj->bi", diffusion, _grad)
+                bath_drift = torch.einsum(
+                    "bqa,ba->bq",
+                    coupling.expand(current.shape[0], -1, -1),
+                    extra_aux,
+                )
+                rev_grad = self.world_model.reversible_potential.mean_force(
+                    current, condition, temperature, create_graph=False,
+                )
+                reversible_drift = self.world_model.skew_operator.apply(rev_grad)
+                total_drift = dissipative_drift + bath_drift + reversible_drift
+
+                # Observed increment
+                observed_incr = target - current  # [batch, d]
+
+                outputs["lspwm_dissipative_force_norm"] = (
+                    dissipative_drift.norm(dim=-1).mean().detach()
+                )
+                outputs["lspwm_reversible_force_norm"] = (
+                    reversible_drift.norm(dim=-1).mean().detach()
+                )
+                outputs["lspwm_bath_drift_norm"] = (
+                    bath_drift.norm(dim=-1).mean().detach()
+                )
+                outputs["lspwm_total_drift_norm"] = (
+                    total_drift.norm(dim=-1).mean().detach()
+                )
+                # Cosine similarity between total force drift and observed increment
+                num = (total_drift * observed_incr).sum(dim=-1)
+                den = total_drift.norm(dim=-1) * observed_incr.norm(dim=-1).clamp(min=1e-8)
+                outputs["lspwm_drift_incr_cosine"] = (
+                    (num / den).mean().detach()
+                )
+                # Reversible fraction of total drift magnitude
+                total_mag = total_drift.norm(dim=-1).clamp(min=1e-8)
+                outputs["lspwm_reversible_drift_fraction"] = (
+                    (reversible_drift.norm(dim=-1) / total_mag).mean().detach()
+                )
 
         return outputs
 

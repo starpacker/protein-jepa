@@ -953,6 +953,19 @@ def train_paired(config: TrainConfig) -> Path:
                 "lspwm_deterministic_skill", terms["delta_loss"].new_zeros(())
             )
             lspwm_active_phase = outputs.get("lspwm_active_phase", "unknown")
+            # v21 THM-JEPA reversible diagnostics
+            lspwm_dissipative_force_norm = outputs.get(
+                "lspwm_dissipative_force_norm", None
+            )
+            lspwm_reversible_force_norm = outputs.get(
+                "lspwm_reversible_force_norm", None
+            )
+            lspwm_bath_drift_norm = outputs.get("lspwm_bath_drift_norm", None)
+            lspwm_total_drift_norm = outputs.get("lspwm_total_drift_norm", None)
+            lspwm_drift_incr_cosine = outputs.get("lspwm_drift_incr_cosine", None)
+            lspwm_reversible_drift_fraction = outputs.get(
+                "lspwm_reversible_drift_fraction", None
+            )
             # Phase-gated weights: five canonical curriculum phases (Ch.7.2)
             lspwm_phase_koopman_weight = 1.0
             lspwm_phase_force_weight = 0.0
@@ -1357,6 +1370,31 @@ def train_paired(config: TrainConfig) -> Path:
                     "lspwm_endpoint_energy_skill": float(lspwm_endpoint_energy_skill.detach().cpu()),
                     "lspwm_deterministic_skill": float(lspwm_deterministic_skill.detach().cpu()),
                     "lspwm_active_phase": lspwm_active_phase,
+                    # v21 THM-JEPA reversible diagnostics
+                    "lspwm_dissipative_force_norm": (
+                        float(lspwm_dissipative_force_norm.detach().cpu())
+                        if lspwm_dissipative_force_norm is not None else 0.0
+                    ),
+                    "lspwm_reversible_force_norm": (
+                        float(lspwm_reversible_force_norm.detach().cpu())
+                        if lspwm_reversible_force_norm is not None else 0.0
+                    ),
+                    "lspwm_bath_drift_norm": (
+                        float(lspwm_bath_drift_norm.detach().cpu())
+                        if lspwm_bath_drift_norm is not None else 0.0
+                    ),
+                    "lspwm_total_drift_norm": (
+                        float(lspwm_total_drift_norm.detach().cpu())
+                        if lspwm_total_drift_norm is not None else 0.0
+                    ),
+                    "lspwm_drift_incr_cosine": (
+                        float(lspwm_drift_incr_cosine.detach().cpu())
+                        if lspwm_drift_incr_cosine is not None else 0.0
+                    ),
+                    "lspwm_reversible_drift_fraction": (
+                        float(lspwm_reversible_drift_fraction.detach().cpu())
+                        if lspwm_reversible_drift_fraction is not None else 0.0
+                    ),
                     "lspwm_physical_mobility_scale": float(
                         outputs.get(
                             "lspwm_physical_mobility_scale",

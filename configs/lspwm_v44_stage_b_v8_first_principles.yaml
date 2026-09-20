@@ -1,0 +1,163 @@
+# LSP-WM v4.4 Stage B v8: First-principles force fix + curriculum trajectory
+#
+# Two changes from v7:
+#   1. KDE mean force normalised to unit L2 norm (removes bandwidth-induced
+#      magnitude artefact — KDE bandwidth is a statistical hyperparameter,
+#      not a physical quantity).  Directional cosine loss replaces Huber.
+#   2. Curriculum on rollout_trajectory_steps: intra-phase smooth ramp
+#      4→6 steps in dynamics, 6→8 in rollout, 8 in observation.
+#      Critical: bath memory kernel C·e^{-Γt}·C^T needs ≥4 steps for
+#      gradient signal — 2 steps was too short to train bath parameters.
+#
+# Changes from v7 (config):
+#   1. epochs: 8 → 3 (3000 steps — aggressive DDL)
+#   2. curriculum_steps: [0,2000,4000,6000,8000] → [0,200,700,1200,1700,3000]
+#   3. lspwm_rollout_trajectory_steps: 12 → 8
+#   4. seed: 6447 → 6448
+#
+seed: 6448
+device: cuda:0
+output_dir: /liuyutian/protein_jepa_frame/artifacts/lspwm_v44_stage_b_v8_first_principles
+init_checkpoint: /liuyutian/protein_jepa_frame/artifacts/lspwm_v44_stage_a_representation/checkpoint_latest.pt
+init_exclude_prefixes:
+  - "lspwm.world_model.diffusion."
+  - "lspwm.world_model.bath."
+strict_init: false
+sync_target_after_init: false
+log_every: 10
+save_every: 1
+checkpoint_every_steps: 100
+
+data:
+  manifest_path: /liuyutian/protein_jepa_frame/manifests/tmjepa_v3.train.jsonl
+  batch_size: 8
+  num_workers: 2
+  num_frames: 24
+  frame_stride: 1
+  window_stride: 8
+  max_residues: 384
+  sampling_mode: hierarchical
+  training_mode: paired_window
+  paired_horizons_frames: [24, 48, 96]
+  paired_nonoverlap_only: true
+  paired_all_horizons: true
+
+model:
+  latent_dim: 256
+  encoder_depth: 2
+  temporal_depth: 2
+  predictor_depth: 3
+  state_predictor_depth: 3
+  frame_pooling: kinetic_query
+  frame_pool_queries: 4
+  lag_predictor_depth: 3
+  time_conditioning: physical
+  thermodynamic_conditioning: false
+  orientation_features: true
+  temporal_causal: true
+  temporal_causal_window: 4
+  temporal_position_encoding: none
+  temporal_delta_features: false
+  motion_depth: 0
+  transition_source: state
+  num_heads: 8
+  num_rbf: 16
+  dropout: 0.0
+  max_frames: 256
+  max_residues: 4096
+  feature_norm: true
+  paired_forecast: true
+  paired_predictor_depth: 3
+  freeze_context_encoder: true
+  freeze_temporal_encoder: true
+  freeze_target_encoders: true
+  tmjepa_enabled: false
+
+  # LSP-WM core
+  lspwm_enabled: true
+  lspwm_num_segments: 3
+  lspwm_learned_cv_dim: 256
+  lspwm_condition_dim: 64
+  lspwm_auxiliary_dim: 4
+  lspwm_koopman_role_dim: 64
+  lspwm_msm_role_dim: 32
+  lspwm_geometric_role_dim: 96
+  lspwm_auxiliary_role_dim: 64
+  lspwm_role_hidden_dim: 256
+  lspwm_reference_temperature_k: 348.0
+  lspwm_diffusion_scale: 8.0e-4
+  lspwm_coupling_scale: 0.3
+  lspwm_memory_times_ps: [4000.0, 16000.0, 64000.0, 128000.0]
+  lspwm_mean_force_bandwidth: 0.0     # Adaptive bandwidth (now normalised to unit L2)
+  lspwm_observation_model: false
+  lspwm_history_closure_enabled: false
+
+  # Architectural revisions (v4.4+)
+  lspwm_midpoint_integration: true
+  lspwm_rollout_trajectory_steps: 8    # Full capacity; curriculum ramps 4→6→8 within phases
+  lspwm_semigroup_consistency_weight: 0.05
+
+  lspwm_rollout_enabled: false
+  lspwm_dynamic_nll_enabled: true
+  lspwm_force_loss_enabled: true
+  lspwm_state_dependent_diffusion: true
+  lspwm_freeze_learned_projection: true
+
+  # Potential architecture
+  lspwm_potential_hidden_dim: 128
+  lspwm_potential_hidden_depth: 2
+
+  # Curriculum: 3 epochs = 3000 steps (aggressive — DDL today)
+  #   [0, 200, 700, 1200, 1700, 3000]
+  #   0-199:     representation (VAMP-2 only — fast, just shapes rep)
+  #   200-699:   thermodynamic_identification (cosine force loss converges fast)
+  #   700-1199:  dynamics (traj_nll ramps 4→6 steps — intra-phase warmup)
+  #   1200-1699: rollout (traj_nll ramps 6→8 steps)
+  #   1700-2999: observation (traj_nll with 8 steps — full capacity)
+  lspwm_curriculum_steps: [0, 200, 700, 1200, 1700, 3000]
+
+  # CV normalization (same as Stage A)
+  lspwm_cv_mean: [0.5808744431, 1.0378025770, -3.5378422730, -1.6780833006, 0.3800410033, -2.7798459530, 0.3983616233, -2.7939324379, 0.3888407946, -2.7732858658, 0.4555905461, 0.3484444022, 1.0433561802, -0.0431454852, -0.0774244592, -0.2054995447]
+  lspwm_cv_scale: [0.0796646103, 0.5420896411, 0.1517379731, 0.3564364311, 0.1541653872, 0.2375139445, 0.1466855109, 0.2658485472, 0.1382870525, 0.2666960061, 0.3291336298, 0.4681170881, 0.1254781187, 0.0886877403, 0.1492052078, 0.2059004903]
+
+optimization:
+  epochs: 3                        # 3000 total steps — aggressive curriculum
+  steps_per_epoch: 1000
+  lr: 1.0e-5
+  encoder_lr_scale: 0.0
+  weight_decay: 1.0e-4
+  warmup_steps: 100
+  ema_start: 0.996
+  ema_end: 0.999
+  grad_clip: 5.0
+  precision: float32
+
+  # Paired prediction weights (reduced — let LSP-WM losses dominate)
+  paired_delta_weight: 0.001
+  paired_state_weight: 0.0
+  paired_relative_delta_weight: 0.0
+  paired_endpoint_variance_weight: 0.0
+
+  # LSP-WM loss weights
+  lspwm_dynamic_weight: 0.1
+  lspwm_force_weight: 0.1
+  lspwm_koopman_weight: 0.05
+  lspwm_msm_weight: 0.0
+  lspwm_sequence_vamp_weight: 0.0
+  lspwm_sequence_vamp_lag: 1
+  lspwm_geometric_weight: 0.0
+  lspwm_auxiliary_weight: 0.0
+  lspwm_observation_weight: 0.0
+
+  # Rev-2/4 loss weights
+  lspwm_trajectory_weight: 0.5
+  lspwm_semigroup_weight: 0.05
+
+  # Rollout weights (disabled; trajectory NLL replaces them)
+  lspwm_rollout_energy_weight: 0.0
+  lspwm_rollout_endpoint_weight: 0.0
+  lspwm_rollout_gaussian_nll_weight: 0.0
+  lspwm_rollout_distribution_weight: 0.0
+  lspwm_rollout_koopman_weight: 0.0
+  lspwm_rollout_force_weight: 0.0
+  lspwm_rollout_trajectory_nll_weight: 0.0

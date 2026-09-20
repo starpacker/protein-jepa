@@ -223,9 +223,9 @@ class ProteinJEPA(nn.Module):
             raise ValueError("LSP-WM and TM-JEPA branches are mutually exclusive")
         if config.lspwm_enabled and (config.temporal_depth <= 0 or not config.temporal_causal):
             raise ValueError("LSP-WM requires a causal temporal encoder")
-        if config.lspwm_enabled and config.lspwm_learned_cv_dim != config.latent_dim:
+        if config.lspwm_enabled and config.lspwm_learned_cv_dim > config.latent_dim:
             raise ValueError(
-                "LSP-WM unified state dimension must equal the JEPA latent_dim"
+                "LSP-WM learned CV dimension cannot exceed JEPA latent_dim"
             )
         if config.lspwm_enabled and len(config.lspwm_memory_times_ps) != config.lspwm_auxiliary_dim:
             raise ValueError("LSP-WM memory times must match auxiliary_dim")
@@ -812,6 +812,27 @@ class ProteinJEPA(nn.Module):
                 ),
                 freeze_calibration_scales=getattr(
                     config, "lspwm_freeze_calibration_scales", False
+                ),
+                rollout_trajectory_steps=getattr(
+                    config, "lspwm_rollout_trajectory_steps", 0
+                ),
+                semigroup_consistency_weight=getattr(
+                    config, "lspwm_semigroup_consistency_weight", 0.0
+                ),
+                midpoint_integration=getattr(
+                    config, "lspwm_midpoint_integration", False
+                ),
+                reversible_dynamics_enabled=getattr(
+                    config, "lspwm_reversible_dynamics_enabled", False
+                ),
+                reversible_operator_rank=getattr(
+                    config, "lspwm_reversible_operator_rank", 16
+                ),
+                reversible_hidden_dim=getattr(
+                    config, "lspwm_reversible_hidden_dim", 128
+                ),
+                reversible_hidden_depth=getattr(
+                    config, "lspwm_reversible_hidden_depth", 4
                 ),
             )
             if config.lspwm_enabled
