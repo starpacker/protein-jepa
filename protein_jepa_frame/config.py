@@ -46,6 +46,33 @@ class MaskConfig:
 
 @dataclass
 class ModelConfig:
+    model_type: str = ""  # "stage_b" for Stage B training, "" for ProteinJEPA
+    q_dim: int = 8         # canonical per-residue Stage-B/Stage-C dynamics width
+    anchor_noise_level: float = 0.0
+    q_weight_ramp_start: int = 0
+    q_weight_ramp_steps: int = 0
+    reference_temperature_k: float = 348.0
+    # Stage-C decoder options retained in the typed config so experimental
+    # configs fail only on genuine protocol errors.
+    context_dim: int = 128
+    decoder_c_hidden: int = 128
+    decoder_ipa_dim: int = 64
+    decoder_ipa_blocks: int = 4
+    decoder_torsion_bins: int = 36
+    decoder_dropout: float = 0.1
+    # Hard bounds for anchor-relative Stage-C coordinate updates.
+    decoder_max_translation_update: float = 0.5
+    decoder_max_com_update: float = 4.0
+    decoder_max_q_translation_update: float = 2.0
+    # Stage-C controlled end-to-end fine-tuning.  The default preserves the
+    # canonical frozen-AB protocol; experiments can selectively adapt the
+    # representation without unfreezing Stage-B transition/dynamics heads.
+    stage_c_finetune_spatial_encoder: bool = False
+    stage_c_finetune_temporal_encoder: bool = False
+    # Phase-1 Q-only warmup: disable the H/IPA translation shortcut for this
+    # many global steps, then switch to the joint H+Q decoder in Phase 2.
+    stage_c_q_only_steps: int = 0
+    max_seq_len: int = 500
     latent_dim: int = 128
     encoder_depth: int = 4
     temporal_depth: int = 0
@@ -84,6 +111,21 @@ class ModelConfig:
     feature_norm: bool = True
     paired_forecast: bool = False
     paired_predictor_depth: int = 3
+    # ── OPF: Orthogonal Predictive Factorization of the Stage-A JEPA target ──
+    # Factorizes the paired delta_target into K orthogonal subspaces, each with a
+    # dedicated head, and synthesizes a complete state via pseudoinverse (JEPA-Anything).
+    # opf_factor_count == 1 is the matched single-head baseline (exact current behavior).
+    opf_enabled: bool = False
+    opf_factor_count: int = 4
+    opf_shared_trunk: bool = True       # shared trunk + K branch heads (parameter-matched)
+    opf_predictor_depth: int = 2
+    opf_activity_gamma: float = 0.01    # per-factor coordinate std floor (L_fac), data-calibrated
+    opf_encoder_activity_gamma: float = 0.01  # online context state std floor (L_enc)
+    opf_qr_retraction: bool = True      # QR-retract the full basis after each optimizer step
+                                        # (exact Prop-1 geometry at every computed step; the
+                                        # official repo defaults to soft-Gram + audit, but for
+                                        # short Stage-A abulations the exact retraction is the
+                                        # cleanest way to guarantee kappa2=1)
     learned_state_training: bool = False
     slow_state_enabled: bool = False
     slow_state_dim: int = 32
@@ -180,6 +222,15 @@ class ModelConfig:
     v53_multi_scale_history_enabled: bool = False
     v53_slow_history_stride: int = 2
     v53_autonomous_rollout_enabled: bool = False
+    # Gate 1: coordinate-derived dynamic state encoder
+    use_dynamic_encoder: bool = True
+    dynamic_encoder_depth: int = 2
+    dynamic_k_nearest: int = 8
+    dynamic_use_displacement: bool = True
+    dynamic_use_pair_distance: bool = True
+    dynamic_use_torsion: bool = True
+    dynamic_use_dt_conditioning: bool = True
+    dynamic_fusion: str = "add"  # "add" | "gate" | "replace"
     v53_horizon_calibration_enabled: bool = False
     v53_horizon_calibration_scale: float = 0.5
     v53_frame_local_target_enabled: bool = False
@@ -284,6 +335,7 @@ class ModelConfig:
     # LSP-WM v4.1 rollout self-consistency
     lspwm_rollout_enabled: bool = False
     lspwm_rollout_steps: int = 4
+    lspwm_base_step_ps: float = 100.0
     lspwm_rollout_warmup_steps: int = 0
     lspwm_rollout_ensemble_size: int = 4
     lspwm_rollout_intermediate_supervision: bool = True
@@ -318,6 +370,36 @@ class ModelConfig:
     # LSP-WM v4.4 first-principles architectural extensions
     # (used by LSPWMConfig via getattr in jepa.py construction)
     lspwm_midpoint_integration: bool = False
+    # LSP-WM v28 per-residue dynamics (architecture flags)
+    lspwm_per_residue_enabled: bool = False
+    lspwm_per_residue_warmup_steps: int = 2000  # V27: delay per-residue training
+    lspwm_use_bath: bool = True  # Gate 2: whether to train with finite bath; set False for no-bath ablation
+    lspwm_history_aware: bool = True  # Gate 2: whether to use temporal encoder for history-aware Q
+    lspwm_residue_cv_dim: int = 8
+    lspwm_residue_gnn_depth: int = 2
+    lspwm_residue_gnn_hidden: int = 64
+    lspwm_sliced_score_enabled: bool = False
+    lspwm_sliced_score_noise: float = 0.05
+    lspwm_force_direction_hinge_margin: float = 0.0
+    lspwm_force_direction_weight: float = 0.0
+    lspwm_sliced_score_projections: int = 4
+
+    # LSP-WM v22: Hierarchical world model with explicit energy graph
+    lspwm_single_frame_state: bool = False
+    lspwm_energy_graph_enabled: bool = False
+    lspwm_energy_graph_num_rbf: int = 8
+    lspwm_energy_graph_hidden_dim: int = 64
+    lspwm_energy_graph_coupling_enabled: bool = False  # A_coupling(Q,G) bridge
+    lspwm_energy_graph_coupling_hidden_dim: int = 64
+    lspwm_gauge_enabled: bool = False
+    lspwm_gauge_dim: int = 6
+    lspwm_bath_timescale_groups: tuple[int, int, int] = (4, 8, 4)  # (fast, mid, slow)
+    lspwm_bath_init_taus_ps: tuple[float, float, float] = (1000.0, 8000.0, 64000.0)
+    lspwm_residue_conditional_enabled: bool = False
+    lspwm_residue_conditional_hidden_dim: int = 128
+    lspwm_stationary_enabled: bool = False
+    lspwm_mori_nll_enabled: bool = False
+
     lspwm_rollout_trajectory_steps: int = 0
     lspwm_semigroup_consistency_weight: float = 0.0
 
@@ -342,12 +424,39 @@ class ModelConfig:
 class OptimizationConfig:
     epochs: int = 10
     steps_per_epoch: int | None = None
+    max_steps: int | None = None  # Override epochs/steps_per_epoch; force-saves at exact step
     lr: float = 3e-4
     encoder_lr_scale: float = 0.2
     weight_decay: float = 0.05
     warmup_steps: int = 500
     ema_start: float = 0.996
     ema_end: float = 1.0
+    gradient_accumulation_steps: int = 1
+    fape_weight: float = 1.0
+    torsion_weight: float = 0.5
+    distance_weight: float = 0.3
+    bond_weight: float = 0.1
+    clash_weight: float = 0.05
+    fape_clamp: float = 10.0
+    q_translation_weight: float = 2.0
+    # Stronger Q supervision during the Q-only warmup phase.
+    q_only_translation_weight: float = 10.0
+    # Scale anchor-relative Q->translation targets before SmoothL1.
+    q_translation_target_scale: float = 4.0
+    # Optional semantic anti-bypass loss: correct Q must fit the displacement
+    # better than a residue-shuffled Q.  Disabled for legacy configs.
+    q_shuffle_weight: float = 0.0
+    q_shuffle_margin: float = 0.0
+    # Stage-C eval-aligned loss weights (basin-reversion training).
+    sc_kabsch_weight: float = 1.0
+    sc_contact_distance_weight: float = 1.0
+    sc_contact_binary_weight: float = 1.0
+    sc_fape_weight: float = 0.2
+    sc_torsion_weight: float = 0.5
+    sc_distance_weight: float = 0.3
+    sc_bond_weight: float = 0.1
+    sc_clash_weight: float = 0.05
+    sc_ca_position_weight: float = 0.05
     grad_clip: float | None = 1.0
     precision: str = "float32"
     auxiliary_warmup_steps: int = 0
@@ -371,6 +480,12 @@ class OptimizationConfig:
     paired_state_weight: float = 0.25
     paired_relative_delta_weight: float = 0.0
     paired_endpoint_variance_weight: float = 0.02
+    # ── OPF loss weights (JEPA-Anything orthogonal predictive factorization) ──
+    opf_pred_weight: float = 1.0         # factor prediction regression (L_pred)
+    opf_orth_weight: float = 0.1         # within+cross factor orthogonality (L_orth)
+    opf_factor_activity_weight: float = 0.05  # keep factor coords active (L_fac)
+    opf_encoder_activity_weight: float = 0.05 # anti-collapse on online encoder (L_enc)
+    opf_lr_scale: float = 10.0           # faster lr for OPF projectors (rotate to orthonormal)
     lspwm_dynamic_weight: float = 0.0
     lspwm_calibrated_dynamic_weight: float = 0.0
     lspwm_calibrated_endpoint_weight: float = 0.0
@@ -393,6 +508,26 @@ class OptimizationConfig:
     lspwm_rollout_koopman_weight: float = 0.0
     lspwm_rollout_force_weight: float = 0.0
     lspwm_rollout_trajectory_nll_weight: float = 0.0
+    lspwm_semigroup_consistency_weight: float = 0.0
+
+    # ── Stage B force-floor regularisation (prevents flat energy landscape) ──
+    force_floor_weight: float = 0.0
+    force_floor_target: float = 0.1
+
+    # LSP-WM v28 per-residue dynamics (weight fields)
+    lspwm_force_direction_weight: float = 0.0
+    lspwm_force_direction_amplitude_weight: float = 0.0
+    lspwm_sliced_score_weight: float = 0.0
+
+    # LSP-WM v22 hierarchical world model (weight fields)
+    lspwm_force_score_G_weight: float = 0.0       # KDE score matching on global G
+    lspwm_force_score_Q_weight: float = 0.0       # sliced score matching on Q_local
+    lspwm_cv_vamp2_weight: float = 0.0            # VAMP-2 on G (Phase 1 gradient)
+    lspwm_mori_nll_weight: float = 0.0            # FDT bath-aware Mori transition NLL
+    lspwm_self_consistency_weight: float = 0.0    # A_g vs φ decomposition
+    lspwm_residue_conditional_weight: float = 0.0 # p(Q_local_{t+1} | Q_local_t, G_t, G_{t+1})
+    lspwm_per_residue_dynamics_weight: float = 0.0 # V25: per-residue transition NLL
+    lspwm_stationary_weight: float = 0.0          # MMD between rollout and MD P(G)
 
     slow_delta_weight: float = 0.5
     slow_state_weight: float = 0.25
@@ -568,6 +703,14 @@ class TrainConfig:
     init_exclude_prefixes: tuple[str, ...] = ()
     sync_target_after_init: bool = False
     resume_checkpoint: str | None = None
+    stage_c_pretrained: str | None = None
+    # Legacy Stage-C warm starts intentionally reset the unused COM shortcut.
+    # Fine-tune experiments can preserve every decoder weight explicitly.
+    stage_c_pretrained_exclude_q_position: bool = True
+    stage_a_checkpoint: str | None = None
+    stage_b_checkpoint: str | None = None
+    temperature_sampling: dict[str, Any] | None = None
+    intervention: dict[str, Any] | None = None
     strict_init: bool = True
     init_copy_temporal_to_offline: bool = False
     log_every: int = 20
@@ -613,6 +756,12 @@ def model_config_from_dict(values: dict[str, Any], state_dict: dict[str, Any] | 
     keys = tuple(state_dict or ())
     if any(key.startswith("paired_delta_predictor.") for key in keys):
         resolved.setdefault("paired_forecast", True)
+    if any(key.startswith("opf_predictor.projectors.") for key in keys):
+        resolved["opf_enabled"] = True
+        # Recover factor count from the number of projector parameters (each P_k).
+        proj_keys = [k for k in (state_dict or {}) if k.startswith("opf_predictor.projectors.")]
+        if proj_keys:
+            resolved["opf_factor_count"] = len(proj_keys)
     if any(key.startswith("slow_state_projector.") for key in keys):
         resolved["slow_state_enabled"] = True
     if any(key.startswith("ls2_reversible_dynamics.") for key in keys):
