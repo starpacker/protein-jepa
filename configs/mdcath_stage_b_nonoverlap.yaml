@@ -1,0 +1,54 @@
+# ═══════════════════════════════════════════════════════════════════════════════
+# STATUS: CANONICAL — Stage B LaSP training with non-overlapping data protocol
+# Depends on: artifacts/mdcath_stage_a_nonoverlap/checkpoint_latest.pt
+# ═══════════════════════════════════════════════════════════════════════════════
+
+output_dir: artifacts/mdcath_stage_b_nonoverlap
+seed: 42
+deterministic: false
+log_every: 50
+save_every: 1
+checkpoint_every_steps: 5000
+device: cuda
+init_checkpoint: artifacts/mdcath_stage_a_nonoverlap/checkpoint_latest.pt
+strict_init: false
+
+data:
+  manifest_path: artifacts/mdcath_manifest_200dom/train.jsonl
+  batch_size: 4
+  num_workers: 2
+  num_frames: 8
+  frame_stride: 4
+  window_stride: 4
+  max_residues: 256
+  coordinate_scale: 1.0
+  training_mode: paired_window
+  paired_horizons_frames: [32, 64, 96]
+  paired_all_horizons: true
+
+model:
+  latent_dim: 128
+  encoder_depth: 4
+  temporal_depth: 2
+  predictor_depth: 4
+  num_heads: 4
+  num_rbf: 16
+  max_frames: 128
+  max_residues: 256
+  dropout: 0.1
+  feature_norm: true
+  time_conditioning: "physical"
+  thermodynamic_conditioning: true
+  lspwm_use_bath: true
+  lspwm_history_aware: true
+
+optimization:
+  lr: 1.0e-4
+  epochs: 30
+  warmup_steps: 500
+  weight_decay: 0.01
+  grad_clip: 1.0
+  steps_per_epoch: 300
+  lagged_state_jepa_weight: 1.0
+  state_jepa_weight: 0.05
+  variance_reg: 0.01

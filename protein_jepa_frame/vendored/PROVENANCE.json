@@ -1,0 +1,20 @@
+{
+  "package": "openfold",
+  "origin": "https://github.com/aqlaboratory/openfold",
+  "license": "Apache-2.0",
+  "vendored_via": "PyPI sdist openfold-0.0.1.tar.gz (pure-Python package tree)",
+  "source_tarball_sha256": "d709aa2647b9e15fd4da42dfc3dbe9fc7310c42bc01bd0b4f5600eb39edef8f8",
+  "vendored_tree_sha256": "0c28bb247f2360e1283c333a71d72675aa9ee52250f1c96a59c54f9cb9113bd6",
+  "extra_data": {
+    "resources/stereo_chemical_props.txt": {
+      "source": "https://git.scicore.unibas.ch/schwede/openstructure/-/raw/7102c63615b64735c4941278d92b554ec94415f8/modules/mol/alg/src/stereo_chemical_props.txt",
+      "sha256": "24510899eeb49167cffedec8fa45363a4d08279c0c637a403b452f7d0ac09451",
+      "note": "OpenFold package_data file; fetched from the upstream URL referenced by openfold/scripts/install_third_party_dependencies.sh"
+    }
+  },
+  "rationale": "Stage C frame -> atom37 reconstruction and evaluation must reuse official OpenFold geometry (torsion_angles_to_frames, frames_and_literature_positions_to_atom14_pos, atom14_to_atom37, protein.to_pdb) instead of any hand-written geometry.",
+  "used_by": [
+    "protein_jepa_frame/models/stage_c/openfold_atom37.py",
+    "protein_jepa_frame/eval/stage_c_evaluator.py"
+  ]
+}

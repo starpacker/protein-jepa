@@ -1,0 +1,85 @@
+# P5-P7: Stage C retraining with Q-dependent decoder
+#
+# Key insight from P0.3 audit: decoder is an anchor refinement autoencoder.
+# aatype + anchor frames → 2.19Å RMSD without Q or H.
+# Solution: train with Q as a PRIMARY input, not optional decoration.
+#
+# Architecture changes:
+# 1. Q injected into EVERY IPA block, not just pooled global offset
+# 2. Q-dim increased to 16 (up from 8) for richer dynamics signal
+# 3. Anchor precision reduced (add noise to anchors) to force Q reliance
+# 4. Two-phase training: (a) anchor-only warmup, (b) full Q-conditioned
+
+output_dir: artifacts/mdcath_stage_c_qdependent
+seed: 42
+deterministic: false
+log_every: 10
+save_every: 1
+checkpoint_every_steps: 2000
+device: cuda
+init_checkpoint: null  # train from scratch to force Q dependence
+strict_init: false
+
+data:
+  manifest_path: artifacts/mdcath_manifest_200dom/train.jsonl
+  batch_size: 4  # batch_size >= 4 for stable COM gradient
+  num_workers: 2
+  num_frames: 8
+  frame_stride: 4
+  window_stride: 4
+  max_residues: 256
+  coordinate_scale: 1.0
+  training_mode: paired_window
+  paired_horizons_frames: [32, 64, 96]
+  paired_all_horizons: true
+  paired_history_mode: uniform
+
+model:
+  model_type: stage_c
+  latent_dim: 128
+  encoder_depth: 4
+  num_heads: 4
+  num_rbf: 16
+  max_frames: 128
+  max_residues: 256
+  dropout: 0.1
+  feature_norm: true
+  time_conditioning: physical
+  thermodynamic_conditioning: true
+  # Stage C specific
+  decoder_c_hidden: 128
+  decoder_ipa_dim: 64
+  decoder_ipa_blocks: 4
+  decoder_torsion_bins: 36
+  decoder_dropout: 0.1
+  max_seq_len: 500
+  q_dim: 8   # must match the canonical Stage-B state width
+  context_dim: 128  # H dimension from Stage A
+  # Phase 1: anchor refinement warmup (0-5000 steps)
+  # Phase 2: Q-conditioned training (5000+ steps)
+  q_weight_ramp_start: 0  # step at which Q starts entering loss
+  q_weight_ramp_steps: 5000  # linear ramp over N steps
+  anchor_noise_level: 0.5  # A noise added to anchor coordinates (force Q reliance)
+
+optimization:
+  lr: 5.0e-5
+  encoder_lr_scale: 0.1  # freeze Stage A/B encoders
+  epochs: 20
+  warmup_steps: 500
+  weight_decay: 0.01
+  grad_clip: 10.0
+  gradient_accumulation_steps: 4
+  steps_per_epoch: 300
+  # Loss weights
+  fape_weight: 1.0
+  torsion_weight: 0.5
+  distance_weight: 0.3
+  bond_weight: 0.1
+  clash_weight: 0.05
+  fape_clamp: 10.0
+
+# Stage A checkpoint (frozen encoder)
+stage_a_checkpoint: artifacts/mdcath_stage_c_compact/checkpoint_latest.pt
+
+# Stage B checkpoint (frozen encoder)
+stage_b_checkpoint: artifacts/mdcath_stage_b_rollout/checkpoint_latest.pt

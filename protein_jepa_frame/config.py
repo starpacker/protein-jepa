@@ -457,6 +457,18 @@ class OptimizationConfig:
     sc_bond_weight: float = 0.1
     sc_clash_weight: float = 0.05
     sc_ca_position_weight: float = 0.05
+    # Autonomous-rollout-Q contact consistency.  When > 0, the decoder is also
+    # trained on structures decoded from the Stage-B SDE rollout Q (the exact
+    # Q distribution autonomous eval produces), applying the contact (binary +
+    # distance) objective there so autonomous contacts beat persistence at long
+    # horizons.  0.0 keeps legacy behaviour (no rollout branch).
+    sc_auto_contact_weight: float = 0.0
+    # Number of optimizer steps before the autonomous-rollout contact branch
+    # activates (lets the direct/oracle decoder stabilise first).
+    sc_auto_contact_warmup_steps: int = 0
+    # SDE substep ceiling and base step (ps) for the training-time rollout.
+    sc_auto_rollout_base_step_ps: float = 100.0
+    sc_auto_rollout_max_substep_ps: float = 100.0
     grad_clip: float | None = 1.0
     precision: str = "float32"
     auxiliary_warmup_steps: int = 0

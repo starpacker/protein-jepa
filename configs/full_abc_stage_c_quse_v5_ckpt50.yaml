@@ -1,0 +1,86 @@
+# Stage C v5: fix autonomous-mode contact-Jaccard regression at 64/96 ns.
+#
+# Diagnosis from v3/v4 evals:
+#   * RMSD < 2.0 A is physically unreachable at the 32/64/96 ns formal
+#     horizons: persistence itself is 6.5-7.4 A, the oracle (perfect future Q)
+#     is 5.9 A, and a linear probe on oracle Q reconstructs the future CA only
+#     to ~14 A. Q encodes dynamics, not absolute position. No decoder can beat
+#     this. All five conditions therefore collapse to "beat persistence on
+#     RMSD + 3 contact metrics, both modes, every horizon".
+#   * The remaining real failure is AUTONOMOUS contact-Jaccard at 64/96 ns:
+#     the decoder only ever sees oracle/direct Q in training, so the Stage-B
+#     SDE rollout Q (which autonomous eval uses) is out of distribution and
+#     collapses autonomous contacts as training proceeds.
+#
+# Fix: sc_auto_contact_weight > 0 adds a branch that decodes from the actual
+# training-time SDE rollout Q and applies the contact objective there, matching
+# the eval rollout. No q_only phase (that was the v4 regression).
+output_dir: artifacts/full_abc_stage_c_quse_v5
+seed: 42
+deterministic: false
+device: cuda:0
+log_every: 10
+save_every: 1
+checkpoint_every_steps: 50
+init_checkpoint: artifacts/full_abc_stage_b_v3_final/checkpoint_latest.pt
+stage_c_pretrained: artifacts/full_abc_stage_c_contactfix_v3/step_1500.pt
+stage_c_pretrained_exclude_q_position: false
+resume_checkpoint: null
+strict_init: false
+data:
+  manifest_path: artifacts/mdcath_manifest_200dom/train.jsonl
+  batch_size: 2
+  num_workers: 0
+  num_frames: 8
+  frame_stride: 4
+  window_stride: 4
+  max_residues: 256
+  coordinate_scale: 1.0
+  training_mode: paired_window
+  paired_horizons_frames: [32, 64, 96]
+  paired_all_horizons: false
+  paired_history_mode: uniform
+model:
+  model_type: stage_c
+  q_dim: 8
+  latent_dim: 128
+  encoder_depth: 4
+  temporal_depth: 2
+  num_heads: 4
+  num_rbf: 16
+  max_frames: 128
+  max_residues: 256
+  dropout: 0.1
+  feature_norm: true
+  time_conditioning: physical
+  thermodynamic_conditioning: true
+  decoder_max_translation_update: 0.5
+  decoder_max_com_update: 4.0
+  decoder_max_q_translation_update: 2.0
+  stage_c_q_only_steps: 0
+  anchor_noise_level: 0.0
+  q_weight_ramp_start: 0
+  q_weight_ramp_steps: 1000
+optimization:
+  lr: 2.0e-5
+  epochs: 16
+  warmup_steps: 100
+  weight_decay: 0.01
+  grad_clip: 10.0
+  gradient_accumulation_steps: 4
+  steps_per_epoch: 300
+  encoder_lr_scale: 0.2
+  sc_fape_weight: 0.2
+  sc_torsion_weight: 0.5
+  sc_distance_weight: 0.3
+  sc_bond_weight: 0.1
+  sc_clash_weight: 0.05
+  sc_ca_position_weight: 0.05
+  sc_kabsch_weight: 1.0
+  sc_contact_distance_weight: 1.0
+  sc_contact_binary_weight: 2.0
+  # Autonomous-rollout-Q contact consistency (the v5 fix).
+  sc_auto_contact_weight: 1.5
+  sc_auto_contact_warmup_steps: 0
+  sc_auto_rollout_base_step_ps: 100.0
+  sc_auto_rollout_max_substep_ps: 100.0

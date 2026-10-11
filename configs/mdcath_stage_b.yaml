@@ -1,0 +1,102 @@
+# Stage B: LSPWM world model training on frozen Stage A encoder
+# Uses Stage A checkpoint for frozen H representations
+# Trains: conservative force, diffusion, bath (Mori-Zwanzig memory)
+# M05 simplified objective hierarchy:
+#   L = L_transition_NLL + λ_semigroup * L_semigroup
+#     + λ_endpoint * L_rollout_endpoint + λ_bound * L_state_bound
+output_dir: artifacts/mdcath_stage_b
+seed: 42
+deterministic: false
+log_every: 50
+save_every: 1
+checkpoint_every_steps: 5000
+init_checkpoint: artifacts/mdcath_stage_a/checkpoint_latest.pt
+sync_target_after_init: true
+
+data:
+  manifest_path: artifacts/mdcath_manifest/train.jsonl
+  batch_size: 16
+  num_workers: 2
+  num_frames: 6
+  frame_stride: 2
+  window_stride: 4
+  max_residues: 256
+  training_mode: paired_window
+  paired_horizons_frames: [1, 2, 4, 8]
+  paired_all_horizons: true
+
+model:
+  latent_dim: 128
+  encoder_depth: 4
+  temporal_depth: 2
+  predictor_depth: 4
+  num_heads: 4
+  num_rbf: 16
+  max_frames: 128
+  max_residues: 256
+  dropout: 0.0
+  feature_norm: true
+  time_conditioning: "none"
+  thermodynamic_conditioning: true
+  # Freeze the encoder (representation is fixed)
+  freeze_context_encoder: true
+  freeze_temporal_encoder: true
+  freeze_target_encoders: true
+  # LSPWM world model
+  lspwm_enabled: true
+  lspwm_learned_cv_dim: 256
+  lspwm_condition_dim: 64
+  lspwm_auxiliary_dim: 4
+  lspwm_diffusion_scale: 1.0e-6
+  lspwm_coupling_scale: 1.0e-3
+  lspwm_memory_times_ps: [1000.0, 2000.0, 4000.0, 8000.0]
+  lspwm_reference_temperature_k: 348.0
+  lspwm_dynamic_nll_enabled: true
+  lspwm_force_loss_enabled: true
+  lspwm_rollout_enabled: true
+  lspwm_rollout_steps: 4
+  lspwm_rollout_warmup_steps: 5000
+  lspwm_rollout_ensemble_size: 4
+  lspwm_rollout_intermediate_supervision: true
+  lspwm_rollout_gaussian_nll_enabled: true
+  lspwm_semigroup_consistency_weight: 0.1
+  lspwm_potential_hidden_dim: 128
+  lspwm_potential_hidden_depth: 4
+  lspwm_curriculum_steps: [0, 2000, 5000, 10000, 15000]
+
+mask:
+  mode: block
+  num_blocks: 2
+  temporal_scale: [0.25, 0.5]
+  residue_scale: [0.15, 0.4]
+  min_context_ratio: 0.2
+
+optimization:
+  lr: 1.0e-4
+  encoder_lr_scale: 0.0  # encoder is frozen
+  epochs: 100
+  warmup_steps: 2000
+  weight_decay: 0.05
+  grad_clip: 10.0
+  ema_start: 0.996
+  ema_end: 1.0
+  precision: float32
+  # Stage B optimization — representation weights zero
+  residue_jepa_weight: 0.0
+  state_jepa_weight: 0.0
+  paired_delta_weight: 0.0
+  paired_state_weight: 0.0
+  variance_reg: 0.0
+  state_variance_reg: 0.0
+  # LSPWM world model weights
+  lspwm_dynamic_weight: 1.0       # Transition NLL
+  lspwm_force_weight: 0.5          # Conservative force score matching
+  lspwm_rollout_endpoint_weight: 0.2  # Endpoint regression
+  lspwm_rollout_gaussian_nll_weight: 0.3  # Rollout NLL
+  lspwm_rollout_energy_weight: 0.1       # Energy conservation
+  lspwm_rollout_force_weight: 0.1        # Force consistency
+  lspwm_rollout_distribution_weight: 0.05
+  # Semigroup: step(τ₁+τ₂) ≈ step(τ₂)∘step(τ₁)
+  lspwm_self_consistency_weight: 0.1
+  # Mori NLL weight
+  lspwm_mori_nll_weight: 0.5

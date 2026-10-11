@@ -1,0 +1,70 @@
+# Stage-C two-phase Q-aware fine-tuning.
+# Phase 1 (steps 0..499): teacher-forced oracle Q, Q-only CA translation,
+# and Q-vs-shuffled-Q margin supervision.
+# Phase 2 (steps >=500): direct predicted Q plus the normal H+Q residual path.
+output_dir: artifacts/full_abc_stage_c_qaware_finetune_v2
+seed: 42
+deterministic: false
+device: cuda:0
+log_every: 10
+save_every: 1
+checkpoint_every_steps: 500
+init_checkpoint: artifacts/full_abc_stage_b_canonical_v1/checkpoint_latest.pt
+resume_checkpoint: null
+stage_c_pretrained: artifacts/full_abc_stage_c_canonical_v1/step_3000.pt
+stage_c_pretrained_exclude_q_position: false
+strict_init: false
+
+data:
+  manifest_path: artifacts/mdcath_manifest_200dom/train.jsonl
+  batch_size: 1
+  num_workers: 0
+  num_frames: 8
+  frame_stride: 4
+  window_stride: 4
+  max_residues: 256
+  coordinate_scale: 1.0
+  training_mode: paired_window
+  paired_horizons_frames: [32, 64, 96]
+  paired_all_horizons: false
+  paired_history_mode: uniform
+
+model:
+  model_type: stage_c
+  q_dim: 8
+  latent_dim: 128
+  encoder_depth: 4
+  temporal_depth: 2
+  num_heads: 4
+  num_rbf: 16
+  max_frames: 128
+  max_residues: 256
+  dropout: 0.1
+  feature_norm: true
+  time_conditioning: physical
+  thermodynamic_conditioning: true
+  decoder_max_translation_update: 0.5
+  decoder_max_com_update: 4.0
+  decoder_max_q_translation_update: 16.0
+  anchor_noise_level: 1.0
+  q_weight_ramp_start: 0
+  q_weight_ramp_steps: 0
+  stage_c_finetune_spatial_encoder: true
+  stage_c_finetune_temporal_encoder: true
+  stage_c_q_only_steps: 500
+
+optimization:
+  lr: 2.0e-5
+  encoder_lr_scale: 0.05
+  epochs: 7
+  max_steps: 2000
+  warmup_steps: 200
+  weight_decay: 0.01
+  grad_clip: 10.0
+  gradient_accumulation_steps: 4
+  q_translation_weight: 2.0
+  q_only_translation_weight: 10.0
+  q_translation_target_scale: 16.0
+  q_shuffle_weight: 1.0
+  q_shuffle_margin: 0.05
+  steps_per_epoch: 300

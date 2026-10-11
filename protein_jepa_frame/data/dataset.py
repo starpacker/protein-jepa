@@ -379,6 +379,32 @@ def _paired_context_offsets(config: DataConfig) -> np.ndarray:
     return np.sort(span - 1 - np.concatenate([recent_back, slow_back]))
 
 
+def validate_real_paired_window_protocol(config: DataConfig) -> None:
+    """Reject shared context/target frames for canonical real-data runs.
+
+    Synthetic smoke data remains available for shape/gradient CI. A real
+    trajectory run, however, must not derive its target representation from
+    frames that were also visible in the context window.
+    """
+    if not config.manifest_path:
+        return
+    offsets = {int(value) for value in _paired_context_offsets(config).tolist()}
+    failures = []
+    for horizon in sorted({int(value) for value in config.paired_horizons_frames}):
+        future = {horizon + value for value in offsets}
+        shared = sorted(offsets.intersection(future))
+        if shared:
+            failures.append(
+                f"horizon {horizon} shares {len(shared)}/{len(offsets)} frames "
+                f"(shared={shared})"
+            )
+    if failures:
+        raise ValueError(
+            "real-data paired-window protocol must have zero context/target "
+            "frame overlap; " + "; ".join(failures)
+        )
+
+
 class PairedTrajectoryDataset(TrajectoryClipDataset):
     """Two same-trajectory windows separated by a raw-frame horizon."""
 

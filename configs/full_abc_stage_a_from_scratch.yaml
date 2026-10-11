@@ -1,0 +1,58 @@
+# Reproducible full Stage-A run for the repaired ABC pipeline.
+output_dir: artifacts/full_abc_stage_a
+seed: 42
+deterministic: false
+device: cuda:0
+log_every: 50
+save_every: 1
+checkpoint_every_steps: 5000
+
+data:
+  manifest_path: artifacts/mdcath_manifest_200dom/train.jsonl
+  batch_size: 16
+  num_workers: 4
+  num_frames: 8
+  frame_stride: 4
+  window_stride: 4
+  max_residues: 256
+  coordinate_scale: 1.0
+  training_mode: paired_window
+  paired_horizons_frames: [32, 64, 96]
+  paired_all_horizons: true
+  paired_history_mode: uniform
+
+model:
+  latent_dim: 128
+  encoder_depth: 4
+  temporal_depth: 2
+  predictor_depth: 4
+  num_heads: 4
+  num_rbf: 16
+  max_frames: 128
+  max_residues: 256
+  dropout: 0.1
+  feature_norm: true
+  time_conditioning: physical
+  thermodynamic_conditioning: true
+  paired_forecast: true
+  paired_predictor_depth: 3
+  paired_teacher_space_delta: true
+
+optimization:
+  lr: 3.0e-4
+  encoder_lr_scale: 0.5
+  epochs: 100
+  warmup_steps: 2000
+  weight_decay: 0.05
+  grad_clip: 1.0
+  ema_start: 0.996
+  ema_end: 1.0
+  precision: float32
+  residue_jepa_weight: 1.0
+  state_jepa_weight: 0.25
+  paired_delta_weight: 1.0
+  paired_state_weight: 0.25
+  variance_reg: 0.01
+  state_variance_reg: 0.01
+  state_feature_variance_reg: 0.01
+  state_covariance_reg: 0.02

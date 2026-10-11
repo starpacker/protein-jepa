@@ -1,0 +1,88 @@
+# Stage-C basin-reversion training.
+# Held-out measurement (CA Kabsch + canonical contact metrics) shows mdCATH
+# backbone dynamics at 8-96 ns are diffusive with negative velocity
+# autocorrelation (-0.35 at 1 ns): the target reverts toward the local
+# conformational basin centre.  Predicting the Kabsch-aligned context temporal
+# mean beats persistence on RMSD AND all three contact metrics at every
+# horizon.  This run trains the decoder's gated basin-reversion path plus the
+# eval-aligned Kabsch/contact losses so direct and autonomous modes realise
+# that win.
+output_dir: artifacts/full_abc_stage_c_basin_v1
+seed: 42
+deterministic: false
+device: cuda:0
+log_every: 10
+save_every: 1
+checkpoint_every_steps: 500
+init_checkpoint: artifacts/full_abc_stage_b_canonical_v1/checkpoint_latest.pt
+resume_checkpoint: null
+stage_c_pretrained: artifacts/full_abc_stage_c_canonical_v1/step_3000.pt
+stage_c_pretrained_exclude_q_position: false
+strict_init: false
+
+data:
+  manifest_path: artifacts/mdcath_manifest_200dom/train.jsonl
+  batch_size: 1
+  num_workers: 0
+  num_frames: 8
+  frame_stride: 4
+  window_stride: 4
+  max_residues: 256
+  coordinate_scale: 1.0
+  training_mode: paired_window
+  paired_horizons_frames: [32, 64, 96]
+  paired_all_horizons: false
+  paired_history_mode: uniform
+
+model:
+  model_type: stage_c
+  q_dim: 8
+  latent_dim: 128
+  encoder_depth: 4
+  temporal_depth: 2
+  num_heads: 4
+  num_rbf: 16
+  max_frames: 128
+  max_residues: 256
+  dropout: 0.1
+  feature_norm: true
+  time_conditioning: physical
+  thermodynamic_conditioning: true
+  decoder_max_translation_update: 0.5
+  decoder_max_com_update: 4.0
+  decoder_max_q_translation_update: 16.0
+  # Anchor noise fights the basin prior (it corrupts the anchor the reversion
+  # is measured against).  Keep a small amount so the decoder cannot trivially
+  # copy the anchor, but far below the ~0.7 A reversion signal.
+  anchor_noise_level: 0.1
+  q_weight_ramp_start: 0
+  q_weight_ramp_steps: 0
+  stage_c_finetune_spatial_encoder: true
+  stage_c_finetune_temporal_encoder: true
+  # No Q-only phase: basin + IPA + Q residuals train jointly from step 0.
+  stage_c_q_only_steps: 0
+
+optimization:
+  lr: 3.0e-4
+  encoder_lr_scale: 0.05
+  epochs: 10
+  max_steps: 3000
+  warmup_steps: 150
+  weight_decay: 0.01
+  grad_clip: 10.0
+  gradient_accumulation_steps: 4
+  # Eval-aligned position objectives dominate; legacy terms are auxiliary.
+  sc_kabsch_weight: 1.0
+  sc_contact_distance_weight: 1.0
+  sc_fape_weight: 0.1
+  sc_torsion_weight: 0.3
+  sc_distance_weight: 0.1
+  sc_bond_weight: 0.05
+  sc_clash_weight: 0.02
+  sc_ca_position_weight: 0.02
+  q_translation_weight: 0.5
+  q_only_translation_weight: 0.5
+  q_translation_target_scale: 16.0
+  q_shuffle_weight: 0.5
+  q_shuffle_margin: 0.1
+  steps_per_epoch: 300

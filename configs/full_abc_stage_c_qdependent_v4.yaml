@@ -1,0 +1,63 @@
+# Stage C v4: Q-dependent structure decoding with a motion-scale-correct
+# anchor-relative translation path.
+#
+# v3 capped the explicit Q translation residual at 2 A/component while the
+# paired 32/64/96-frame targets have ~12.6 A RMS local relative displacement.
+# v4 raises that bound and keeps oracle Q active longer during curriculum.
+output_dir: artifacts/full_abc_stage_c_qdependent_v4
+seed: 42
+deterministic: false
+device: cuda:0
+log_every: 10
+save_every: 1
+checkpoint_every_steps: 500
+init_checkpoint: artifacts/full_abc_stage_b_v3_final/checkpoint_latest.pt
+resume_checkpoint: null
+stage_c_pretrained: artifacts/full_abc_stage_c_relative_v2/checkpoint_latest.pt
+strict_init: false
+
+data:
+  manifest_path: artifacts/mdcath_manifest_200dom/train.jsonl
+  batch_size: 2
+  num_workers: 0
+  num_frames: 8
+  frame_stride: 4
+  window_stride: 4
+  max_residues: 256
+  coordinate_scale: 1.0
+  training_mode: paired_window
+  paired_horizons_frames: [32, 64, 96]
+  paired_all_horizons: false
+  paired_history_mode: uniform
+
+model:
+  model_type: stage_c
+  q_dim: 8
+  latent_dim: 128
+  encoder_depth: 4
+  temporal_depth: 2
+  num_heads: 4
+  num_rbf: 16
+  max_frames: 128
+  max_residues: 256
+  dropout: 0.1
+  feature_norm: true
+  time_conditioning: physical
+  thermodynamic_conditioning: true
+  decoder_max_translation_update: 0.5
+  decoder_max_com_update: 4.0
+  decoder_max_q_translation_update: 16.0
+  anchor_noise_level: 1.0
+  q_weight_ramp_start: 0
+  q_weight_ramp_steps: 3000
+
+optimization:
+  lr: 5.0e-5
+  epochs: 20
+  warmup_steps: 500
+  weight_decay: 0.01
+  grad_clip: 10.0
+  gradient_accumulation_steps: 4
+  q_translation_weight: 2.0
+  q_translation_target_scale: 16.0
+  steps_per_epoch: 300

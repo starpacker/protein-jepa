@@ -24,6 +24,11 @@ eval = [
   "scikit-learn",
   "scipy",
 ]
+openfold = [
+  "biopython",
+  "dm-tree",
+  "ml-collections",
+]
 
 [project.scripts]
 protein-jepa-frame = "protein_jepa_frame.cli:main"
@@ -31,6 +36,17 @@ protein-jepa-frame = "protein_jepa_frame.cli:main"
 [tool.setuptools.packages.find]
 include = ["protein_jepa_frame*"]
 
+[tool.setuptools.package-data]
+protein_jepa_frame = [
+  "vendored/PROVENANCE.json",
+  "vendored/openfold/resources/*.txt",
+  "vendored/openfold/utils/kernel/csrc/*",
+]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]
+filterwarnings = [
+  # Vendored official OpenFold uses non-tuple sequence indexing; harmless here.
+  "ignore:Using a non-tuple sequence for multidimensional indexing:UserWarning",
+]

@@ -65,6 +65,8 @@ def collate_clips(samples: Sequence[dict]) -> dict:
         "protein_id": [sample["protein_id"] for sample in samples],
         "trajectory_id": [sample["trajectory_id"] for sample in samples],
     }
+    # Gate 1: per-frame physical dt for dynamic encoder conditioning
+    out["dt_ps"] = torch.diff(time_ps, dim=1, prepend=time_ps[:, :1])
     if has_msm:
         out["msm_state_labels"] = msm_state_labels
     if has_forces:
@@ -104,6 +106,16 @@ def collate_paired_windows(samples: Sequence[dict]) -> dict:
     out["dataset"] = context["dataset"]
     out["protein_id"] = context["protein_id"]
     out["trajectory_id"] = context["trajectory_id"]
+
+    # Gate 1 fix: provide per-frame physical dt so dynamic encoder can condition on
+    # real physical intervals rather than falling back to 1 ps placeholder.
+    if "context_time_ps" in out:
+        time_ps = out["context_time_ps"]  # [B, T]
+        out["context_dt_ps"] = torch.diff(time_ps, dim=1, prepend=time_ps[:, :1])
+    if "future_time_ps" in out:
+        time_ps = out["future_time_ps"]  # [B, T]
+        out["future_dt_ps"] = torch.diff(time_ps, dim=1, prepend=time_ps[:, :1])
+
     if grouped:
         out["context_group_index"] = group_index
         out["context_group_size"] = torch.tensor(group_sizes, dtype=torch.long)

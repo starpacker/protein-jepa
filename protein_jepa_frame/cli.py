@@ -12,6 +12,8 @@ def main(argv: list[str] | None = None) -> None:
 
     train_parser = sub.add_parser("train")
     train_parser.add_argument("--config", required=True)
+    train_parser.add_argument("--stage", choices=["legacy", "A", "B", "C"], default="legacy",
+                              help="Training stage: legacy (original), A/B/C (canonical)")
 
     smoke_parser = sub.add_parser("smoke")
     smoke_parser.add_argument("--output-dir", default="artifacts/smoke")
@@ -50,9 +52,18 @@ def main(argv: list[str] | None = None) -> None:
     args = parser.parse_args(argv)
     if args.cmd == "train":
         from protein_jepa_frame.config import load_config
-        from protein_jepa_frame.training.train import train
-
-        train(load_config(args.config))
+        if args.stage == "A":
+            from protein_jepa_frame.training.stage_a import train_stage_a
+            train_stage_a(load_config(args.config))
+        elif args.stage == "B":
+            from protein_jepa_frame.training.stage_b import train_stage_b
+            train_stage_b(load_config(args.config))
+        elif args.stage == "C":
+            from protein_jepa_frame.training.stage_c import train_stage_c
+            train_stage_c(load_config(args.config))
+        else:
+            from protein_jepa_frame.training.train import train
+            train(load_config(args.config))
         return
     if args.cmd == "smoke":
         from protein_jepa_frame.config import DataConfig, OptimizationConfig, TrainConfig

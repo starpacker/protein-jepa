@@ -1,0 +1,302 @@
+{
+  "configurations": [
+    {
+      "manifest_path": "artifacts/mdcath_manifest_200dom/train.jsonl",
+      "paired_window_audit": {
+        "context_offsets": [
+          0,
+          4,
+          8,
+          12,
+          16,
+          20,
+          24,
+          28
+        ],
+        "context_raw_span_frames": 28,
+        "failures": [
+          "horizon=4 shares 7/8 frames",
+          "horizon=8 shares 6/8 frames",
+          "horizon=16 shares 4/8 frames"
+        ],
+        "frame_stride": 4,
+        "horizons": [
+          {
+            "context_frames": [
+              0,
+              4,
+              8,
+              12,
+              16,
+              20,
+              24,
+              28
+            ],
+            "context_to_future_gap_ps": {
+              "1000.0": -24000.0
+            },
+            "endpoint_to_endpoint_ps": {
+              "1000.0": 4000.0
+            },
+            "first_to_first_ps": {
+              "1000.0": 4000.0
+            },
+            "future_frames": [
+              4,
+              8,
+              12,
+              16,
+              20,
+              24,
+              28,
+              32
+            ],
+            "horizon_frames": 4,
+            "nonoverlap": false,
+            "overlap_count": 7,
+            "overlap_ratio": 0.875,
+            "shared_frames": [
+              4,
+              8,
+              12,
+              16,
+              20,
+              24,
+              28
+            ]
+          },
+          {
+            "context_frames": [
+              0,
+              4,
+              8,
+              12,
+              16,
+              20,
+              24,
+              28
+            ],
+            "context_to_future_gap_ps": {
+              "1000.0": -20000.0
+            },
+            "endpoint_to_endpoint_ps": {
+              "1000.0": 8000.0
+            },
+            "first_to_first_ps": {
+              "1000.0": 8000.0
+            },
+            "future_frames": [
+              8,
+              12,
+              16,
+              20,
+              24,
+              28,
+              32,
+              36
+            ],
+            "horizon_frames": 8,
+            "nonoverlap": false,
+            "overlap_count": 6,
+            "overlap_ratio": 0.75,
+            "shared_frames": [
+              8,
+              12,
+              16,
+              20,
+              24,
+              28
+            ]
+          },
+          {
+            "context_frames": [
+              0,
+              4,
+              8,
+              12,
+              16,
+              20,
+              24,
+              28
+            ],
+            "context_to_future_gap_ps": {
+              "1000.0": -12000.0
+            },
+            "endpoint_to_endpoint_ps": {
+              "1000.0": 16000.0
+            },
+            "first_to_first_ps": {
+              "1000.0": 16000.0
+            },
+            "future_frames": [
+              16,
+              20,
+              24,
+              28,
+              32,
+              36,
+              40,
+              44
+            ],
+            "horizon_frames": 16,
+            "nonoverlap": false,
+            "overlap_count": 4,
+            "overlap_ratio": 0.5,
+            "shared_frames": [
+              16,
+              20,
+              24,
+              28
+            ]
+          }
+        ],
+        "num_frames": 8,
+        "paired_nonoverlap_only": false,
+        "zero_overlap": false
+      },
+      "path": "configs/mdcath_stage_a_200dom.yaml",
+      "training_mode": "paired_window"
+    }
+  ],
+  "generated_at_utc": "2026-10-01T11:30:28.908292+00:00",
+  "manifests": [
+    {
+      "checked_unique_paths": 4318,
+      "datasets": {
+        "mdCATH": 107947
+      },
+      "formats": {
+        "mdcath-hdf5": 107947
+      },
+      "frame_interval_ps": {
+        "1000.0": 107947
+      },
+      "missing_checked_paths": 0,
+      "missing_path_examples": [],
+      "path": "artifacts/mdcath_manifest/train.jsonl",
+      "proteins": 4318,
+      "records": 107947,
+      "trajectories": 107947,
+      "unique_paths": 4318
+    },
+    {
+      "checked_unique_paths": 539,
+      "datasets": {
+        "mdCATH": 13474
+      },
+      "formats": {
+        "mdcath-hdf5": 13474
+      },
+      "frame_interval_ps": {
+        "1000.0": 13474
+      },
+      "missing_checked_paths": 0,
+      "missing_path_examples": [],
+      "path": "artifacts/mdcath_manifest/val.jsonl",
+      "proteins": 539,
+      "records": 13474,
+      "trajectories": 13474,
+      "unique_paths": 539
+    },
+    {
+      "checked_unique_paths": 541,
+      "datasets": {
+        "mdCATH": 13525
+      },
+      "formats": {
+        "mdcath-hdf5": 13525
+      },
+      "frame_interval_ps": {
+        "1000.0": 13525
+      },
+      "missing_checked_paths": 0,
+      "missing_path_examples": [],
+      "path": "artifacts/mdcath_manifest/test.jsonl",
+      "proteins": 541,
+      "records": 13525,
+      "trajectories": 13525,
+      "unique_paths": 541
+    },
+    {
+      "checked_unique_paths": 4167,
+      "datasets": {
+        "atlas": 4167
+      },
+      "formats": {
+        "xtc": 4167
+      },
+      "frame_interval_ps": {
+        "10.0": 4167
+      },
+      "missing_checked_paths": 0,
+      "missing_path_examples": [],
+      "path": "artifacts/manifests/atlas.raw.full.jsonl",
+      "proteins": 1389,
+      "records": 4167,
+      "trajectories": 4167,
+      "unique_paths": 4167
+    },
+    {
+      "checked_unique_paths": 300,
+      "datasets": {
+        "atlas": 300
+      },
+      "formats": {
+        "protein-jepa-hdf5": 300
+      },
+      "frame_interval_ps": {
+        "10.0": 300
+      },
+      "missing_checked_paths": 0,
+      "missing_path_examples": [],
+      "path": "artifacts/manifests/atlas.cached.pilot300.jsonl",
+      "proteins": 100,
+      "records": 300,
+      "trajectories": 300,
+      "unique_paths": 300
+    },
+    {
+      "checked_unique_paths": 2600,
+      "datasets": {
+        "unknown": 2600
+      },
+      "formats": {
+        "unknown": 2600
+      },
+      "frame_interval_ps": {
+        "missing": 2600
+      },
+      "missing_checked_paths": 0,
+      "missing_path_examples": [],
+      "path": "artifacts/fastfolding/frame_labels.full.jsonl",
+      "proteins": 26,
+      "records": 2600,
+      "trajectories": 26,
+      "unique_paths": 2600
+    },
+    {
+      "checked_unique_paths": 160,
+      "datasets": {
+        "mdCATH": 4000
+      },
+      "formats": {
+        "mdcath-hdf5": 4000
+      },
+      "frame_interval_ps": {
+        "1000.0": 4000
+      },
+      "missing_checked_paths": 0,
+      "missing_path_examples": [],
+      "path": "artifacts/mdcath_manifest_200dom/train.jsonl",
+      "proteins": 160,
+      "records": 4000,
+      "trajectories": 4000,
+      "unique_paths": 160
+    }
+  ],
+  "strict_failures": [
+    "configs/mdcath_stage_a_200dom.yaml: horizon=4 shares 7/8 frames",
+    "configs/mdcath_stage_a_200dom.yaml: horizon=8 shares 6/8 frames",
+    "configs/mdcath_stage_a_200dom.yaml: horizon=16 shares 4/8 frames"
+  ]
+}

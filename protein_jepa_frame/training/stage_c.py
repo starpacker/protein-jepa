@@ -463,20 +463,39 @@ def train_stage_c(config: TrainConfig) -> Path:
 
                     # CANONICAL: use encode_state so H includes temporal history,
                     # matching what evaluation scripts produce via the same path.
+                    # When the autonomous-rollout contact branch is active we
+                    # also need the context Q, bath state and CA distances so the
+                    # training-time SDE rollout matches the eval rollout exactly.
+                    _auto_contact_w = float(
+                        getattr(config.optimization, "sc_auto_contact_weight", 0.0)
+                    )
+                    _want_rollout = _auto_contact_w > 0.0
                     ctx_state = stage_b_model.encode_state(
                         ctx_coords, ctx_res_mask, t_aatype, t_res_idx, t_chain,
                         time_ps=batch.get("context_time_ps"),
                         temperature_k=temperature_k,
                         use_temporal=True,
-                        return_bath=False,
-                        return_ca_distances=False,
+                        return_bath=_want_rollout,
+                        return_ca_distances=_want_rollout,
                         return_forces=False,
                     )
                     h_frozen = ctx_state["h_last"]
                     if not encoder_trainable:
                         h_frozen = h_frozen.detach()  # [B, L, D_H]
+                    # Capture rollout inputs (detached: Stage B is frozen and the
+                    # rollout only supplies a Q distribution, not a grad path).
+                    ctx_q0 = ctx_state.get("q")
+                    ctx_bath_s0 = ctx_state.get("bath_s0")
+                    ctx_ca_dist = ctx_state.get("ca_distances")
+                    if ctx_q0 is not None:
+                        ctx_q0 = ctx_q0.detach()
+                    if ctx_bath_s0 is not None:
+                        ctx_bath_s0 = ctx_bath_s0.detach()
+                    if ctx_ca_dist is not None:
+                        ctx_ca_dist = ctx_ca_dist.detach()
             else:
                 h_frozen = torch.zeros(B, L, 256, device=device)
+                ctx_q0 = ctx_bath_s0 = ctx_ca_dist = None
 
             # Anchor frames from last context frame
             anchor_backbone = batch["context_coords"][:, -1]  # [B, L, 4, 3]
@@ -589,6 +608,97 @@ def train_stage_c(config: TrainConfig) -> Path:
                 residue_index=t_res_idx,
                 chain_id=t_chain,
             )
+
+            # ── Autonomous-rollout-Q contact consistency ──
+            # Decode from the Stage-B SDE rollout Q (the exact Q distribution
+            # that autonomous eval produces) and apply the contact objective
+            # there, so autonomous contacts beat persistence at long horizons.
+            # Without this the decoder only ever sees oracle/direct Q and the
+            # rollout Q drifts out of distribution, collapsing autonomous
+            # contact-Jaccard at 64/96 ns.  The rollout uses the SAME transition
+            # call and base step as scripts/eval_world_model.py.
+            auto_contact_loss = None
+            _auto_w = float(getattr(config.optimization, "sc_auto_contact_weight", 0.0))
+            _auto_warmup = int(getattr(config.optimization, "sc_auto_contact_warmup_steps", 0))
+            if (
+                _auto_w > 0.0
+                and global_step >= _auto_warmup
+                and stage_b_model is not None
+                and ctx_q0 is not None
+                and ctx_ca_dist is not None
+            ):
+                base_step_ps = float(
+                    getattr(config.optimization, "sc_auto_rollout_base_step_ps", 100.0)
+                )
+                max_sub_ps = float(
+                    getattr(config.optimization, "sc_auto_rollout_max_substep_ps", 100.0)
+                )
+                # Horizon for this batch (anchor -> target), in ps.
+                h_ps_batch = batch.get("horizon_time_ps")
+                if h_ps_batch is None:
+                    h_ps_val = 32000.0
+                else:
+                    h_ps_val = float(h_ps_batch.reshape(-1)[0].item())
+                n_steps = int(h_ps_val // base_step_ps)
+                remainder = h_ps_val - n_steps * base_step_ps
+                if remainder < 1e-3 * base_step_ps:
+                    remainder = 0.0
+                if ctx_bath_s0 is not None:
+                    s_roll = ctx_bath_s0
+                else:
+                    s_roll = stage_b_model.initialize_bath(
+                        h_frozen.detach(), target_mask
+                    )
+                q_roll = ctx_q0
+                # Stage B is frozen; the rollout is a pure Q sampler (no grad).
+                with torch.no_grad():
+                    for _ in range(n_steps):
+                        q_roll, s_roll, _ = stage_b_model.transition(
+                            q_roll, s_roll, ca_distances=ctx_ca_dist,
+                            residue_mask=target_mask, temperature_k=temperature_k,
+                            dt_ps=base_step_ps, max_substep_dt_ps=max_sub_ps,
+                            stochastic=True,
+                        )
+                    if remainder > 0:
+                        q_roll, s_roll, _ = stage_b_model.transition(
+                            q_roll, s_roll, ca_distances=ctx_ca_dist,
+                            residue_mask=target_mask, temperature_k=temperature_k,
+                            dt_ps=remainder, max_substep_dt_ps=max_sub_ps,
+                            stochastic=True,
+                        )
+                q_roll = q_roll.detach()
+                if torch.isfinite(q_roll).all():
+                    auto_outputs = decoder(
+                        aatype, h_frozen, q_roll, R_anchor, t_anchor, target_mask,
+                        q_only_translation=False,
+                        basin_dt_local=basin_dt_local,
+                    )
+                    # Only the contact objective is applied on the rollout branch
+                    # — the autonomous failure is specifically contact-Jaccard,
+                    # and RMSD is already governed by the mode-invariant basin.
+                    auto_weights = {
+                        "fape": 0.0, "torsion": 0.0, "distance": 0.0,
+                        "bond": 0.0, "clash": 0.0, "ca_position": 0.0,
+                        "kabsch_ca": 0.0,
+                        "contact_distance": float(
+                            getattr(config.optimization, "sc_contact_distance_weight", 1.0)
+                        ),
+                        "contact_binary": float(
+                            getattr(config.optimization, "sc_contact_binary_weight", 1.0)
+                        ),
+                    }
+                    auto_total, _auto_comps = stage_c_total_loss(
+                        auto_outputs, target, target_mask,
+                        weights=auto_weights,
+                        use_frame_aligned=True,
+                        anchor_CA=anchor_backbone[..., 1, :],
+                        anchor_R=R_anchor,
+                        residue_index=t_res_idx,
+                        chain_id=t_chain,
+                    )
+                    if torch.isfinite(auto_total):
+                        auto_contact_loss = auto_total
+                        total_loss = total_loss + _auto_w * auto_contact_loss
 
             # Explicit supervision for the Q-only translation path.  The
             # target is the internal anchor-relative deformation, expressed
@@ -708,6 +818,8 @@ def train_stage_c(config: TrainConfig) -> Path:
                     record["loss_q_translation"] = float(q_translation_loss.detach().cpu())
                 if q_shuffle_loss is not None:
                     record["loss_q_shuffle"] = float(q_shuffle_loss.detach().cpu())
+                if auto_contact_loss is not None:
+                    record["loss_auto_contact"] = float(auto_contact_loss.detach().cpu())
                 record["q_only_phase"] = bool(q_only_phase)
                 # Accumulation-only records have no current optimizer grad
                 # norm; zero would be misleading in the diagnostic log.
