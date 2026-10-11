@@ -197,11 +197,6 @@ def train_stage_c(config: TrainConfig) -> Path:
         getattr(config.model, "stage_c_finetune_temporal_encoder", False)
     )
     if config.init_checkpoint:
-        stage_b_model = StageBLASP(
-            config.model,
-            freeze_spatial_encoder=not finetune_spatial,
-            freeze_temporal_encoder=not finetune_temporal,
-        ).to(device)
         ckpt = torch.load(config.init_checkpoint, map_location=device)
         state = ckpt.get("model", ckpt) if isinstance(ckpt, dict) else ckpt
         # Preserve a canonical Stage B checkpoint in full.  Legacy Stage A/B
@@ -214,6 +209,37 @@ def train_stage_c(config: TrainConfig) -> Path:
             else:
                 remapped[k] = v
         state = remapped
+        # Infer the energy-graph condition/temperature layout from the saved
+        # weights (identical logic to the canonical eval loader).  The default
+        # constructor builds a 0-condition, temperature-free energy head, which
+        # does not match the canonical Stage-B checkpoint (edge=25, node=138,
+        # head=10 -> condition_dim=1, has_temperature=True).  Building the wrong
+        # layout raises a size-mismatch on load; this keeps training and eval on
+        # exactly the same Stage-B representation.
+        sb_condition_dim = 0
+        sb_has_temperature = True
+        _nw = state.get("energy_graph.node_nets.0.0.weight")
+        _ew = state.get("energy_graph.edge_net.0.weight")
+        _hw = state.get("energy_graph.energy_head.0.weight")
+        if _nw is not None and _ew is not None and _hw is not None:
+            edge_in = int(_ew.shape[1]); node_in = int(_nw.shape[1]); head_in = int(_hw.shape[1])
+            sb_condition_dim = edge_in - 2 * 8 - 8
+            sb_has_temperature = node_in == 8 + 128 + sb_condition_dim + 1
+            expected_node = 8 + 128 + sb_condition_dim + (1 if sb_has_temperature else 0)
+            expected_head = 8 + sb_condition_dim + (1 if sb_has_temperature else 0)
+            if sb_condition_dim not in (0, 1) or node_in != expected_node or head_in != expected_head:
+                raise RuntimeError(
+                    "unsupported Stage-B energy layout for Stage-C training: "
+                    f"edge={edge_in}, node={node_in}, head={head_in}, "
+                    f"condition={sb_condition_dim}"
+                )
+        stage_b_model = StageBLASP(
+            config.model,
+            freeze_spatial_encoder=not finetune_spatial,
+            freeze_temporal_encoder=not finetune_temporal,
+            condition_dim=sb_condition_dim,
+            energy_temperature_feature=sb_has_temperature,
+        ).to(device)
         incompatible = stage_b_model.load_state_dict(state, strict=False)
         # Keep the pretrained Stage-B dynamics and projection frozen.  Only
         # explicitly requested representation encoders are adapted.  eval()
