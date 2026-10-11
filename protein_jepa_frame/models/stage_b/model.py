@@ -686,7 +686,11 @@ class StageBLASP(nn.Module):
                     s_next = s_next + s_std * torch.randn_like(s)
                 if residue_mask is not None:
                     s_next = s_next * residue_mask.unsqueeze(-1).float()
-                s = s_next
+                # Clamp bath state to prevent blow-up: |s| should stay O(1)
+                # in the learned latent space. Unclamped back-action can send
+                # s → ±∞ when forces are large early in rollout, which then
+                # drives sys_forcing → ±∞ on the next substep.
+                s = s_next.clamp(-30.0, 30.0)
 
             # Q update
             q_next = q + drift
@@ -698,7 +702,10 @@ class StageBLASP(nn.Module):
                 m = residue_mask.unsqueeze(-1).float()
                 q_next = q_next * m + q * (1.0 - m)
 
-            q = q_next
+            # Clamp Q to prevent blow-up: |q| staying bounded keeps the
+            # energy network in its trained regime and prevents force
+            # explosion on subsequent substeps.
+            q = q_next.clamp(-200.0, 200.0)
 
         if return_diagnostics:
             diagnostics = {

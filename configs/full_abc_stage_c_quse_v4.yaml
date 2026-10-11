@@ -1,0 +1,80 @@
+# Stage C v4 (Q-utilization): the v3 model beats persistence on all four
+# contact/RMSD-relative conditions, but oracle==direct==qshuffle to 4 decimals
+# — the decoder is invariant to Q and explains everything via h_frozen + anchor
+# + basin-reversion.  To push RMSD below 2.0 A the decoder MUST use Q.
+#
+# Changes vs v3:
+#   * stage_c_q_only_steps: 600 — force dt_local = q_dt_local for the first
+#     600 optimizer steps so the only way to reduce kabsch_ca is through the
+#     explicit Q->translation head.  This breaks the h_frozen shortcut.
+#   * decoder_max_q_translation_update raised 2.0 -> 8.0 A so Q can express the
+#     full conformational displacement at diffusive timescales.
+#   * warm-start the decoder geometry from the v3 final checkpoint (contact &
+#     basin behaviour already good), re-anneal LR.
+output_dir: artifacts/full_abc_stage_c_quse_v4
+seed: 42
+deterministic: false
+device: cuda:0
+log_every: 10
+save_every: 1
+checkpoint_every_steps: 500
+init_checkpoint: artifacts/full_abc_stage_b_v3_final/checkpoint_latest.pt
+stage_c_pretrained: artifacts/full_abc_stage_c_contactfix_v3/checkpoint_latest.pt
+stage_c_pretrained_exclude_q_position: false
+resume_checkpoint: null
+strict_init: false
+
+data:
+  manifest_path: artifacts/mdcath_manifest_200dom/train.jsonl
+  batch_size: 2
+  num_workers: 0
+  num_frames: 8
+  frame_stride: 4
+  window_stride: 4
+  max_residues: 256
+  coordinate_scale: 1.0
+  training_mode: paired_window
+  paired_horizons_frames: [32, 64, 96]
+  paired_all_horizons: false
+  paired_history_mode: uniform
+
+model:
+  model_type: stage_c
+  q_dim: 8
+  latent_dim: 128
+  encoder_depth: 4
+  temporal_depth: 2
+  num_heads: 4
+  num_rbf: 16
+  max_frames: 128
+  max_residues: 256
+  dropout: 0.1
+  feature_norm: true
+  time_conditioning: physical
+  thermodynamic_conditioning: true
+  decoder_max_translation_update: 0.5
+  decoder_max_com_update: 4.0
+  decoder_max_q_translation_update: 8.0
+  stage_c_q_only_steps: 600
+  anchor_noise_level: 0.0
+  q_weight_ramp_start: 0
+  q_weight_ramp_steps: 1000
+
+optimization:
+  lr: 5.0e-5
+  epochs: 24
+  warmup_steps: 200
+  weight_decay: 0.01
+  grad_clip: 10.0
+  gradient_accumulation_steps: 4
+  steps_per_epoch: 300
+  encoder_lr_scale: 0.2
+  sc_fape_weight: 0.2
+  sc_torsion_weight: 0.5
+  sc_distance_weight: 0.3
+  sc_bond_weight: 0.1
+  sc_clash_weight: 0.05
+  sc_ca_position_weight: 0.05
+  sc_kabsch_weight: 1.0
+  sc_contact_distance_weight: 1.0
+  sc_contact_binary_weight: 2.0
