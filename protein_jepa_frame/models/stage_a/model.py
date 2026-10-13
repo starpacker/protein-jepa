@@ -25,6 +25,7 @@ from protein_jepa_frame.models.predictor import (
     StatePredictor,
 )
 from protein_jepa_frame.models.temporal import TemporalStateEncoder
+from protein_jepa_frame.models.time_features import LogTimeEmbedding
 
 
 @dataclass(frozen=True)
@@ -84,6 +85,43 @@ class StageAConfig:
             k: getattr(config, k) for k in cls.__dataclass_fields__
             if hasattr(config, k)
         })
+
+
+class DynamicJEPAHead(nn.Module):
+    """Predict a future-view per-residue dynamic H from context dynamic H.
+
+    The target is produced by the EMA dynamic encoder and detached by the
+    caller.  This is a JEPA transition in latent space, not a supervised
+    coordinate/displacement head.
+    """
+
+    def __init__(self, latent_dim: int, depth: int = 2, dropout: float = 0.1):
+        super().__init__()
+        self.time_embed = LogTimeEmbedding(latent_dim)
+        hidden = latent_dim * 2
+        layers: list[nn.Module] = [
+            nn.LayerNorm(latent_dim),
+            nn.Linear(latent_dim, hidden),
+            nn.GELU(),
+            nn.Dropout(dropout),
+        ]
+        for _ in range(max(0, depth - 1)):
+            layers.extend([nn.Linear(hidden, hidden), nn.GELU(), nn.Dropout(dropout)])
+        self.trunk = nn.Sequential(*layers)
+        self.out = nn.Linear(hidden, latent_dim)
+
+    def forward(
+        self,
+        context_residue_state: torch.Tensor,
+        horizon_time_ps: torch.Tensor,
+    ) -> torch.Tensor:
+        if context_residue_state.dim() != 3:
+            raise ValueError("context_residue_state must be [B,L,D]")
+        if horizon_time_ps.dim() != 1 or horizon_time_ps.shape[0] != context_residue_state.shape[0]:
+            raise ValueError("horizon_time_ps must be [B]")
+        time = self.time_embed(horizon_time_ps).to(dtype=context_residue_state.dtype)
+        x = context_residue_state + time[:, None, :]
+        return self.out(self.trunk(x))
 
 
 class StageAJEPA(nn.Module):
@@ -216,6 +254,14 @@ class StageAJEPA(nn.Module):
             else:
                 self.dynamic_gate = None
 
+            self.dynamic_jepa_predictor = DynamicJEPAHead(
+                latent_dim=config.latent_dim,
+                depth=max(1, config.paired_predictor_depth),
+                dropout=config.dropout,
+            )
+        else:
+            self.dynamic_jepa_predictor = None
+
         # Frame-level state predictor
         self.state_predictor = (
             StatePredictor(
@@ -243,6 +289,25 @@ class StageAJEPA(nn.Module):
         )
 
         self._curriculum_step = 0
+
+        # iter_010: per-residue displacement prediction head.
+        # Consumes a per-residue motion feature = [last-frame H_res,
+        # H_res(t_last) - H_res(t_last-k) temporal delta] so the GRADIENT reaches
+        # the encoder's temporal axis and cannot be satisfied by a static code.
+        # Last layer zero-init: predicts exactly zero (= persistence) at load.
+        disp_hidden = int(getattr(config, "disp_head_hidden", 128))
+        self.disp_use_temporal_delta = bool(getattr(config, "disp_use_temporal_delta", True))
+        self.disp_delta_k = int(getattr(config, "disp_delta_k", 4))
+        disp_in = config.latent_dim * (2 if self.disp_use_temporal_delta else 1)
+        self.displacement_head = nn.Sequential(
+            nn.Linear(disp_in, disp_hidden),
+            nn.GELU(),
+            nn.LayerNorm(disp_hidden),
+            nn.Linear(disp_hidden, 3),
+        )
+        nn.init.zeros_(self.displacement_head[-1].weight)
+        nn.init.zeros_(self.displacement_head[-1].bias)
+
 
     def train(self, mode: bool = True) -> "StageAJEPA":
         super().train(mode)
@@ -276,28 +341,22 @@ class StageAJEPA(nn.Module):
     def update_target_encoder(self, momentum: float) -> None:
         if self.config.freeze_target_encoders:
             return
-        for target, context in zip(
-            self.target_encoder.parameters(), self.context_encoder.parameters()
-        ):
-            target.data.mul_(momentum).add_(context.detach().data, alpha=1.0 - momentum)
+        def _ema_module(target_module: nn.Module, online_module: nn.Module) -> None:
+            for target, online in zip(target_module.parameters(), online_module.parameters()):
+                target.data.mul_(momentum).add_(online.detach().data, alpha=1.0 - momentum)
+            for target, online in zip(target_module.buffers(), online_module.buffers()):
+                if target.dtype.is_floating_point:
+                    target.data.mul_(momentum).add_(online.detach().data, alpha=1.0 - momentum)
+                else:
+                    target.data.copy_(online.data)
+
+        _ema_module(self.target_encoder, self.context_encoder)
         if self.target_temporal_encoder is not None and self.temporal_encoder is not None:
-            for target, context in zip(
-                self.target_temporal_encoder.parameters(),
-                self.temporal_encoder.parameters(),
-            ):
-                target.data.mul_(momentum).add_(context.detach().data, alpha=1.0 - momentum)
+            _ema_module(self.target_temporal_encoder, self.temporal_encoder)
         if self.target_offline_temporal_encoder is not None and self.offline_temporal_encoder is not None:
-            for target, context in zip(
-                self.target_offline_temporal_encoder.parameters(),
-                self.offline_temporal_encoder.parameters(),
-            ):
-                target.data.mul_(momentum).add_(context.detach().data, alpha=1.0 - momentum)
+            _ema_module(self.target_offline_temporal_encoder, self.offline_temporal_encoder)
         if self.target_dynamic_encoder is not None and self.dynamic_encoder is not None:
-            for target, context in zip(
-                self.target_dynamic_encoder.parameters(),
-                self.dynamic_encoder.parameters(),
-            ):
-                target.data.mul_(momentum).add_(context.detach().data, alpha=1.0 - momentum)
+            _ema_module(self.target_dynamic_encoder, self.dynamic_encoder)
 
     def forward_mask_prediction(
         self, batch: dict, context_mask: torch.Tensor, target_mask: torch.Tensor
@@ -339,6 +398,7 @@ class StageAJEPA(nn.Module):
             "predictions": predictions,
             "targets": target_latents,
             "target_mask": target_mask,
+            "context_mask": context_mask,
             "context_latents": context_latents,
         }
 
@@ -360,8 +420,11 @@ class StageAJEPA(nn.Module):
                     coords=coords,
                     residue_mask=residue_mask,  # Gate 1 fix: physical mask, not JEPA context_mask
                     residue_index=residue_index, chain_id=chain_id, dt=dt,
+                    observation_mask=context_mask,
                 )
-                context_states = self._fuse_dynamic(context_states, dynamic_out)
+                context_states = self._fuse_dynamic(
+                    context_states, dynamic_out, residue_latents=context_latents
+                )
 
             outputs.update(context_states)
 
@@ -376,8 +439,11 @@ class StageAJEPA(nn.Module):
                     target_dynamic_out = self.target_dynamic_encoder(
                         coords=coords, residue_mask=residue_mask,
                         residue_index=residue_index, chain_id=chain_id, dt=dt,
+                        observation_mask=residue_mask,
                     )
-                    target_states = self._fuse_dynamic(target_states, target_dynamic_out)
+                    target_states = self._fuse_dynamic(
+                        target_states, target_dynamic_out, residue_latents=target_latents
+                    )
                 target_frame_states = target_states["frame_states"]
                 if self.config.feature_norm:
                     target_frame_states = F.layer_norm(
@@ -442,7 +508,9 @@ class StageAJEPA(nn.Module):
                 chain_id=batch["context_chain_id"],
                 dt=dt,
             )
-            context_states = self._fuse_dynamic(context_states, dynamic_out)
+            context_states = self._fuse_dynamic(
+                context_states, dynamic_out, residue_latents=context_latents
+            )
 
         # EMA targets
         with torch.no_grad():
@@ -485,7 +553,10 @@ class StageAJEPA(nn.Module):
                     chain_id=batch["context_chain_id"],
                     dt=dt,
                 )
-                teacher_context_states = self._fuse_dynamic(teacher_context_states, teacher_dynamic_out)
+                teacher_context_states = self._fuse_dynamic(
+                    teacher_context_states, teacher_dynamic_out,
+                    residue_latents=teacher_context_latents,
+                )
             future_states = self.target_temporal_encoder(
                 future_latents,
                 batch["future_residue_mask"],
@@ -502,7 +573,9 @@ class StageAJEPA(nn.Module):
                     chain_id=batch["future_chain_id"],
                     dt=dt,
                 )
-                future_states = self._fuse_dynamic(future_states, future_dynamic_out)
+                future_states = self._fuse_dynamic(
+                    future_states, future_dynamic_out, residue_latents=future_latents
+                )
 
             # Endpoint encoding
             context_endpoint_ema = self._mean_over_valid(
@@ -556,9 +629,139 @@ class StageAJEPA(nn.Module):
             "horizon_time_ps": batch["horizon_time_ps"],
             "horizon_frames": batch["horizon_frames"],
             "online_context_state": context_endpoint.detach(),
+            # Explicit H surfaces for Stage-A diagnostics and the later Stage-B
+            # handoff.  They are not used as a coordinate-supervised shortcut.
+            "context_frame_states": context_states["frame_states"],
+            "context_residue_states": context_states.get("residue_states"),
+            "future_residue_states": future_states.get("residue_states"),
         }
 
+        if self.dynamic_encoder is not None and self.dynamic_jepa_predictor is not None:
+            context_dynamic_endpoint = context_states["dynamic_residue_states"][:, -1]
+            future_dynamic_endpoint = future_states["dynamic_residue_states"][:, -1]
+            dynamic_prediction = self.dynamic_jepa_predictor(
+                context_dynamic_endpoint, batch["horizon_time_ps"]
+            )
+            dynamic_valid = (
+                batch["context_residue_mask"][:, -1]
+                & batch["future_residue_mask"][:, -1]
+            )
+            outputs.update({
+                "context_dynamic_endpoint": context_dynamic_endpoint,
+                "dynamic_prediction": dynamic_prediction,
+                "dynamic_target": future_dynamic_endpoint.detach(),
+                "dynamic_target_mask": dynamic_valid,
+                "dynamic_context_mask": batch["context_residue_mask"][:, -1],
+            })
+
         return outputs
+
+    def forward_displacement(
+        self, batch: dict
+    ) -> dict[str, torch.Tensor]:
+        """Per-residue displacement prediction from context H.
+
+        Supervision: Kabsch-aligned ground-truth displacements computed from
+        the last context frame anchor and the last future frame target, both in
+        the per-residue anchor backbone frame.  This forces H to encode WHERE
+        each residue is moving, not just where it is now.
+
+        Returns dict with keys:
+          disp_pred   [B, L, 3]  predicted displacement in anchor frame
+          disp_target [B, L, 3]  Kabsch-aligned target displacement in anchor frame
+          valid_mask  [B, L]     bool, residues valid in both context and future
+        """
+        # ── Encode context (last frame only for displacement) ──
+        # context_encoder expects [B,T,L,4,3]; run full sequence, take last frame H
+        context_latents = self.context_encoder(
+            coords=batch["context_coords"],
+            residue_mask=batch["context_residue_mask"],
+            aatype=batch["context_aatype"],
+            residue_index=batch["context_residue_index"],
+            chain_id=batch["context_chain_id"],
+            token_mask=batch["context_residue_mask"],
+        )
+        # context_latents: [B, T, L, D]; take last frame
+        h_last = context_latents[:, -1]  # [B, L, D]
+
+        # iter_010: temporal-delta motion feature. Gives the head (and thus the
+        # encoder) a per-residue motion signal; a static code cannot drive it.
+        if getattr(self, "disp_use_temporal_delta", False):
+            n_t = context_latents.shape[1]
+            k = max(1, min(int(getattr(self, "disp_delta_k", 4)), n_t - 1))
+            h_prev = context_latents[:, -1 - k]  # [B, L, D]
+            h_motion = torch.cat([h_last, h_last - h_prev], dim=-1)  # [B, L, 2D]
+        else:
+            h_motion = h_last
+
+        # ── Compute displacement head prediction ──
+        if not hasattr(self, "displacement_head"):
+            raise AttributeError(
+                "displacement_head not found; rebuild model with displacement head enabled"
+            )
+        disp_pred = self.displacement_head(h_motion)  # [B, L, 3]
+
+        # Target stays the Kabsch-aligned local displacement (below); weighting
+        # for the learnable regime is handled in the loss, not by band-limiting here.
+
+        # ── Compute Kabsch-aligned ground-truth displacement target ──
+        # The raw MD trajectory contains global rigid-body translation/rotation
+        # of the whole protein inside the simulation box.  The eval protocol
+        # Kabsch-superposes the prediction onto the target before scoring, which
+        # removes exactly that rigid component.  We therefore must superpose the
+        # future frame onto the anchor frame FIRST, and only then measure the
+        # per-residue displacement.  Anything else supervises ~31 A of global
+        # drift (measured) instead of the internal conformational change.
+        anchor_bb = batch["context_coords"][:, -1]   # [B, L, 4, 3]
+        future_bb = batch["future_coords"][:, -1]    # [B, L, 4, 3]
+
+        ctx_mask = batch["context_residue_mask"][:, -1].bool()   # [B, L]
+        fut_mask = batch["future_residue_mask"][:, -1].bool()    # [B, L]
+        valid = ctx_mask & fut_mask                               # [B, L]
+
+        anchor_ca = anchor_bb[..., 1, :]   # [B, L, 3]
+        future_ca = future_bb[..., 1, :]   # [B, L, 3]
+
+        # ── Per-sample Kabsch superposition of future CA onto anchor CA ──
+        # (weighted by the shared valid mask; removes global rot + trans)
+        B, L = valid.shape
+        m = valid.to(anchor_ca.dtype).unsqueeze(-1)                # [B,L,1]
+        n_valid = m.sum(dim=1, keepdim=True).clamp(min=1.0)        # [B,1,1]
+        anchor_mean = (anchor_ca * m).sum(dim=1, keepdim=True) / n_valid  # [B,1,3]
+        future_mean = (future_ca * m).sum(dim=1, keepdim=True) / n_valid  # [B,1,3]
+        anchor_c = (anchor_ca - anchor_mean) * m                   # [B,L,3]
+        future_c = (future_ca - future_mean) * m                   # [B,L,3]
+
+        # H = sum_i future_c_i^T anchor_c_i  -> [B,3,3]
+        H = future_c.transpose(-2, -1) @ anchor_c                  # [B,3,3]
+        U, S, Vt = torch.linalg.svd(H)                             # batched SVD
+        # Correct for reflection so R is a proper rotation
+        det = torch.det(U @ Vt)                                    # [B]
+        d_fix = torch.ones(B, 3, device=U.device, dtype=U.dtype)
+        d_fix[:, -1] = torch.sign(det)
+        # Kabsch rotation such that:  future_c @ R_fix^T  ==  anchor_c
+        # (verified convention: R = V diag(d) U^T with H = future_c^T @ anchor_c)
+        R_fix = Vt.transpose(-2, -1) @ torch.diag_embed(d_fix) @ U.transpose(-2, -1)  # [B,3,3]
+        future_ca_aligned = future_c @ R_fix.transpose(-2, -1) + anchor_mean  # [B,L,3]
+
+        # Internal (rigid-removed) global displacement
+        disp_g = future_ca_aligned - anchor_ca                     # [B,L,3]
+
+        # Per-residue anchor backbone frame (from the anchor structure)
+        from protein_jepa_frame.models.stage_c.geometry import RigidBodyFrame
+        N_a  = anchor_bb[..., 0, :]
+        C_a  = anchor_bb[..., 2, :]
+        Rf, tf = RigidBodyFrame.from_backbone(N_a, anchor_ca, C_a)  # Rf [B,L,3,3]
+
+        # Rotate into per-residue anchor frame (fully SE(3)-invariant target,
+        # after the global Kabsch rigid-body removal above)
+        disp_local = (Rf.transpose(-2, -1) @ disp_g.unsqueeze(-1)).squeeze(-1)  # [B,L,3]
+
+        return {
+            "disp_pred":   disp_pred,
+            "disp_target": disp_local.detach(),
+            "valid_mask":  valid,
+        }
 
     def forward(
         self,
@@ -589,7 +792,10 @@ class StageAJEPA(nn.Module):
 
 
     def _fuse_dynamic(
-        self, temporal_states: dict[str, torch.Tensor], dynamic_states: dict[str, torch.Tensor]
+        self,
+        temporal_states: dict[str, torch.Tensor],
+        dynamic_states: dict[str, torch.Tensor],
+        residue_latents: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         """Fuse coordinate-derived dynamic states into temporal states.
 
@@ -608,25 +814,39 @@ class StageAJEPA(nn.Module):
 
         if fusion == "replace":
             # Replace temporal states entirely with dynamic states
-            return {
+            fused = {
                 "frame_states": dynamic_states["dynamic_frame_states"],
                 "clip_state": dynamic_states["dynamic_clip_state"],
             }
         elif fusion == "add":
             # Simple addition: static + dynamic
-            return {
+            fused = {
                 "frame_states": temporal_states["frame_states"] + dynamic_states["dynamic_frame_states"],
                 "clip_state": temporal_states["clip_state"] + dynamic_states["dynamic_clip_state"],
             }
         elif fusion == "gate":
             # Gated fusion: static + gate * dynamic
             gate = torch.sigmoid(self.dynamic_gate)
-            return {
+            fused = {
                 "frame_states": temporal_states["frame_states"] + gate * dynamic_states["dynamic_frame_states"],
                 "clip_state": temporal_states["clip_state"] + gate * dynamic_states["dynamic_clip_state"],
             }
         else:
             raise ValueError(f"Unknown dynamic_fusion mode: {fusion}")
+
+        # Preserve the per-residue representation for Stage-B consumers and
+        # diagnostics.  It is formed only after the dynamic branch has kept
+        # residue identity, so localized motion is not irreversibly averaged.
+        if "dynamic_residue_states" in dynamic_states:
+            residue_dynamic = dynamic_states["dynamic_residue_states"]
+            if fusion == "replace":
+                fused["residue_states"] = residue_dynamic
+            elif residue_latents is not None:
+                fused["residue_states"] = residue_latents + residue_dynamic
+            else:
+                fused["residue_states"] = residue_dynamic
+            fused["dynamic_residue_states"] = residue_dynamic
+        return fused
 
     @staticmethod
     def _mean_over_valid(

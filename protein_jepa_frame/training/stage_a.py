@@ -25,6 +25,12 @@ from protein_jepa_frame.data.dataset import build_dataset, validate_real_paired_
 from protein_jepa_frame.data.masks import SpatiotemporalBlockMasker
 from protein_jepa_frame.data.sampler import HierarchicalClipSampler
 from protein_jepa_frame.models.stage_a import StageAJEPA, stage_a_total_loss
+from protein_jepa_frame.models.stage_a.objectives import (
+    stage_a_displacement_loss,
+    temporal_covariance_regularizer,
+    temporal_variance_regularizer,
+    temporal_velocity_loss,
+)
 from protein_jepa_frame.training.train_utils import (
     _device, _set_reproducibility, _move_batch,
     _momentum, _lr_scale, _warmup_scale,
@@ -200,6 +206,18 @@ def train_stage_a(config: TrainConfig) -> Path:
             "lr": config.optimization.lr,
             "base_lr_scale": 1.0,
         })
+    if model.dynamic_encoder is not None:
+        param_groups.append({
+            "params": model.dynamic_encoder.parameters(),
+            "lr": config.optimization.lr,
+            "base_lr_scale": 1.0,
+        })
+    if model.dynamic_jepa_predictor is not None:
+        param_groups.append({
+            "params": model.dynamic_jepa_predictor.parameters(),
+            "lr": config.optimization.lr,
+            "base_lr_scale": 1.0,
+        })
     if model.state_predictor is not None:
         param_groups.append({
             "params": model.state_predictor.parameters(),
@@ -289,6 +307,9 @@ def train_stage_a(config: TrainConfig) -> Path:
                     mask_weight=config.optimization.residue_jepa_weight,
                     residue_weight=config.optimization.residue_jepa_weight,
                     state_weight=config.optimization.state_jepa_weight,
+                    dynamic_activity_weight=config.optimization.stage_a_dynamic_activity_weight,
+                    dynamic_covariance_weight=config.optimization.stage_a_dynamic_covariance_weight,
+                    dynamic_variance_floor=config.optimization.stage_a_dynamic_variance_floor,
                 )
             else:  # "paired"
                 # The batch from collate_paired_windows is already flat:
@@ -338,6 +359,10 @@ def train_stage_a(config: TrainConfig) -> Path:
                     paired_outputs=outputs,
                     paired_weight=1.0,
                     mask_weight=0.0,
+                    dynamic_jepa_weight=config.optimization.stage_a_dynamic_jepa_weight,
+                    dynamic_activity_weight=config.optimization.stage_a_dynamic_activity_weight,
+                    dynamic_covariance_weight=config.optimization.stage_a_dynamic_covariance_weight,
+                    dynamic_variance_floor=config.optimization.stage_a_dynamic_variance_floor,
                 )
                 log_dict["task"] = "paired"
                 if not skip_controls:

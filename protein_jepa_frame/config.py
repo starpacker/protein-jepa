@@ -64,6 +64,11 @@ class ModelConfig:
     decoder_max_translation_update: float = 0.5
     decoder_max_com_update: float = 4.0
     decoder_max_q_translation_update: float = 2.0
+    # iter_005: drive the canonical CA translation purely from the eval-legal
+    # analytic basin displacement, removing the learned per-residue translation
+    # residual that measurably destroys the contact map under the canonical
+    # metric.  See models/stage_c/structure_decoder.py DecoderConfig.
+    decoder_basin_only_ca: bool = False
     # Stage-C controlled end-to-end fine-tuning.  The default preserves the
     # canonical frozen-AB protocol; experiments can selectively adapt the
     # representation without unfreezing Stage-B transition/dynamics heads.
@@ -483,6 +488,13 @@ class OptimizationConfig:
     state_variance_reg: float = 0.0
     state_feature_variance_reg: float = 0.0
     state_covariance_reg: float = 0.0
+    # Stage-A dynamic JEPA reconstruction.  These terms are structural
+    # self-supervision: the target is the EMA encoder's future-view H, not a
+    # hand-labelled displacement target.
+    stage_a_dynamic_jepa_weight: float = 1.0
+    stage_a_dynamic_activity_weight: float = 0.05
+    stage_a_dynamic_covariance_weight: float = 0.01
+    stage_a_dynamic_variance_floor: float = 0.02
     msm_state_weight: float = 0.0
     vamp2_weight: float = 0.0
     vamp2_lag: int = 1

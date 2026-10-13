@@ -112,6 +112,14 @@ class DecoderConfig:
     max_translation_update: float = 0.5  # per-component local-frame bound (Å)
     max_com_update: float = 4.0          # per-component COM bound (Å)
     max_q_translation_update: float = 2.0  # explicit Q→frame residual bound (Å)
+    # iter_005: when True, the canonical CA translation is driven purely by the
+    # eval-legal analytic basin displacement (context-mean CA in anchor frame).
+    # The learned per-residue frame_update/q_translation residuals -- which
+    # measurably destroy the contact map without improving Kabsch RMSD because
+    # context cannot predict internal deformation direction -- are removed from
+    # the CA position.  Rotation and torsion prediction are unaffected so the
+    # atom37 reconstruction geometry is preserved.
+    basin_only_ca: bool = False
 
 
 def reconstruct_atom37(
@@ -765,7 +773,17 @@ class StructureDecoder(nn.Module):
         # dominant eval-legal signal at diffusive timescales; the IPA/Q
         # residuals above only fine-tune around it.
         basin_gate_val = None
-        if basin_dt_local is not None:
+        if getattr(self.config, "basin_only_ca", False) and basin_dt_local is not None:
+            # iter_005: the canonical CA translation is EXACTLY the analytic
+            # basin displacement.  The learned frame_update/q_translation
+            # residuals are measured contact noise (they move CAs in internal
+            # directions context cannot predict), so they are removed from the
+            # CA position entirely.  gate is pinned to 1.0.
+            basin_gate_val = torch.ones(
+                B, L, 1, device=device, dtype=basin_dt_local.dtype
+            )
+            dt_local = basin_dt_local
+        elif basin_dt_local is not None:
             gate_in = torch.cat([h_frozen, q_dynamics], dim=-1)
             basin_gate_val = torch.sigmoid(self.basin_gate(gate_in))  # [B, L, 1]
             dt_local = dt_local + basin_gate_val * basin_dt_local

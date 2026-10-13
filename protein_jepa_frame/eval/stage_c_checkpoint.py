@@ -10,6 +10,7 @@ from protein_jepa_frame.config import ModelConfig
 from protein_jepa_frame.models.stage_c.direct_head import DirectEndpointHead, DirectHeadConfig
 from protein_jepa_frame.models.stage_c.structure_decoder import DecoderConfig, StructureDecoder
 from protein_jepa_frame.models.stage_b.model import StageBLASP
+from protein_jepa_frame.models.stage_b.kinematic import StageBLASP_Kinematic
 
 
 def split_stage_c_state(decoder, direct_head, state: Mapping[str, torch.Tensor]):
@@ -61,6 +62,7 @@ def stage_c_configs_from_checkpoint(checkpoint, context_dim: int = 128):
         max_translation_update=float(model.get("decoder_max_translation_update", 0.5)),
         max_com_update=float(model.get("decoder_max_com_update", 4.0)),
         max_q_translation_update=float(model.get("decoder_max_q_translation_update", 2.0)),
+        basin_only_ca=bool(model.get("decoder_basin_only_ca", False)),
     )
     direct_cfg = DirectHeadConfig(
         context_dim=latent_dim, condition_dim=0,
@@ -165,14 +167,38 @@ def load_stage_b_for_stage_c(
     else:
         condition_dim = 0
         has_temperature = True
-    sb = StageBLASP(
+    # iter_008: the Q projection may carry an explicit, SE(3)-invariant
+    # kinematic channel (StageBLASP_Kinematic).  The architecture flag lives
+    # in the checkpoint config; rebuild the identical subclass so the routed
+    # channel is actually used at evaluation instead of being silently
+    # dropped by a plain StageBLASP.
+    arch = sb_cfg.get("arch", "canonical")
+    if any(k.startswith(("kin_encoder.", "projection_kin.")) for k in remapped):
+        arch = "kinematic"
+    cls = StageBLASP_Kinematic if arch == "kinematic" else StageBLASP
+    extra = ({"kin_hidden": int(sb_cfg.get("kin_hidden", 64))}
+             if cls is StageBLASP_Kinematic else {})
+    sb = cls(
         mc,
         condition_dim=condition_dim,
         use_bath=sb_cfg.get("lspwm_use_bath", True),
         history_aware=sb_cfg.get("lspwm_history_aware", True),
         energy_temperature_feature=has_temperature,
+        **extra,
     ).to(device)
     sb.load_state_dict(remapped, strict=True if embedded is not None else False)
+    if embedded is None and arch == "kinematic":
+        # A kinematic Stage-B checkpoint must be fully consumed apart from the
+        # (zero-initialised) kinematic branch.  Anything else missing means
+        # the wrong architecture was rebuilt.
+        _kin_prefixes = ("kin_encoder.", "projection_kin.")
+        bad = [k for k in sb.state_dict()
+               if k not in remapped and not k.startswith(_kin_prefixes)]
+        if bad:
+            raise RuntimeError(
+                f"Stage-B checkpoint does not match rebuilt architecture; "
+                f"missing={bad[:8]}"
+            )
     sb.eval()
     for parameter in sb.parameters():
         parameter.requires_grad = False

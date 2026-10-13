@@ -22,6 +22,7 @@ from protein_jepa_frame.config import TrainConfig, config_to_dict
 from protein_jepa_frame.data.collate import collate_paired_windows
 from protein_jepa_frame.data.dataset import build_dataset, validate_real_paired_window_protocol
 from protein_jepa_frame.models.stage_b.model import StageBLASP
+from protein_jepa_frame.models.stage_b.kinematic import StageBLASP_Kinematic
 from protein_jepa_frame.models.stage_c import (
     StructureDecoder,
     DecoderConfig,
@@ -233,14 +234,29 @@ def train_stage_c(config: TrainConfig) -> Path:
                     f"edge={edge_in}, node={node_in}, head={head_in}, "
                     f"condition={sb_condition_dim}"
                 )
-        stage_b_model = StageBLASP(
+        _sb_arch = "kinematic" if any(
+            k.startswith(("kin_encoder.", "projection_kin.")) for k in state
+        ) else "canonical"
+        _sb_cls = StageBLASP_Kinematic if _sb_arch == "kinematic" else StageBLASP
+        _sb_extra = ({"kin_hidden": 64} if _sb_cls is StageBLASP_Kinematic else {})
+        stage_b_model = _sb_cls(
             config.model,
             freeze_spatial_encoder=not finetune_spatial,
             freeze_temporal_encoder=not finetune_temporal,
             condition_dim=sb_condition_dim,
             energy_temperature_feature=sb_has_temperature,
+            **_sb_extra,
         ).to(device)
         incompatible = stage_b_model.load_state_dict(state, strict=False)
+        # The kinematic branch must be fully consumed when present; a plain
+        # StageBLASP would silently drop the routed Q channel.
+        if _sb_arch == "kinematic":
+            _bad = [k for k in incompatible.missing_keys
+                    if not k.startswith(("kin_encoder.", "projection_kin."))]
+            if _bad:
+                raise RuntimeError(
+                    f"Stage-B checkpoint missing non-kinematic keys: {_bad[:8]}"
+                )
         # Keep the pretrained Stage-B dynamics and projection frozen.  Only
         # explicitly requested representation encoders are adapted.  eval()
         # disables dropout while retaining autograd for those encoders, which
@@ -275,6 +291,9 @@ def train_stage_c(config: TrainConfig) -> Path:
         ),
         max_q_translation_update=float(
             getattr(config.model, "decoder_max_q_translation_update", 2.0)
+        ),
+        basin_only_ca=bool(
+            getattr(config.model, "decoder_basin_only_ca", False)
         ),
     )
     decoder = StructureDecoder(decoder_cfg).to(device)

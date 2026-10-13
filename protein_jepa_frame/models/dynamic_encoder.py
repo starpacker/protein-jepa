@@ -107,7 +107,70 @@ def _ca_displacement_features(ca_coords: torch.Tensor, valid_mask: torch.Tensor)
     return displacements
 
 
-def _pair_distance_changes(ca_coords: torch.Tensor, k_nearest: int = 8) -> torch.Tensor:
+def _local_backbone_frames(coords: torch.Tensor) -> torch.Tensor:
+    """Return a differentiable residue-local frame for each backbone.
+
+    The rows are the local x/y/z axes.  This is deliberately constructed from
+    N--CA--C only, so a rigid translation/rotation of the whole protein does
+    not become a fake residue velocity.
+    """
+    ca = coords[..., 1, :]
+    x_axis = torch.nn.functional.normalize(coords[..., 2, :] - ca, dim=-1, eps=1.0e-8)
+    n_direction = torch.nn.functional.normalize(coords[..., 0, :] - ca, dim=-1, eps=1.0e-8)
+    z_axis = torch.nn.functional.normalize(torch.cross(x_axis, n_direction, dim=-1), dim=-1, eps=1.0e-8)
+    y_axis = torch.nn.functional.normalize(torch.cross(z_axis, x_axis, dim=-1), dim=-1, eps=1.0e-8)
+    return torch.stack([x_axis, y_axis, z_axis], dim=-2)
+
+
+def _local_motion_features(
+    coords: torch.Tensor,
+    residue_mask: torch.Tensor,
+    dt: torch.Tensor | None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Compute local-frame displacement, velocity-like and acceleration-like terms.
+
+    ``dt`` is normalized within each clip.  This keeps the representation in a
+    numerically useful range while retaining the physical ordering/ratio of
+    frame intervals.  The first frame has no predecessor and is exactly zero.
+    """
+    ca = coords[..., 1, :]
+    displacement = _ca_displacement_features(ca, residue_mask)
+    frames = _local_backbone_frames(coords)
+    # Use the previous residue frame to express the motion from t-1 to t.
+    local_displacement = torch.zeros_like(displacement)
+    local_displacement[:, 1:] = torch.einsum(
+        "btlij,btlj->btli", frames[:, :-1], displacement[:, 1:]
+    )
+    local_displacement = local_displacement * residue_mask.unsqueeze(-1).to(coords.dtype)
+
+    B, T = coords.shape[:2]
+    if dt is None:
+        dt_rel = coords.new_ones(B, T)
+    else:
+        if dt.dim() == 3:
+            dt = dt.squeeze(-1)
+        dt = dt.to(device=coords.device, dtype=coords.dtype)
+        positive = dt[:, 1:].abs()
+        scale = positive.mean(dim=1, keepdim=True).clamp_min(1.0e-6) if T > 1 else coords.new_ones(B, 1)
+        dt_rel = dt.abs() / scale
+        dt_rel[:, 0] = 1.0
+        dt_rel = dt_rel.clamp_min(1.0e-3)
+
+    velocity = local_displacement / dt_rel[:, :, None, None]
+    acceleration = torch.zeros_like(velocity)
+    if T > 1:
+        acceleration[:, 1:] = (velocity[:, 1:] - velocity[:, :-1]) / dt_rel[:, 1:, None, None]
+    pair_valid = residue_mask
+    velocity = velocity * pair_valid.unsqueeze(-1).to(coords.dtype)
+    acceleration = acceleration * pair_valid.unsqueeze(-1).to(coords.dtype)
+    return local_displacement, velocity, acceleration
+
+
+def _pair_distance_changes(
+    ca_coords: torch.Tensor,
+    k_nearest: int = 8,
+    valid_mask: torch.Tensor | None = None,
+) -> torch.Tensor:
     """Compute changes in k-nearest CA pair distances frame-to-frame.
 
     Args:
@@ -126,6 +189,10 @@ def _pair_distance_changes(ca_coords: torch.Tensor, k_nearest: int = 8) -> torch
 
     # Find k-nearest at t=0 (topology remains same)
     dist_t0 = distances[:, 0]  # [B, L, L]
+    if valid_mask is not None:
+        valid0 = valid_mask[:, 0]
+        pair0 = valid0[:, :, None] & valid0[:, None, :]
+        dist_t0 = dist_t0.masked_fill(~pair0, 1.0e6)
     dist_t0 = dist_t0 + torch.eye(L, device=dist_t0.device).unsqueeze(0) * 1e6  # mask diagonal
     _, nearest_indices = torch.topk(dist_t0, k=min(k_nearest, L), largest=False, dim=-1)  # [B, L, k]
 
@@ -140,6 +207,17 @@ def _pair_distance_changes(ca_coords: torch.Tensor, k_nearest: int = 8) -> torch
     # Compute temporal changes
     distance_changes = torch.zeros_like(nearest_distances)
     distance_changes[:, 1:] = nearest_distances[:, 1:] - nearest_distances[:, :-1]
+    if valid_mask is not None:
+        # Gather-compatible validity is the validity of the center and its
+        # tracked neighbors.
+        neighbour_valid = torch.gather(
+            valid_mask.unsqueeze(-1).expand(B, T, L, L),
+            3,
+            nearest_indices.unsqueeze(1).expand(B, T, L, k_actual),
+        )
+        distance_changes = distance_changes * (
+            valid_mask.unsqueeze(-1) & neighbour_valid
+        ).to(distance_changes.dtype)
 
     # Pad if needed
     if k_actual < k_nearest:
@@ -207,10 +285,12 @@ class DynamicStateEncoder(nn.Module):
         self.use_torsion_changes = use_torsion_changes
         self.use_dt_conditioning = use_dt_conditioning
 
-        # Dynamic feature projection
+        # Dynamic feature projection.  The local displacement, velocity-like
+        # and acceleration-like channels are all per-residue; no residue mean
+        # pooling happens before this projection.
         dynamic_dim = 0
         if use_displacement:
-            dynamic_dim += 3  # CA displacement (x, y, z)
+            dynamic_dim += 9  # local displacement + velocity-like + acceleration-like
         if use_pair_distance_changes:
             dynamic_dim += k_nearest  # k-nearest pair distance changes
         if use_torsion_changes:
@@ -223,10 +303,17 @@ class DynamicStateEncoder(nn.Module):
             nn.Linear(dynamic_dim, latent_dim, bias=False),
             nn.GELU(),
         )
-        # No LayerNorm or temporal Transformer here. Dynamic features are per-frame
-        # and frame-local. Cross-frame modeling is the TemporalStateEncoder's job.
-        # Adding per-frame biases (LN affine, FF biases) would break the zero-output
-        # invariant for static coordinates.
+        # A bias-free temporal mixer retains the exact zero-motion invariant:
+        # static coordinates produce zero at every layer.  It operates over T
+        # independently for each residue, so localized motion cannot disappear
+        # into an early global mean pool.
+        self.temporal_mixers = nn.ModuleList(
+            [nn.Conv1d(latent_dim, latent_dim, kernel_size=3, padding=1, bias=False)
+             for _ in range(max(0, depth))]
+        )
+        self.temporal_gains = nn.ParameterList(
+            [nn.Parameter(torch.tensor(0.1)) for _ in self.temporal_mixers]
+        )
 
         # Physical time (dt) conditioning: scales/modulates dynamic features based on
         # the physical interval between frames. This is NOT a frame-index clock embedding —
@@ -255,6 +342,7 @@ class DynamicStateEncoder(nn.Module):
         chain_id: torch.Tensor,
         static_frame_latents: torch.Tensor | None = None,
         dt: torch.Tensor | None = None,
+        observation_mask: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         """
         Args:
@@ -276,27 +364,33 @@ class DynamicStateEncoder(nn.Module):
         B, T, L = coords.shape[:3]
         ca_coords = coords[:, :, :, 1, :]  # [B, T, L, 3]
 
+        if observation_mask is not None:
+            if observation_mask.shape != residue_mask.shape:
+                raise ValueError("observation_mask must match residue_mask [B,T,L]")
+            residue_mask = residue_mask.bool() & observation_mask.bool()
+
         # Compute dynamic features
         features = []
 
         if self.use_displacement:
-            displacement = _ca_displacement_features(ca_coords, residue_mask)  # [B, T, L, 3]
-            features.append(displacement)
+            displacement, velocity, acceleration = _local_motion_features(
+                coords, residue_mask, dt
+            )
+            features.extend([displacement, velocity, acceleration])
 
         if self.use_pair_distance_changes:
-            dist_changes = _pair_distance_changes(ca_coords, self.k_nearest)  # [B, T, L, k]
+            dist_changes = _pair_distance_changes(
+                ca_coords, self.k_nearest, valid_mask=residue_mask
+            )  # [B, T, L, k]
             features.append(dist_changes)
 
         if self.use_torsion_changes:
             torsion_delta = _torsion_changes(coords, residue_mask, residue_index, chain_id)  # [B, T, L, 6]
             features.append(torsion_delta)
 
-        # Concatenate and pool over residues
+        # Concatenate per-residue features.  This is the critical distinction
+        # from the previous implementation: do not mean-pool before encoding.
         dynamic_features = torch.cat(features, dim=-1)  # [B, T, L, dynamic_dim]
-
-        # Per-frame pooling (mean over valid residues)
-        valid = residue_mask.unsqueeze(-1).float()
-        frame_dynamic = (dynamic_features * valid).sum(dim=2) / valid.sum(dim=2).clamp(min=1)
 
         # Apply dt conditioning to the RAW motion signal *before* projection.
         # Modulating pre-projection keeps the static-coordinate invariant: zero motion
@@ -306,19 +400,35 @@ class DynamicStateEncoder(nn.Module):
         if self.dt_embed is not None:
             if dt is None:
                 # Default: uniform 1 ps spacing (placeholder)
-                dt = torch.ones(B, T, 1, device=coords.device, dtype=frame_dynamic.dtype)
+                dt_rel = torch.ones(B, T, 1, device=coords.device, dtype=dynamic_features.dtype)
             elif dt.dim() == 2:
                 dt = dt.unsqueeze(-1)  # [B, T, 1]
-            dt = dt.to(dtype=frame_dynamic.dtype)
-            dt_scale = self.dt_embed(dt)  # [B, T, dynamic_dim] gate on raw features
-            frame_dynamic = frame_dynamic * dt_scale
+                dt = dt.to(device=coords.device, dtype=dynamic_features.dtype)
+                scale = dt[:, 1:].abs().mean(dim=1, keepdim=True).clamp_min(1.0e-6)
+                dt_rel = (dt.abs() / scale).clamp_min(1.0e-3)
+                dt_rel[:, 0] = 1.0
+            else:
+                dt = dt.to(device=coords.device, dtype=dynamic_features.dtype)
+                scale = dt[:, 1:].abs().mean(dim=1, keepdim=True).clamp_min(1.0e-6)
+                dt_rel = (dt.abs() / scale).clamp_min(1.0e-3)
+                dt_rel[:, 0] = 1.0
+            dt_scale = self.dt_embed(dt_rel)  # [B, T, dynamic_dim] gate on raw features
+            dynamic_features = dynamic_features * dt_scale.unsqueeze(2)
 
-        # Project to latent space (bias-free: zero motion → zero projection).
-        # Residue mean-pooling substantially attenuates localized conformational
-        # changes (especially for short clips), so retain a small, fixed motion
-        # gain after projection.  This changes only the scale of genuine motion;
-        # the exact zero-motion invariant is preserved.
-        frame_dynamic = 2.0 * self.dynamic_proj(frame_dynamic)  # [B, T, D]
+        valid = residue_mask.unsqueeze(-1).to(dynamic_features.dtype)
+        residue_dynamic = 2.0 * self.dynamic_proj(dynamic_features * valid)
+        residue_dynamic = residue_dynamic * valid
+
+        # Temporal mixing per residue, with no bias or affine normalization.
+        if self.temporal_mixers:
+            x = residue_dynamic.permute(0, 2, 3, 1).reshape(B * L, self.latent_dim, T)
+            for conv, gain in zip(self.temporal_mixers, self.temporal_gains):
+                x = x + gain * torch.nn.functional.gelu(conv(x))
+            residue_dynamic = x.reshape(B, L, self.latent_dim, T).permute(0, 3, 1, 2)
+            residue_dynamic = residue_dynamic * valid
+
+        # Per-frame pooling happens only after residue-level H has been formed.
+        frame_dynamic = (residue_dynamic * valid).sum(dim=2) / valid.sum(dim=2).clamp(min=1)
 
         # Add static frame latents if provided (residual connection)
         if static_frame_latents is not None:
@@ -336,4 +446,5 @@ class DynamicStateEncoder(nn.Module):
         return {
             "dynamic_frame_states": frame_states,  # [B, T, D]
             "dynamic_clip_state": clip_state,  # [B, D]
+            "dynamic_residue_states": residue_dynamic,  # [B, T, L, D]
         }
