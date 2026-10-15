@@ -88,8 +88,10 @@ class StageAV2LossWeights:
     # the target (a run with temporal_variance_weight=1.0 drove L_future to 0
     # while adding nothing decodable).  It is also applied only to the *near-
     # consecutive* frame differences, where real MD carries signal.
-    temporal_variance_weight: float = 0.05  # λ_τ; temporal variance floor
-    temporal_min_std: float = 0.05         # γ; std floor (squared internally)
+    temporal_variance_weight: float = 0.10  # λ_τ; temporal variance floor
+    temporal_min_std: float = 0.40         # γ; std floor (squared internally)
+    # γ=0.40 → γ²=0.16 >> natural per-step variance ~0.05, so the hinge
+    # fires immediately and pushes H to vary along the trajectory.
 
     # Activity floor thresholds
     factor_min_std: float = 0.1       # γ for factor activity
