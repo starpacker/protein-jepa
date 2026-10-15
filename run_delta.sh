@@ -1,0 +1,15 @@
+#!/bin/bash
+cd /liuyutian/protein_jepa_frame
+export TMPDIR=/tmp CLAUDE_CODE_TMPDIR=/tmp PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+mkdir -p artifacts/abc_v3/stage_a_delta
+exec python -u -m protein_jepa_frame.training.train_stage_a_v2 \
+  --manifest artifacts/mdcath_manifest_200dom/train.jsonl \
+  --output artifacts/abc_v3/stage_a_delta \
+  --steps 3000 --warmup-steps 300 \
+  --batch-size 8 --grad-accum 4 --num-workers 6 \
+  --history-frames 8 --temporal-lags 1 2 4 7 --recent-frac 0.5 \
+  --paired-horizons-frames 8 16 24 32 48 64 96 \
+  --lr 3e-4 --encoder-lr-scale 0.2 \
+  --temporal-variance-weight 0.02 --encoder-variance-weight 0.05 --factor-activity-weight 0.1 \
+  --ema-start 0.998 --ema-end 0.9999 --ema-warmup-steps 3000 \
+  --log-every 25 --save-every 250 > artifacts/abc_v3/stage_a_delta/train.log 2>&1

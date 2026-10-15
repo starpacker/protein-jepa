@@ -69,6 +69,53 @@ def _pair_orientation_features(coords: torch.Tensor) -> torch.Tensor:
     return torch.cat([local_direction, relative_rotation], dim=-1)
 
 
+def _orientation_pair_bias(
+    coords: torch.Tensor, weight: torch.Tensor, chunk: int = 32
+) -> torch.Tensor:
+    """Compute ``Linear(pair_orientation(coords))`` without materialising the
+    full ``[B, L, L, 12]`` feature tensor.
+
+    The pair-orientation tensor is O(B·L²·12) and, at K context frames × batch,
+    is the dominant activation in the encoder.  Fusing the linear projection
+    into the contraction lets us stream over query residues, cutting peak
+    memory from O(B·L²) to O(B·L·chunk) while producing the identical bias.
+
+    Args:
+        coords: ``[B, L, 4, 3]`` backbone coordinates.
+        weight: ``Linear.weight`` of shape ``[num_heads, 12]``.
+        chunk: query-residue block size.
+
+    Returns:
+        ``[B, L, L, num_heads]`` orientation bias.
+    """
+    ca = coords[:, :, 1]
+    frames = _local_backbone_frames(coords)            # [B, L, 3, 3]
+    B, L, _, _ = frames.shape
+    # Split the 12 input features into 3 (local direction) + 9 (relative rot).
+    w_dir = weight[:, :3]                              # [H, 3]
+    w_rot = weight[:, 3:].reshape(weight.shape[0], 3, 3)   # [H, 3, 3]
+    # Direction of the (i -> j) unit vector expressed in residue i's frame.
+    # Sign convention matches _pair_orientation_features: delta[i,j] = ca_j - ca_i.
+    delta = ca[:, None, :, :] - ca[:, :, None, :]      # [B, L, L, 3]
+    direction = F.normalize(delta, dim=-1, eps=1.0e-8)
+    outs = []
+    for s in range(0, L, chunk):
+        e = min(L, s + chunk)
+        f_q = frames[:, s:e]                           # [B, q, 3, 3]
+        # local direction: contract the local frame vector axis with direction
+        # direction[:, s:e] is [B, q, L, 3] (indexed [i, j]); label j explicitly.
+        local_dir = torch.einsum(
+            "bqkc,bqjc->bqjk", f_q, direction[:, s:e]
+        )                                              # [B, q, L, 3]
+        # relative rotation: element (k, l) = sum_c f_q[.,k,c] * f_j[.,l,c]
+        rel = torch.einsum("bqkc,bjlc->bqjkl", f_q, frames)     # [B,q,L,3,3]
+        # fuse projection: bias[h] = w_dir[h]·local_dir + w_rot[h]·rel
+        term_dir = torch.einsum("bqja,ha->bqjh", local_dir, w_dir)
+        term_rot = torch.einsum("bqjkl,hkl->bqjh", rel, w_rot)
+        outs.append(term_dir + term_rot)
+    return torch.cat(outs, dim=1)                      # [B, L, L, H]
+
+
 class VisibleGraphAttentionLayer(nn.Module):
     """Distance-biased attention over visible residues inside each frame."""
 
@@ -137,20 +184,45 @@ class ProteinGeometryEncoder(nn.Module):
         dropout: float = 0.1,
         max_residues: int = 4096,
         orientation_features: bool = False,
+        identity_embed_scale: float = 1.0,
     ):
         super().__init__()
         self.latent_dim = latent_dim
         self.num_rbf = num_rbf
         self.orientation_features = orientation_features
+        # Time-invariant identity embeddings (amino-acid type, residue index,
+        # chain id) are constant along a trajectory.  If they dominate the
+        # geometry projection the encoder can satisfy the JEPA objective from
+        # the static component alone, collapsing H to a time-invariant code
+        # (cos(H_t, H_{t+Δ}) ≈ 0.999 even at Δ = 400 ns).  The scale keeps
+        # them from swamping the geometry signal.
+        self.identity_embed_scale = float(identity_embed_scale)
         self.aatype_embed = nn.Embedding(21, latent_dim)
         self.residue_embed = nn.Embedding(max_residues, latent_dim)
         self.chain_embed = nn.Embedding(128, latent_dim)
-        self.geom_proj = nn.Linear(12 if orientation_features else 6, latent_dim)
+        # No bias in the geometry projection: a learned bias here accumulates
+        # into a constant offset across all frames and proteins, which (combined
+        # with the geom_gain scale) produces the ~10x shared direction that
+        # dominates H and drives cross-protein cosine similarity toward 1.
+        self.geom_proj = nn.Linear(12 if orientation_features else 6, latent_dim, bias=False)
+        # Learnable per-channel gain on the geometry term, initialised so that
+        # geometry is at least as strong as the (scaled) identity embeddings.
+        self.geom_gain = nn.Parameter(torch.ones(latent_dim))
+        with torch.no_grad():
+            nn.init.normal_(self.aatype_embed.weight, std=self.identity_embed_scale)
+            nn.init.normal_(self.residue_embed.weight, std=self.identity_embed_scale)
+            nn.init.normal_(self.chain_embed.weight, std=self.identity_embed_scale)
         self.orientation_bias = nn.Linear(12, num_heads, bias=False) if orientation_features else None
         self.layers = nn.ModuleList(
             [VisibleGraphAttentionLayer(latent_dim, num_heads, num_rbf, dropout) for _ in range(depth)]
         )
-        self.norm = nn.LayerNorm(latent_dim)
+        # No learnable bias: a constant bias term grows during training and
+        # creates a shared "anchor" direction that all H vectors align to,
+        # pushing cross-protein cosine similarity toward 1 even though the
+        # per-protein geometry information is preserved in the residual
+        # subspace.  elementwise_affine=False removes both weight and bias;
+        # the gain is already carried by geom_gain and the attention layers.
+        self.norm = nn.LayerNorm(latent_dim, elementwise_affine=False)
         self.register_buffer("rbf_centers", torch.linspace(2.0, 22.0, num_rbf), persistent=False)
 
     def _rbf(self, distances: torch.Tensor) -> torch.Tensor:
@@ -184,7 +256,7 @@ class ProteinGeometryEncoder(nn.Module):
         res_pos = residue_index.clamp(min=0, max=self.residue_embed.num_embeddings - 1)
         chain_pos = chain_id.clamp(min=0, max=self.chain_embed.num_embeddings - 1)
         base = (
-            self.geom_proj(geom)
+            self.geom_proj(geom) * self.geom_gain
             + self.aatype_embed(aa).unsqueeze(1).expand(B, T, L, -1).reshape(B * T, L, -1)
             + self.residue_embed(res_pos).unsqueeze(1).expand(B, T, L, -1).reshape(B * T, L, -1)
             + self.chain_embed(chain_pos).unsqueeze(1).expand(B, T, L, -1).reshape(B * T, L, -1)
@@ -196,8 +268,12 @@ class ProteinGeometryEncoder(nn.Module):
         rbf = self._rbf(distances) * pair_valid.unsqueeze(-1).float()
         orientation_bias = None
         if self.orientation_bias is not None:
-            orientation = _pair_orientation_features(coords_f)
-            orientation_bias = self.orientation_bias(orientation) * pair_valid.unsqueeze(-1).float()
+            # Fused projection avoids the O(B*L^2*12) intermediate tensor, which
+            # dominates memory once K context frames are stacked on the batch
+            # axis; numerically identical to Linear(_pair_orientation_features).
+            orientation_bias = _orientation_pair_bias(
+                coords_f, self.orientation_bias.weight
+            ) * pair_valid.unsqueeze(-1).float()
         for layer in self.layers:
             h = layer(h, ca, valid_f, rbf, orientation_bias=orientation_bias)
         h = self.norm(h) * valid_f.unsqueeze(-1).float()

@@ -44,6 +44,7 @@ def fape_loss(
     pred_coords, target_coords,
     pred_R=None, pred_t=None, target_R=None, target_t=None,
     mask=None, clamp=10.0, backbone_only=True, centered=False,
+    atom_mask=None,
 ):
     """Frame Aligned Point Error (FAPE).
 
@@ -67,8 +68,25 @@ def fape_loss(
     if mask is None:
         mask = torch.ones(B, L, dtype=torch.bool, device=device)
 
-    # True frame-aligned FAPE
-    if pred_R is not None and pred_t is not None and target_t is not None and target_R is not None:
+    if atom_mask is None:
+        point_mask = torch.ones(
+            B, L, N_atoms, dtype=torch.bool, device=device
+        )
+    else:
+        if atom_mask.shape != (B, L, N_atoms):
+            raise ValueError(
+                "atom_mask must have shape [B, L, N_atoms], "
+                f"got {tuple(atom_mask.shape)}"
+            )
+        point_mask = atom_mask.to(device=device, dtype=torch.bool)
+
+    # True frame-aligned FAPE.  ``centered=True`` explicitly requests the
+    # fallback path; previously this argument was accepted but ignored.
+    if (
+        not centered
+        and pred_R is not None and pred_t is not None
+        and target_t is not None and target_R is not None
+    ):
         pred_R_inv = pred_R.transpose(-2, -1)
         target_R_inv = target_R.transpose(-2, -1)
 
@@ -95,9 +113,9 @@ def fape_loss(
 
         # Pair mask
         pair_mask = mask[:, :, None] & mask[:, None, :]  # [B, L, L]
-        atom_mask = pair_mask.unsqueeze(-1).expand(-1, -1, -1, N_atoms)
-        valid = per_atom_error * atom_mask.float()
-        total = atom_mask.float().sum()
+        valid_mask = pair_mask.unsqueeze(-1) & point_mask[:, None, :, :]
+        valid = per_atom_error * valid_mask.float()
+        total = valid_mask.float().sum()
         return valid.sum() / total.clamp(min=1)
 
     # Fallback: CA-recentered global L2
@@ -111,20 +129,30 @@ def fape_loss(
     pae = torch.sqrt((diff ** 2).sum(dim=-1) + 1e-8)
     if clamp > 0:
         pae = torch.clamp(pae, max=clamp)
-    am = mask.unsqueeze(-1).expand_as(pae)
+    am = mask.unsqueeze(-1) & point_mask
     valid = pae * am.float()
     return valid.sum() / am.float().sum().clamp(min=1)
 
 
 def frame_aligned_fape(
     pred_coords, target_coords, target_R, target_t,
-    mask=None, clamp=10.0, centered=False,
+    mask=None, clamp=10.0, centered=False, pred_R=None, pred_t=None,
+    atom_mask=None,
 ):
     """Frame-aligned FAPE using target frames (variant of fape_loss)."""
-    return fape_loss(pred_coords, target_coords, target_t=target_t, target_R=target_R, mask=mask, clamp=clamp, centered=centered)
+    return fape_loss(
+        pred_coords, target_coords,
+        pred_R=pred_R, pred_t=pred_t,
+        target_t=target_t, target_R=target_R,
+        mask=mask, clamp=clamp, centered=centered,
+        atom_mask=atom_mask,
+    )
 
 
-def torsion_loss(torsion_logits, target_torsions, mask=None, n_bins=36):
+def torsion_loss(
+    torsion_logits, target_torsions, mask=None, n_bins=36,
+    torsion_mask=None, angle_mask=None,
+):
     B, L = torsion_logits.shape[:2]
     device = torsion_logits.device
     if mask is None:
@@ -136,6 +164,16 @@ def torsion_loss(torsion_logits, target_torsions, mask=None, n_bins=36):
     tbf = tb.reshape(-1)
     ce = F.cross_entropy(tl, tbf, reduction="none").reshape(B, L, NUM_TORSIONS)
     me = mask.unsqueeze(-1).expand(B, L, NUM_TORSIONS)
+    # Optional per-torsion-slot mask, e.g. when only phi/psi/omega have real
+    # targets and chi1-4 are placeholders.  Without this, cross-entropy would
+    # train the head toward the placeholder value and back-propagate that noise
+    # into the shared representation.
+    if torsion_mask is not None:
+        me = me & torsion_mask.to(device).reshape(1, 1, NUM_TORSIONS).bool()
+    if angle_mask is not None:
+        if angle_mask.shape != (B, L, NUM_TORSIONS):
+            raise ValueError("angle_mask must have shape [B, L, NUM_TORSIONS]")
+        me = me & angle_mask.to(device=device, dtype=torch.bool)
     return (ce * me.float()).sum() / me.sum().clamp(min=1)
 
 
@@ -253,12 +291,16 @@ def stage_c_total_loss(outputs, target, mask=None, weights=None, use_frame_align
     if use_frame_aligned and target.get("R") is not None and target.get("t") is not None:
         comps["fape"] = fape_loss(bb_pos, target["backbone_coords"],
             pred_R=outputs.get("R"), pred_t=outputs.get("t"),
-            target_R=target["R"], target_t=target["t"], mask=mask, clamp=fape_clamp)
+            target_R=target["R"], target_t=target["t"], mask=mask,
+            clamp=fape_clamp, atom_mask=target.get("atom_mask"))
     else:
         comps["fape"] = fape_loss(bb_pos, target["backbone_coords"],
-            mask=mask, clamp=fape_clamp)
+            mask=mask, clamp=fape_clamp, atom_mask=target.get("atom_mask"))
     if "torsion_logits" in outputs and "torsion_angles" in target:
-        comps["torsion"] = torsion_loss(outputs["torsion_logits"], target["torsion_angles"], mask=mask)
+        comps["torsion"] = torsion_loss(
+            outputs["torsion_logits"], target["torsion_angles"],
+            mask=mask, angle_mask=target.get("torsion_mask"),
+        )
     else:
         comps["torsion"] = outputs["backbone_coords"].new_tensor(0.0)
     comps["distance"] = pairwise_distance_loss(ca_pos, target["CA"], mask=mask)

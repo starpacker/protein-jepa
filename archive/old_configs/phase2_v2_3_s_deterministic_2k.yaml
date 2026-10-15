@@ -1,0 +1,77 @@
+seed: 113
+device: auto
+output_dir: /liuyutian/protein_jepa_frame/artifacts/phase2_v2_3_s_deterministic_2k
+log_every: 20
+save_every: 1
+checkpoint_every_steps: 2000
+strict_init: true
+
+data:
+  manifest_path: /liuyutian/protein_jepa/artifacts/manifests/mdcath.train.jsonl
+  batch_size: 4
+  num_workers: 0
+  num_frames: 24
+  frame_stride: 2
+  window_stride: 8
+  max_residues: 384
+  sampling_mode: hierarchical
+  training_mode: paired_window
+  paired_horizons_frames: [48, 96, 192]
+  paired_nonoverlap_only: true
+
+model:
+  latent_dim: 128
+  encoder_depth: 4
+  temporal_depth: 2
+  offline_temporal_depth: 2
+  causal_temporal_depth: 2
+  dual_temporal_towers: true
+  predictor_depth: 4
+  frame_pooling: mean_kinetic_query
+  frame_pool_queries: 4
+  time_conditioning: physical
+  thermodynamic_conditioning: true
+  orientation_features: true
+  temporal_causal: true
+  temporal_position_encoding: none
+  temporal_delta_features: true
+  transition_thermodynamic_conditioning: true
+  paired_forecast: true
+  paired_predictor_depth: 3
+  slow_state_enabled: true
+  slow_state_dim: 32
+  slow_predictor_depth: 2
+  observable_head: true
+  observable_dim: 4
+  probabilistic_transition: false
+  causal_encoder_gradient_scale: 0.10
+  num_heads: 4
+  num_rbf: 16
+  dropout: 0.1
+  max_frames: 64
+  max_residues: 4096
+  feature_norm: true
+
+optimization:
+  epochs: 1
+  steps_per_epoch: 2000
+  lr: 0.0002
+  encoder_lr_scale: 0.1
+  weight_decay: 0.05
+  warmup_steps: 400
+  ema_start: 0.996
+  ema_end: 0.9999
+  grad_clip: 1.0
+  precision: float32
+  paired_delta_weight: 0.75
+  paired_state_weight: 0.15
+  paired_endpoint_variance_weight: 0.01
+  offline_forecast_weight: 0.35
+  offline_lr_scale: 1.0
+  observable_weight: 0.10
+  gaussian_nll_weight: 0.0
+  slow_delta_weight: 0.25
+  slow_state_weight: 0.10
+  slow_contrastive_weight: 0.05
+  slow_variance_weight: 0.05
+  slow_covariance_weight: 0.01

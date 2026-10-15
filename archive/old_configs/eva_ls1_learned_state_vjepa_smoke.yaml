@@ -1,0 +1,92 @@
+seed: 6901
+device: cuda:0
+output_dir: /liuyutian/protein_jepa_frame/artifacts/eva_ls1_learned_state_vjepa_smoke
+init_checkpoint: /liuyutian/protein_jepa_frame/artifacts/phase2_a3_mdcath_state_motion_semigroup/checkpoint_step2000.pt
+strict_init: false
+sync_target_after_init: true
+init_exclude_prefixes:
+  - state_predictor.
+  - lagged_state_predictor.
+  - linear_dynamics_predictor.
+  - motion_
+log_every: 1
+save_every: 1
+checkpoint_every_steps: 10
+
+data:
+  manifest_path: /liuyutian/protein_jepa_frame/manifests/tmjepa_v3.train.jsonl
+  batch_size: 4
+  num_workers: 0
+  num_frames: 24
+  frame_stride: 1
+  window_stride: 8
+  max_residues: 384
+  sampling_mode: hierarchical
+  training_mode: paired_window
+  paired_horizons_frames: [1, 2, 4, 8, 16, 24, 48]
+  paired_nonoverlap_only: false
+  paired_all_horizons: false
+
+model:
+  latent_dim: 128
+  encoder_depth: 4
+  temporal_depth: 2
+  predictor_depth: 4
+  paired_forecast: true
+  learned_state_training: true
+  paired_predictor_depth: 3
+  paired_teacher_space_delta: true
+  slow_state_enabled: true
+  slow_state_dim: 16
+  slow_predictor_depth: 2
+  slow_vamp_lags: [1, 2, 4, 8, 12, 16]
+  slow_vamp_burn_in_frames: 0
+  probabilistic_transition: true
+  transition_log_sigma_min: -5.0
+  transition_log_sigma_max: 1.5
+  temporal_causal: true
+  temporal_causal_window: 0
+  temporal_position_encoding: none
+  temporal_delta_features: false
+  time_conditioning: none
+  thermodynamic_conditioning: false
+  transition_thermodynamic_conditioning: true
+  orientation_features: true
+  frame_pooling: mean
+  causal_encoder_gradient_scale: 1.0
+  num_heads: 4
+  num_rbf: 16
+  max_frames: 64
+  max_residues: 4096
+  dropout: 0.0
+  feature_norm: true
+  freeze_context_encoder: false
+  freeze_temporal_encoder: false
+  tmjepa_enabled: false
+
+optimization:
+  epochs: 1
+  steps_per_epoch: 20
+  lr: 0.0001
+  encoder_lr_scale: 0.1
+  weight_decay: 0.01
+  warmup_steps: 5
+  ema_start: 0.996
+  ema_end: 0.999
+  grad_clip: 1.0
+  precision: float32
+  paired_delta_weight: 0.50
+  paired_state_weight: 0.25
+  paired_relative_delta_weight: 0.25
+  paired_endpoint_variance_weight: 0.02
+  gaussian_nll_weight: 0.25
+  causal_alignment_weight: 0.20
+  observable_weight: 0.0
+  slow_delta_weight: 0.50
+  slow_state_weight: 0.25
+  slow_relative_delta_weight: 0.50
+  slow_alignment_weight: 0.20
+  slow_vamp_weight: 0.05
+  slow_contrastive_weight: 0.05
+  slow_variance_weight: 0.05
+  slow_covariance_weight: 0.01

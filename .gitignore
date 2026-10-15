@@ -7,3 +7,30 @@ artifacts/
 *.log
 *.out
 manifests/*.jsonl
+
+# large scratch / temp files
+.tmpwork/
+tmp_claude/*.pt
+tmp_claude/*.h5
+tmp_claude/ctmp/
+tmp_claude/scratch/
+tmp_claude/eval_*/
+tmp_claude/stage_a_dryrun/
+
+# archive — only track code/docs subdirs; exclude large data
+archive/old_artifacts/
+archive/cache/
+archive/logs_nohup/
+archive/tmp/
+
+# run artifacts and logs kept outside artifacts/
+runs/
+logs/
+
+# paper drafts (not core code)
+paper/
+
+# jepa_anything reference copy (external repo)
+jepa_anything/
+
+tmp_claude/

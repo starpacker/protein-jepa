@@ -120,6 +120,15 @@ class DecoderConfig:
     # the CA position.  Rotation and torsion prediction are unaffected so the
     # atom37 reconstruction geometry is preserved.
     basin_only_ca: bool = False
+    # Direct H->position path.  The residual frame-translation head is bounded
+    # to a sub-Å tanh and the legacy COM head is disabled, which leaves the
+    # decoder with no way to move CA to where the latent says it should be.
+    # When True, add an unbounded (generously bounded) per-residue translation
+    # predicted directly from the H-conditioned representation.  This is
+    # essential for the Stage B1a oracle, whose whole purpose is to test how
+    # much positional information H carries.
+    direct_h_position: bool = False
+    max_direct_position_update: float = 25.0
 
 
 def reconstruct_atom37(
@@ -511,6 +520,11 @@ class StructureDecoder(nn.Module):
 
         # Input projections
         self.aatype_embed = nn.Embedding(21, c.c_hidden)  # 20 AA + unknown
+        # Normalize raw H/Q to zero-mean unit-var per feature before projecting.
+        # The physical probe sees normalized H; without this the decoder had to
+        # cope with a different input distribution, slowing convergence.
+        self.h_input_norm = nn.LayerNorm(c.context_dim)
+        self.q_input_norm = nn.LayerNorm(c.q_dim)
         self.h_proj = nn.Linear(c.context_dim, c.c_hidden)  # frozen H_t0
         self.q_proj = nn.Linear(c.q_dim, c.c_hidden)        # dynamics Q_t
         self.frame_condition_proj = nn.Linear(c.c_hidden * 2, c.c_hidden)
@@ -576,6 +590,21 @@ class StructureDecoder(nn.Module):
         nn.init.constant_(self.q_position_head.weight, 0.0)
         self.q_position_head.bias.data.zero_()
 
+        # Direct H-conditioned per-residue position head (see DecoderConfig).
+        # Reads the sequence/H single representation `s` (which the IPA blocks
+        # have already refined) and emits a local-frame translation residual.
+        # Zero-init so it starts exactly at the anchor, like the other heads.
+        self.direct_h_position = bool(getattr(c, "direct_h_position", False))
+        self.max_direct_position_update = float(getattr(c, "max_direct_position_update", 25.0))
+        if self.direct_h_position:
+            self.direct_position_head = nn.Sequential(
+                nn.Linear(c.c_hidden, c.c_hidden),
+                nn.SiLU(),
+                nn.Linear(c.c_hidden, 3),
+            )
+            nn.init.zeros_(self.direct_position_head[-1].weight)
+            nn.init.zeros_(self.direct_position_head[-1].bias)
+
         # ── Basin-reversion path ──
         # Held-out measurement shows backbone dynamics at 8-96 ns are diffusive
         # with NEGATIVE velocity autocorrelation (-0.35 at 1 ns): the target
@@ -617,8 +646,8 @@ class StructureDecoder(nn.Module):
         B, L = aatype.shape
 
         s_aa = self.aatype_embed(aatype)           # [B, L, c_hidden]
-        s_h = self.h_proj(h_frozen)                 # [B, L, c_hidden]
-        s_q = self.q_proj(q_dynamics)               # [B, L, c_hidden]
+        s_h = self.h_proj(self.h_input_norm(h_frozen))   # [B, L, c_hidden]
+        s_q = self.q_proj(self.q_input_norm(q_dynamics)) # [B, L, c_hidden]
         s_frame = self.frame_condition_proj(
             torch.cat([s_h, s_q], dim=-1)
         )
@@ -768,6 +797,18 @@ class StructureDecoder(nn.Module):
         else:
             dt_local = dt_local + q_dt_local
 
+        # ── Direct H-conditioned position residual ──
+        # The residual paths above are sub-Å bounded and the legacy COM head is
+        # disabled, so without this the decoder can only reproduce the anchor.
+        # This head reads the H/sequence representation and emits the missing
+        # per-residue translation needed to reach the structure encoded in H.
+        direct_dt_local = None
+        if self.direct_h_position:
+            direct_dt_local = self.max_direct_position_update * torch.tanh(
+                self.direct_position_head(s)
+            )
+            dt_local = dt_local + direct_dt_local
+
         # ── Basin-reversion contribution ──
         # Add the gated aligned context-mean displacement.  This is the
         # dominant eval-legal signal at diffusive timescales; the IPA/Q
@@ -831,6 +872,7 @@ class StructureDecoder(nn.Module):
             "delta_com_local": delta_com_local,
             "translation_update_local": dt_local,
             "q_translation_update_local": q_dt_local,
+            "direct_translation_update_local": direct_dt_local,
             "basin_gate": basin_gate_val,
             "torsion_logits": torsion_logits,
             "torsions": torsions,

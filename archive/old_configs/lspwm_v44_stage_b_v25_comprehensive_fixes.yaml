@@ -1,0 +1,33 @@
+# =============================================================================
+# V25: Comprehensive Architecture Fixes on top of V24
+#
+# Key Diagnostics (from V24 checkpoint_step5400):
+#   1. cos(force, bath) = 0.857  → bath direction IS force direction (linear)
+#      ROOT CAUSE: aux_ss = -C·force_G/gamma, making bath_drift ∝ C·C^T·force_G
+#      FIX: Initialize aux from learned history projection (3-frame context)
+#
+#   2. dissipative_drift ~5.8e-5 vs dG ~0.007 → 120x mismatch
+#      ROOT CAUSE: diffusion_scale=5e-5 in 8D CV space vs observed step sizes
+#      FIX: Per-dimension learnable diffusion_scale with target magnitude
+#
+#   3. force_score_G_loss = 0.362 (high, noisy) → KDE gradient inaccurate
+#      ROOT CAUSE: bandwidth=1.0 too large for 8D CV distribution
+#      FIX: Reduce bandwidth to 0.5, add sliced score on G for diversity
+#
+#   4. self_consistency_loss = 2.255 → decomposition A ≠ A_g + Σφ_i
+#      ROOT CAUSE: No residual correction term
+#      FIX: Add learnable residual MLP that adds ΔE to unified energy
+#
+#   5. mori_nll = 500 (clamped) → transition prediction completely wrong
+#      ROOT CAUSE: Bath drift ~200x too large, dissipative 120x too small
+#      FIX: After fixing #1-#2, enable mori_nll with weight=0.001
+#
+#   6. residue_force_cosine = 0.04 → per-residue force near-orthogonal to Δq
+#      ROOT CAUSE: Sliced score matches ∇log p but not Δq direction
+#      FIX: Increase force_direction_weight from 0.3 to 1.0
+#
+# Approach: incremental, low-risk fixes. V24 is the fallback.
+# =============================================================================
+# Usage: cp from V24 then override specific keys
+# =============================================================================
+" 2>&1; echo "V25 config doc created"

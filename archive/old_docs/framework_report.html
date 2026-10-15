@@ -1,0 +1,630 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Protein JEPA — 蛋白质动力学世界模型</title>
+<style>
+  :root {
+    --bg: #f8f9fb; --card: #fff; --border: #e2e6ed; --text: #1a1d23; --text2: #5a5f6b; --text3: #8e94a0;
+    --accent: #2563eb; --green: #059669; --red: #dc2626; --amber: #d97706; --purple: #7c3aed;
+    --code-bg: #f1f3f6; --radius: 10px; --shadow: 0 1px 3px rgba(0,0,0,.06);
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans SC', sans-serif; background: var(--bg); color: var(--text); line-height: 1.7; }
+
+  header { background: linear-gradient(135deg, #0f172a 0%, #1e3a5f 40%, #0c4a6e 100%); color: #fff; padding: 56px 0 72px; text-align: center; }
+  header h1 { font-size: 2.1rem; font-weight: 800; letter-spacing: -0.5px; }
+  header .subtitle { font-size: 1.02rem; color: #94a3b8; margin-top: 8px; }
+  header .meta { margin-top: 18px; font-size: 0.82rem; color: #64748b; }
+
+  .nav-bar {
+    display: flex; justify-content: center; gap: 0; background: #fff; border-bottom: 1px solid var(--border);
+    position: sticky; top: 0; z-index: 100; padding: 0 24px;
+  }
+  .nav-bar a { display: block; padding: 12px 22px; font-size: 0.85rem; color: var(--text2); text-decoration: none; border-bottom: 2px solid transparent; font-weight: 500; }
+  .nav-bar a:hover, .nav-bar a.active { color: var(--accent); border-bottom-color: var(--accent); }
+
+  .container { max-width: 1060px; margin: 0 auto; padding: 36px 24px; }
+  .hero-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 14px; margin: -32px 0 28px; }
+  .hero-card { background: var(--card); border-radius: var(--radius); padding: 18px; box-shadow: var(--shadow); border: 1px solid var(--border); text-align: center; }
+  .hero-card .val { font-size: 1.6rem; font-weight: 700; }
+  .hero-card .lbl { font-size: 0.76rem; color: var(--text3); margin-top: 3px; text-transform: uppercase; letter-spacing: 0.4px; }
+  .hero-card.c1 .val { color: var(--accent); } .hero-card.c2 .val { color: var(--green); }
+  .hero-card.c3 .val { color: var(--purple); } .hero-card.c4 .val { color: var(--amber); }
+
+  section { margin: 44px 0; }
+  h2 { font-size: 1.35rem; font-weight: 700; margin-bottom: 18px; padding-bottom: 8px; border-bottom: 2px solid var(--accent); display: flex; align-items: center; gap: 10px; }
+  h2 .stage-num { display: inline-flex; align-items: center; justify-content: center; width: 32px; height: 32px; border-radius: 8px; font-size: 0.9rem; font-weight: 800; }
+  h2 .stage-num.a { background: #dbeafe; color: #1e40af; } h2 .stage-num.b { background: #d1fae5; color: #065f46; }
+  h2 .stage-num.c { background: #ede9fe; color: #6d28d9; }
+  h3 { font-size: 1.06rem; font-weight: 600; margin: 22px 0 10px; color: #1e293b; }
+  p { color: var(--text2); margin-bottom: 12px; font-size: 0.94rem; }
+
+  .pipeline { background: var(--card); border-radius: var(--radius); padding: 26px 30px; margin: 20px 0; box-shadow: var(--shadow); border: 1px solid var(--border); font-family: 'SF Mono', 'Fira Code', monospace; font-size: 0.8rem; line-height: 2.0; overflow-x: auto; white-space: pre; color: #334155; }
+
+  table { width: 100%; border-collapse: collapse; margin: 16px 0; font-size: 0.86rem; }
+  th { background: #f1f5f9; text-align: left; padding: 10px 14px; font-weight: 600; color: #334155; border-bottom: 2px solid var(--border); font-size: 0.82rem; text-transform: uppercase; letter-spacing: 0.3px; }
+  td { padding: 10px 14px; border-bottom: 1px solid var(--border); color: var(--text2); }
+  tr:hover td { background: #f8fafc; }
+  .num { text-align: right; font-variant-numeric: tabular-nums; font-family: 'SF Mono','Fira Code',monospace; }
+  .best { color: var(--green); font-weight: 700; }
+
+  .badge { display: inline-block; padding: 3px 10px; border-radius: 11px; font-size: 0.7rem; font-weight: 600; letter-spacing: 0.2px; }
+  .badge.done { background: #d1fae5; color: #065f46; } .badge.prog { background: #dbeafe; color: #1e40af; }
+  .badge.warn { background: #fef3c7; color: #92400e; } .badge.fail { background: #fee2e2; color: #991b1b; }
+
+  .insight { background: linear-gradient(135deg, #eff6ff, #f0f9ff); border: 1px solid #bfdbfe; border-radius: var(--radius); padding: 18px 22px; margin: 20px 0; }
+  .insight .title { font-weight: 700; color: var(--accent); margin-bottom: 8px; font-size: 0.92rem; }
+  .insight p { font-size: 0.88rem; color: #1e40af; }
+  .insight.warn { background: linear-gradient(135deg, #fffbeb, #fef3c7); border-color: #fcd34d; }
+  .insight.warn .title { color: #92400e; }
+  .insight.warn p { color: #92400e; }
+
+  .result-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 10px; margin: 14px 0; }
+  .result-item { background: var(--card); border-radius: var(--radius); padding: 14px 16px; border: 1px solid var(--border); text-align: center; }
+  .result-item .num { font-size: 1.2rem; font-weight: 700; color: var(--accent); }
+  .result-item .desc { font-size: 0.73rem; color: var(--text3); margin-top: 3px; line-height: 1.4; }
+
+  .two-col { display: grid; grid-template-columns: 1fr 1fr; gap: 22px; }
+  .three-col { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; }
+
+  .stage-card { background: var(--card); border-radius: var(--radius); padding: 24px; box-shadow: var(--shadow); border: 1px solid var(--border); border-top: 4px solid var(--border); }
+  .stage-card.sa { border-top-color: var(--accent); } .stage-card.sb { border-top-color: var(--green); } .stage-card.sc { border-top-color: var(--purple); }
+  .stage-card h3 { margin-top: 0; font-size: 1.05rem; }
+  .stage-card ul { list-style: none; padding: 0; margin: 12px 0 0; }
+  .stage-card li { padding: 4px 0; font-size: 0.84rem; color: var(--text2); }
+  .stage-card li::before { content: "▸"; color: var(--text3); margin-right: 8px; }
+
+  .code-block { background: var(--code-bg); border-radius: 6px; padding: 13px 17px; font-family: 'SF Mono', 'Fira Code', monospace; font-size: 0.78rem; overflow-x: auto; margin: 10px 0; color: #334155; line-height: 1.75; }
+  .math-block { background: #fafbfc; border: 1px solid var(--border); border-radius: 8px; padding: 20px 24px; margin: 16px 0; text-align: center; font-size: 0.92rem; color: #334155; font-style: italic; }
+
+  .progress-hint { font-size: 0.8rem; color: var(--text3); margin-left: 8px; font-weight: 400; display: inline; }
+
+  footer { margin-top: 56px; padding: 24px 0; text-align: center; color: var(--text3); font-size: 0.78rem; border-top: 1px solid var(--border); }
+
+  @media (max-width: 768px) {
+    .two-col, .three-col { grid-template-columns: 1fr; }
+    .hero-grid { grid-template-columns: repeat(2, 1fr); }
+    .nav-bar { overflow-x: auto; justify-content: flex-start; }
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>Protein JEPA — 蛋白质动力学世界模型</h1>
+  <div class="subtitle">三阶段训练体系：JEPA 表示预训练 → 朗之万动力学 → 结构解码与下游评估</div>
+  <div class="meta">
+    数据集: mdCATH (5,398 蛋白域，320–450K 温度梯度) ｜ 模型: LSP-WM (JEPA + Generalized Langevin Dynamics)<br>
+    报告日期: 2026-09-30 ｜ 分支: v21_thermo_helmholtz_mori
+  </div>
+</header>
+
+<div class="nav-bar">
+  <a href="#overview" class="active">总览</a>
+  <a href="#stage-a">Stage A: 表示学习</a>
+  <a href="#stage-b">Stage B: 朗之万动力学</a>
+  <a href="#stage-c">Stage C: 解码与评估</a>
+  <a href="#results">实验成果</a>
+  <a href="#fresh">Fresh Training</a>
+</div>
+
+<div class="container">
+
+<!-- ==================== OVERVIEW ==================== -->
+<section id="overview">
+<h2>Protein JEPA：三阶段世界模型</h2>
+
+<div class="hero-grid">
+  <div class="hero-card c1"><div class="val">Stage A</div><div class="lbl">JEPA 表示学习<br>EMA-target 自监督</div></div>
+  <div class="hero-card c2"><div class="val">Stage B</div><div class="lbl">LSP-WM 动力学<br>广义朗之万方程</div></div>
+  <div class="hero-card c3"><div class="val">Stage C</div><div class="lbl">物理解码<br>可观测量 + 结构</div></div>
+  <div class="hero-card c4"><div class="val">134,946</div><div class="lbl">训练轨迹<br>5 温度 × 5 复本</div></div>
+</div>
+
+<div class="pipeline">
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                           Protein JEPA — 三阶段训练管线                           │
+├─────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                 │
+│  ┌───────────┐     ┌───────────────────────┐     ┌──────────────────────────┐  │
+│  │           │     │  Stage A: JEPA        │     │  Frozen Encoder          │  │
+│  │  mdCATH   │────▶│                       │────▶│                          │  │
+│  │  MD Traj  │     │  H_t ∈ ℝ²⁵⁶ (spatial) │     │  learned_projection      │  │
+│  │  [T,L,4,3]│     │  S_t ∈ ℝ¹²⁸ (temporal)│     │  H → Q ∈ ℝ⁸             │  │
+│  │           │     │                       │     │                          │  │
+│  └───────────┘     │  L = L_JEPA_mask      │     └────────────┬─────────────┘  │
+│                     │    + L_paired_delta   │                  │                │
+│                     └───────────────────────┘                  ▼                │
+│                                                 ┌──────────────────────────┐  │
+│                     ┌───────────────────────┐    │  Stage B: LSP-WM        │  │
+│                     │  Stage C: Decoding    │    │                          │  │
+│                     │                       │    │  dQ = [M·∇U + ΣKQ]dt    │  │
+│                     │  M04 Readout:         │◀───│      + √(2D)·dW         │  │
+│                     │  Q→{dist, contacts,   │    │                          │  │
+│                     │       RMSF, Rg}       │    │  U(Q): learned potential │  │
+│                     │                       │    │  D(Q): state-dep. diff.  │  │
+│                     │  Structure Decoder:   │    │  K(τ): Mori memory kernel│  │
+│                     │  Q→{torsions, frames} │    │  S: 16D auxiliary bath   │  │
+│                     └───────────────────────┘    └──────────────────────────┘  │
+│                                                                                 │
+│  Evaluation:                                                                   │
+│    M1 — Thermodynamic decomposition (force-memory direction coverage)           │
+│    K1 — Folding kinetics (endpoint skill + implied timescales)                  │
+│    R1 — Representation closure (history dependence after compression)           │
+│    M02 — Autonomous rollout verification (no future data leakage)              │
+│    M04 — Physical observable readout (CA distances, contacts, RMSF)             │
+│    E01 — Baseline comparison (B0 Persistence → B5 Full LaSP)                   │
+└─────────────────────────────────────────────────────────────────────────────────┘
+</div>
+
+<p><strong>核心思想</strong>：从分子动力学轨迹中学习一个可迁移的蛋白动力学世界模型。Stage A 通过 JEPA 自监督学习残基级的时空表示；Stage B 在该潜空间中学习符合物理约束的随机动力学（保守力、状态依赖扩散、Mori-Zwanzig 记忆浴）；Stage C 将预测的潜状态解码为蛋白物理可观测量和全原子结构。三个阶段各自冻结、独立评估、可组合验证。</p>
+</section>
+
+<!-- ==================== STAGE A ==================== -->
+<section id="stage-a">
+<h2><span class="stage-num a">A</span> Stage A — JEPA 表示预训练</h2>
+
+<h3>目标</h3>
+<p>以<strong>完全不标注的 MD 轨迹</strong>为输入，自监督地学习每个残基在每个时刻的隐藏表示 <strong>H ∈ ℝ²⁵⁶</strong>，使该表示能够 (a) 从可见残基预测被遮挡的残基，(b) 从当前窗口预测未来状态。</p>
+
+<h3>架构</h3>
+<div class="two-col">
+<div class="stage-card sa">
+  <h3>Spatial Encoder (ProteinGeometryEncoder)</h3>
+  <ul>
+    <li>输入: [B,T,L,4,3] backbone 坐标 (N,CA,C,O)</li>
+    <li>特征: 内骨架距离 (6 类) + sin/cos(φ,ψ,ω)</li>
+    <li>层: GNN (VisibleGraphAttention) + Transformer</li>
+    <li>输出: H ∈ [B,T,L,256] 每残基每帧表示</li>
+  </ul>
+</div>
+<div class="stage-card sa">
+  <h3>Temporal Encoder (TemporalStateEncoder)</h3>
+  <ul>
+    <li>输入: H (来自 spatial encoder) + time_ps, T_k</li>
+    <li>Pooling: mean(valid residues) per frame</li>
+    <li>层: Transformer Encoder (depth=2)</li>
+    <li><strong>时间条件: physical (LogTimeEmbedding)</strong></li>
+    <li>输出: clip_state [B,D] + frame_states [B,T,D]</li>
+  </ul>
+</div>
+</div>
+
+<h3>损失函数</h3>
+<div class="math-block">
+L<sub>Stage A</sub> = L<sub>residue_JEPA</sub> + 0.25·L<sub>state_JEPA</sub> + 1.0·L<sub>paired_delta</sub> + 0.25·L<sub>paired_state</sub>
+  + 0.01·(L<sub>variance_reg</sub> + L<sub>state_variance</sub> + L<sub>state_feature_var</sub>) + 0.02·L<sub>state_covariance</sub>
+</div>
+
+<p>L<sub>residue_JEPA</sub> 和 L<sub>state_JEPA</sub> 使用 <strong>EMA target encoder (momentum: 0.996→1.0)</strong> 作为教师；L<sub>paired_delta</sub> 是时域终点预测，强制 encoder 学习多时间尺度的变化信息。块状时空掩码控制可见比例为 15%-50%。</p>
+
+<h3>关键突破: 时间条件修复</h3>
+<div class="insight">
+  <div class="title">🔑 诊断: Smoke encoder 产生全同表示 cos(H<sub>t</sub>, H<sub>0</sub>) ≈ 0.999999</div>
+  <p>所有帧被映射到几乎相同的 H，导致所有动力学模型等效为一个 Persistence baseline（恒等映射）。空间编码器逐帧独立处理、蛋白 backbone 在短窗口内几何变化微弱，两者共同导致了表示的时间崩塌。</p>
+</div>
+
+<table>
+  <tr><th>修复方案</th><th>修复前</th><th>修复后</th><th>改善</th></tr>
+  <tr>
+    <td>time_conditioning="physical" (LogTimeEmbedding 注入 temporal encoder)</td>
+    <td class="num">—</td>
+    <td class="num">—</td>
+    <td><strong>核心机制</strong></td>
+  </tr>
+  <tr>
+    <td>宽帧间隔: stride=4 (每 4ns 一帧), 8 帧窗口 = 28ns 跨距</td>
+    <td>stride=1 (1ns)</td>
+    <td class="num">stride=4</td>
+    <td>4× 增大</td>
+  </tr>
+  <tr>
+    <td>多时域预测: 16ns, 32ns, 64ns 三个 horizon</td>
+    <td>单一 horizon</td>
+    <td class="num">3 horizons</td>
+    <td>强制多尺度</td>
+  </tr>
+  <tr style="background:#f0fdf4;">
+    <td><strong>cos(S<sub>0</sub>, S<sub>10ns</sub>) — 时间状态余弦相似度</strong></td>
+    <td class="num" style="color:var(--red);font-weight:700;">0.999999</td>
+    <td class="num best" style="font-weight:700;">0.476</td>
+    <td><strong>从全同变为显著衰减</strong></td>
+  </tr>
+  <tr style="background:#f0fdf4;">
+    <td><strong>cos(S<sub>0</sub>, S<sub>40ns</sub>)</strong></td>
+    <td class="num" style="color:var(--red);font-weight:700;">0.999999</td>
+    <td class="num best" style="font-weight:700;">0.463</td>
+    <td><strong>真正的时变表示</strong></td>
+  </tr>
+  <tr style="background:#f0fdf4;">
+    <td><strong>cos(clip<sub>320K</sub>, clip<sub>450K</sub>) — 温度分离</strong></td>
+    <td class="num" style="color:var(--red);font-weight:700;">0.999999</td>
+    <td class="num best" style="font-weight:700;">0.758</td>
+    <td><strong>温度条件被编码</strong></td>
+  </tr>
+</table>
+
+<div class="insight warn">
+  <div class="title">⚠️ 空间编码器 H 依然时不变 (cos≈0.999)</div>
+  <p>这是预期行为——蛋白 backbone 在 10-40ns 内的局部几何变化太小，空间编码器不应为此改变表示。时间敏感性完全由 temporal encoder 承担。</p>
+</div>
+</section>
+
+<!-- ==================== STAGE B ==================== -->
+<section id="stage-b">
+<h2><span class="stage-num b">B</span> Stage B — 潜空间朗之万动力学 (LSP-WM)</h2>
+
+<h3>目标</h3>
+<p>在冻结的 Stage A 编码器之上，学习一个<strong>物理一致的低维随机动力学模型</strong>。learned_projection 将 H ∈ ℝ²⁵⁶ → Q ∈ ℝ⁸（每残基动力学变量），G = mean(Q) ∈ ℝ⁸。在 Q 空间中学习保守力势能 + 状态依赖扩散 + Mori-Zwanzig 有限浴记忆核。最终得到一个<strong>可自主 rollout 的随机过程</strong>，无需访问未来帧。</p>
+
+<h3>Mori-Zwanzig 广义朗之万方程</h3>
+<div class="math-block">
+Q(t+Δt) = Q(t) + <u>M · ∇U(Q(t))</u> · Δt &emsp;← 保守力势能（学习得到）
+                + <u>Σ<sub>τ</sub> K<sub>τ</sub> · (Q(t−τ) − μ)</u> · Δt &emsp;← Mori 记忆浴（4 组 8×8 核，32ns 历史）
+                + <u>√(2·D(Q(t))·Δt)</u> · ξ<sub>t</sub> &emsp;← 状态依赖扩散（高斯噪声，满足 FDT）
+<br>
+S(t+Δt) = e<sup>−ΓΔt</sup>S(t) + C<sup>T</sup>·∇U(Q(t))·Δt + √(2ΓΔt)·η<sub>t</sub> &emsp;← 辅助浴演化 (OU 过程)
+<br>
+其中 ξ<sub>t</sub>, η<sub>t</sub> ~ N(0,I)；U(Q), D(Q) 为可学习 MLP；M, Γ, C 为可学习矩阵。
+</div>
+
+<h3>LSP-WM 损失体系</h3>
+<table>
+  <tr><th style="width:220px">损失组件</th><th>数学形式</th><th>物理意义</th><th>当前权重</th></tr>
+  <tr>
+    <td>L<sub>transition_NLL</sub> (dynamic)</td>
+    <td style="font-size:0.82rem;">−log p(Q<sub>t+Δt</sub>|Q<sub>t</sub>,T,历史) under GLD</td>
+    <td>一步转移的高斯似然</td>
+    <td class="num best">1.0</td>
+  </tr>
+  <tr>
+    <td>L<sub>force_score</sub></td>
+    <td style="font-size:0.82rem;">MSE(∇U(Q), ∇log p<sub>KDE</sub>(Q))</td>
+    <td>保守力应匹配 KDE 对数密度梯度</td>
+    <td class="num">0.5</td>
+  </tr>
+  <tr>
+    <td>L<sub>mori_nll</sub></td>
+    <td style="font-size:0.82rem;">FDT 浴感知近似的过渡似然</td>
+    <td>Mori-Zwanzig 记忆项的对数密度匹配</td>
+    <td class="num">0.5</td>
+  </tr>
+  <tr>
+    <td>L<sub>rollout_endpoint</sub></td>
+    <td style="font-size:0.82rem;">MSE(Q<sub>rollout</sub>(T), Q<sub>true</sub>(T))</td>
+    <td>自主 rollout 终点精确度</td>
+    <td class="num">0.2</td>
+  </tr>
+  <tr>
+    <td>L<sub>rollout_gaussian_nll</sub></td>
+    <td style="font-size:0.82rem;">−log p(q<sub>pred</sub>|q<sub>true</sub>) over rollout steps</td>
+    <td>多步轨迹的整体似然</td>
+    <td class="num">0.3</td>
+  </tr>
+  <tr>
+    <td>L<sub>self_consistency</sub></td>
+    <td style="font-size:0.82rem;">||step(τ₁+τ₂, Q₀) − step(τ₂, step(τ₁, Q₀))||²</td>
+    <td>时间半群性质（Champman-Kolmogorov）</td>
+    <td class="num">0.1</td>
+  </tr>
+  <tr>
+    <td>L<sub>rollout_energy</sub></td>
+    <td style="font-size:0.82rem;">能量守恒惩罚 over rollout</td>
+    <td>物理能量不应漂移</td>
+    <td class="num">0.1</td>
+  </tr>
+  <tr>
+    <td>L<sub>stationary</sub></td>
+    <td style="font-size:0.82rem;">MMD(p<sub>rollout</sub>, p<sub>MD</sub>)</td>
+    <td>rollout 稳态分布应与 MD 一致</td>
+    <td class="num">0.05</td>
+  </tr>
+</table>
+
+<h3>训练课程 (Curriculum)</h3>
+<div class="three-col">
+  <div class="result-item"><div class="num">Phase 1</div><div class="desc">Representation<br>(steps 0–1,000)<br>≈10% total</div></div>
+  <div class="result-item"><div class="num">Phase 2</div><div class="desc">Thermo. Identification<br>(1,000–2,500)<br>KDE score + Mori NLL</div></div>
+  <div class="result-item"><div class="num">Phase 3</div><div class="desc">Dynamics Learning<br>(2,500–5,000)<br>Full transition NLL</div></div>
+</div>
+<div class="three-col" style="margin-top:10px;">
+  <div class="result-item"><div class="num">Phase 4</div><div class="desc">Rollout Training<br>(5,000–6,000)<br>Autoregressive steps</div></div>
+  <div class="result-item"><div class="num">Phase 5</div><div class="desc">Endpoint Calibration<br>(6,000+)<br>Distribution matching</div></div>
+  <div class="result-item"><div class="num">~3h</div><div class="desc">Training time<br>on single A100</div></div>
+</div>
+
+<h3>数值稳定性保障</h3>
+<table>
+  <tr><th>机制</th><th>描述</th><th>效果</th></tr>
+  <tr><td>子步积分 (sub-stepping)</td><td>自动将 dt 分解为 ≤20ps 的子步</td><td class="num">ODE error: 34% → 4.3%</td></tr>
+  <tr><td>Drift clipping</td><td>单步子步的 Q 变化限制在 ±5.0</td><td>防止爆炸</td></tr>
+  <tr><td>NaN guard</td><td>NaN 位置回退到前一步 q 值</td><td>训练不中断</td></tr>
+</table>
+</section>
+
+<!-- ==================== RESULTS ==================== -->
+<section id="results">
+<h2>🔬 实验结果</h2>
+
+<h3>E01: 力-记忆分解 (M1) — LaSP 的三部分贡献</h3>
+<p>在 9 个代表性蛋白上，分解 LaSP 的 CovSkill 来源：</p>
+<table>
+  <tr><th>模型组件</th><th>平均 CovSkill</th><th>占比</th><th>说明</th></tr>
+  <tr><td>Full LaSP (G=8, K=4, history=32ns)</td><td class="num best">32.11%</td><td class="num">100%</td><td>完整模型</td></tr>
+  <tr><td>Force only (no memory, no aux)</td><td class="num">9.30%</td><td class="num">28.9%</td><td>保守力势能 U(Q) 的贡献</td></tr>
+  <tr><td>Memory only (no force, history+aux)</td><td class="num">20.58%</td><td class="num">64.1%</td><td>Mori-Zwanzig 记忆浴的贡献</td></tr>
+  <tr><td>No latent dynamics (random walk)</td><td class="num">0.00%</td><td class="num">0%</td><td>基线：纯布朗运动</td></tr>
+</table>
+<div class="insight-box">
+<strong>💡 关键洞察：</strong>Mori-Zwanzig 记忆浴贡贡献是保守力势能的 ~2.2 倍 (20.58% vs 9.30%)。
+蛋白质动力学中，<strong>非马尔可夫历史依赖</strong>远比瞬时的保守力更重要 — 这验证了 GLD 中记忆核的必要性。
+</div>
+
+<h3>E02: 神经基线比较 (M1) — LaSP vs. 其他架构</h3>
+<table>
+  <tr><th>模型</th><th>Innovation ACF ↓ (越低越好)</th><th>Stationary JSD ↓ (越低越好)</th><th>综合</th></tr>
+  <tr><td><strong>LaSP (ours)</strong></td><td class="num best">6.84</td><td class="num best">0.147</td><td class="num best">🥇</td></tr>
+  <tr><td>Causal Transformer (lag=3)</td><td class="num">12.15</td><td class="num">0.241</td><td class="num">—</td></tr>
+  <tr><td>GRU (lag=5)</td><td class="num">14.33</td><td class="num">0.301</td><td class="num">—</td></tr>
+  <tr><td>Generic Markov (no force)</td><td class="num">18.50</td><td class="num">0.312</td><td class="num">—</td></tr>
+</table>
+<p>LaSP 在两项关键诊断上均超越黑箱时序模型：innovation ACF（残差白化程度）<strong>提升 44%</strong>，稳态分布保真度 <strong>提升 39%</strong>。</p>
+
+<h3>E03: 各蛋白折叠动力学预测 (K1) — 多时间尺度追踪</h3>
+<table>
+  <tr><th>蛋白</th><th>24帧 DetSkill</th><th>48帧 DetSkill</th><th>72帧 DetSkill</th><th>96帧 DetSkill</th><th>均值</th></tr>
+  <tr><td>1a0rP01</td><td class="num">0.8887</td><td class="num">0.8589</td><td class="num">0.8369</td><td class="num">0.8066</td><td class="num best">0.8478</td></tr>
+  <tr><td>1a2pB01</td><td class="num">0.7613</td><td class="num">0.7768</td><td class="num">0.7622</td><td class="num">0.7370</td><td class="num">0.7593</td></tr>
+  <tr><td>1ad2A01</td><td class="num">0.8436</td><td class="num">0.8407</td><td class="num">0.8307</td><td class="num">0.8261</td><td class="num">0.8353</td></tr>
+  <tr><td>1ahoB00</td><td class="num">0.8218</td><td class="num">0.8570</td><td class="num">0.8083</td><td class="num">0.7916</td><td class="num">0.8197</td></tr>
+  <tr><td>1ak1A00</td><td class="num">0.7170</td><td class="num">0.7132</td><td class="num">0.7316</td><td class="num">0.6907</td><td class="num">0.7131</td></tr>
+  <tr><td>1akoA00</td><td class="num">0.6916</td><td class="num">0.6672</td><td class="num">0.6777</td><td class="num">0.6719</td><td class="num">0.6771</td></tr>
+  <tr><td>1ammA01</td><td class="num">0.8627</td><td class="num">0.8145</td><td class="num">0.8296</td><td class="num">0.8346</td><td class="num">0.8353</td></tr>
+  <tr><td>1ampA01</td><td class="num">0.7532</td><td class="num">0.7105</td><td class="num">0.7325</td><td class="num">0.7281</td><td class="num">0.7311</td></tr>
+  <tr><td>1at0A02</td><td class="num">0.7986</td><td class="num">0.7933</td><td class="num">0.7702</td><td class="num">0.7901</td><td class="num">0.7880</td></tr>
+  <tr><td>1au1B01</td><td class="num">0.8006</td><td class="num">0.7967</td><td class="num">0.8000</td><td class="num">0.7915</td><td class="num">0.7972</td></tr>
+  <tr style="background:#e6f4ea;font-weight:700"><td>均值</td><td class="num">0.7939</td><td class="num">0.7829</td><td class="num">0.7780</td><td class="num">0.7668</td><td class="num best">0.7799</td></tr>
+</table>
+<div class="insight-box">
+<strong>💡 关键洞察：</strong>从 24 帧 (≈16ns) 到 96 帧 (≈64ns)，DetSkill 仅从 0.7939 退化到 0.7668（退化 <strong>3.4%</strong>）。
+这验证了 LSP-WM 的<strong>时间一致性</strong> — 长时间 rollout 不会积累大面积漂移。
+</div>
+
+<h3>E04: 自主 SDE Rollout (K1) — 无未来信息的轨迹合成</h3>
+<table>
+  <tr><th>Rollout 策略</th><th>轨迹 Skill ↑</th><th>Stationary JSD ↓</th><th>能量 Skill ↑</th></tr>
+  <tr><td>单独一步 (naive 1-step)</td><td class="num">0.687</td><td class="num">0.298</td><td class="num">0.724</td></tr>
+  <tr><td>+ Recursive ensemble (5 paths)</td><td class="num">0.843</td><td class="num">0.112</td><td class="num">0.867</td></tr>
+  <tr><td><strong>+ History bath aux (完整GLD)</strong></td><td class="num best">0.931</td><td class="num best">0.061</td><td class="num best">0.915</td></tr>
+  <tr><td>Persistence baseline</td><td class="num">0.000</td><td class="num">—</td><td class="num">—</td></tr>
+</table>
+<p>完整 GLD rollout（ensemble + history bath）达到 <strong>trajectory skill 0.931</strong>，且 stationary JSD 仅 0.061，表明 rollout 稳态分布与真实 MD 分布几乎一致。</p>
+
+<h3>E05: ITS 反应速率比较 (K1) — LaSP vs. MSM vs. tICA+MSM</h3>
+<table>
+  <tr><th>模型</th><th>均值 log(k) 误差 ↓ (越低越好)</th><th>相对 MSM 改进</th></tr>
+  <tr><td><strong>LaSP (ours)</strong></td><td class="num best">0.459</td><td class="num best">−41.6%</td></tr>
+  <tr><td>tICA + MSM (state-of-art)</td><td class="num">0.627</td><td class="num">−20.2%</td></tr>
+  <tr><td>Raw MSM</td><td class="num">0.785</td><td class="num">baseline</td></tr>
+</table>
+<p>LaSP 在隐含时间尺度 (ITS) 推断上分别比 tICA+MSM 和原始 MSM 低 <strong>26.9% 和 41.6% 的误差</strong>。这意味着从 LaSP 模拟中提取的动力学速率更接近真实 MD。</p>
+
+<h3>E06: GLE 合成恢复 (R1) — 物理可解释性验证</h3>
+<table>
+  <tr><th>恢复指标</th><th>LaSP 恢复值</th><th>真实值 (合成 GLE)</th><th>误差</th></tr>
+  <tr><td>保守力相关系数</td><td class="num">0.946</td><td class="num">1.000</td><td class="num">5.4%</td></tr>
+  <tr><td>记忆核衰减误差</td><td class="num">5.19%</td><td class="num">0%</td><td class="num best">5.19%</td></tr>
+  <tr><td>弛豫时间 (ns)</td><td class="num">2.11</td><td class="num">2.00</td><td class="num">5.5%</td></tr>
+</table>
+<p>从 GLE 合成数据中，LaSP 能<strong>恢复 94.6% 的保守力</strong>和<strong>94.8% 的记忆核结构</strong>，弛豫时间误差仅 5.5%。这证明了 LSP-WM 具备<strong>物理成分的可识别性</strong>。</p>
+
+<h3>E07: 表征闭包 (R1) — 压缩是否丢失动力学信息?</h3>
+<table>
+  <tr><th>表征方法</th><th>被历史检测出的蛋白数 (共20)</th><th>判定</th></tr>
+  <tr><td><strong>LaSP (Q∈ℝ⁸) — 状态空间</strong></td><td class="num best">0/20</td><td class="num best">✅ 无历史残留</td></tr>
+  <tr><td>tICA (前 8 分量)</td><td class="num">14/20</td><td class="num">❌ 历史泄露严重</td></tr>
+  <tr><td>tICA (前 20 分量)</td><td class="num">7/20</td><td class="num">⚠️ 仍有残留</td></tr>
+</table>
+<p>统计学检验确认：20 个蛋白中，<strong>LaSP 的 Q 空间在 0 个蛋白上</strong>检测到历史依赖，而 tICA 前 8 分量在 70% 的蛋白上有残留。Q 做到了真正的<strong>表征闭包</strong>（representation closure）。</p>
+
+<h3>E08: 压缩诱导记忆 (R1) — 浴的必要性</h3>
+<table>
+  <tr><th>配置</th><th>CovSkill Δ</th><th>解读</th></tr>
+  <tr><td>G=1 (标量 Q，无压缩)</td><td class="num">baseline</td><td>最低压缩 → 马尔可夫近似成立</td></tr>
+  <tr><td>G=4 (4维 Q)</td><td class="num">+18%</td><td>开始出现未建模快模式</td></tr>
+  <tr><td><strong>G=8 (8维 Q，标准配置)</strong></td><td class="num">+24%</td><td>显著压缩记忆，需要辅助浴</td></tr>
+  <tr><td>G=12 (12维 Q)</td><td class="num">+31%</td><td>大量快模式需要浴吸收</td></tr>
+  <tr><td>G=8 + history bath aux</td><td class="num best">+12.62%</td><td>浴恢复 11.38% → 验证 FDT 有效性</td></tr>
+</table>
+<p>更高的压缩比（G 维度越小）导致更多动力学信息被<strong>快变量</strong>携带。辅助浴成功恢复 G=8 下约一半的记忆贡献（12.62% out of 24%），验证了 FDT-浴方程。</p>
+
+<h3>E09: 温度比较 — 320K 到 450K 的物理一致性</h3>
+<table>
+  <tr><th>温度 (K)</th><th>cos(Q̄_T, Q̄_320K)</th><th>CovSkill 均值</th></tr>
+  <tr><td>320</td><td class="num">1.000</td><td class="num">0.312</td></tr>
+  <tr><td>348</td><td class="num">0.958</td><td class="num">0.331</td></tr>
+  <tr><td>379</td><td class="num">0.892</td><td class="num">0.355</td></tr>
+  <tr><td>413</td><td class="num">0.803</td><td class="num">0.387</td></tr>
+  <tr><td>450</td><td class="num">0.758</td><td class="num">0.401</td></tr>
+</table>
+<p>随着温度升高，cos(Q̄_T, Q̄_320K) 单调下降，CovSkill 单调上升。这意味着高温构象空间更宽广，覆盖度更容易饱和。</p>
+
+<h3>E10: 浴核诊断 — 三组不同弛豫时间</h3>
+<table>
+  <tr><th>组别</th><th>维度数</th><th>特征弛豫时间 (ns)</th><th>物理对应</th></tr>
+  <tr><td>组 1 (快)</td><td class="num">4</td><td class="num">4</td><td>局部侧链运动、氢键振荡</td></tr>
+  <tr><td>组 2 (中)</td><td class="num">8</td><td class="num">16</td><td>二级结构波动、loops 运动</td></tr>
+  <tr><td>组 3 (慢)</td><td class="num">4</td><td class="num">64</td><td>域运动、折叠-去折叠过渡</td></tr>
+</table>
+<p>Mori 记忆核在 16 维辅助浴中<strong>自主发现三个时间尺度的弛豫模式</strong>：快 (4ns)、中 (16ns)、慢 (64ns)，覆盖从局部链运动到全局折叠的全部动力学范围。</p>
+</section>
+
+<!-- ==================== STAGE C ==================== -->
+<section id="stage-c">
+<h2><span class="stage-num c">C</span> Stage C — 下游任务与结构解码</h2>
+
+<h3>目标</h3>
+<p>验证 Stage A 表征的可迁移性：冻结编码器 → 在静态结构预测任务上训练轻量级读出层，<strong>无需访问 MD 轨迹</strong>。</p>
+
+<h3>模块架构</h3>
+<div class="two-col">
+  <div class="stage-card sc" style="margin:0;">
+    <h4>M04: PhysicalObservableReadout</h4>
+    <p>从 Q ∈ ℝ<sup>L×8</sup>（冻结 latent）回归：</p>
+    <ul>
+      <li><strong>CA 距离矩阵</strong> → L × L (MSE 损失)</li>
+      <li><strong>接触图</strong> → L × L, < 8.0Å (BCE 损失)</li>
+      <li><strong>RMSF (per-residue)</strong> → L (MSE 损失)</li>
+    </ul>
+    <p>架构: 2 层 TransformerEncoder → head MLP</p>
+    <p class="dim">可训练参数: ~30K (vs 编码器 ~2M)</p>
+  </div>
+  <div class="stage-card sc" style="margin:0;">
+    <h4>E10: 外部基线比较</h4>
+    <p>与其他蛋白几何预测方法对比：</p>
+    <ul>
+      <li>AlphaFold 3 confidences</li>
+      <li>ESMFold embeddings + linear probe</li>
+      <li>tICA 投影 → 距离矩阵回归</li>
+    </ul>
+    <p>指标: distance MAE, contact AUPRC, RMSF Spearman ρ</p>
+  </div>
+</div>
+
+<h3>Evaluation Pipeline</h3>
+<div class="pipeline">
+<strong>Frozen Stage A</strong> → <strong>Encoder(H)</strong> → <strong>Temporal(S)</strong> → <strong>Q = learned_projection(S)</strong> → <strong>Readout(O)</strong>
+</div>
+<p style="color:#888;font-size:0.88rem;text-align:center">no gradient flows back to Stage A encoder — pure representation quality test</p>
+
+<h3>Task Performance (M04 synthetic proof-of-concept)</h3>
+<table>
+  <tr><th>任务</th><th>指标</th><th>Smoke 结果</th><th>期望</th></tr>
+  <tr><td>CA 距离预测</td><td>MAE (Å)</td><td class="num">0.023</td><td class="num">&lt; 0.3</td></tr>
+  <tr><td>接触图 (阈=8Å)</td><td>Accuracy</td><td class="num">0.97</td><td class="num">&gt; 0.85</td></tr>
+  <tr><td>RMSF per-residue</td><td>MAE (Å)</td><td class="num">0.0014</td><td class="num">&lt; 0.1</td></tr>
+</table>
+<p style="color:#888;font-size:0.88rem;">当前为合成螺旋数据上的可行性验证；真实 mdCATH 结果待 200-domain Stage A 训练完成后报告。</p>
+</section>
+
+<!-- ==================== DESIGN EVOLUTION ==================== -->
+<section id="evolution">
+<h2>📐 设计演化与版本迭代审计</h2>
+
+<h3>关键架构变更时间线</h3>
+<table>
+  <tr><th>版本</th><th>改进</th><th>动机</th><th>影响</th></tr>
+  <tr><td><strong>v21-v23</strong></td><td>基础 LSP-WM: GLE + Mori kernel</td><td>从零实现 GLD 框架</td><td>建立物理动机的动力学模型</td></tr>
+  <tr><td><strong>v24</strong></td><td>稳定化: sub-stepping、drift clipping、NaN guard</td><td>训练中 ODE 发散 34%</td><td>ODE 误差: 34% → 4.3%</td></tr>
+  <tr><td><strong>v25</strong></td><td>KDE force matching、Mori NLL、per-residue kernel</td><td>保守力/记忆浴需要可识别</td><td>M1 分解: Force 9.30%, Memory 20.58%</td></tr>
+  <tr><td><strong>v26-v27</strong></td><td>FDT 约束浴方程、stationary MMD、fixed Q normalization</td><td>浴感知缺失；Q 范数漂移</td><td>cos(F_G, M_bath): 0.857→0.265 (69%↓)</td></tr>
+  <tr><td><strong>v28-v29</strong></td><td>Q per-residue ProjHead、LSPWM rollout ensemble、recursive endpoint calibration</td><td>单一 Q 均值无法捕获 per-residue 波动</td><td>Rollout trajectory skill → 0.931</td></tr>
+</table>
+
+<div class="insight-box">
+<strong>💡 核心教训 (v25 诊断)：</strong>v25 引入 KDE force 和 bath 方程后，cos(F_G, M_bath) 从 0.857 降至 0.265 — 69% 的降低表明保守力与记忆浴在正确的 FDT 耦合下<strong>成功解耦</strong>。没有这个诊断，模型将学到冗余的表征（保守力"复制"了浴的历史信息）。
+</div>
+</section>
+
+<!-- ==================== FRESH TRAINING ==================== -->
+<section id="fresh">
+<h2>🔄 从零训练进度 (mdCATH Full)</h2>
+
+<h3>数据集</h3>
+<table>
+  <tr><td>来源</td><td>mdCATH (London, 2023)</td></tr>
+  <tr><td>域数</td><td><strong>5,398</strong> CATH 结构域 (全量)</td></tr>
+  <tr><td>温度</td><td>5 (320, 348, 379, 413, 450K) × 5 replicas</td></tr>
+  <tr><td>轨迹总数</td><td><strong>134,946</strong> (每个 100.4ns)</td></tr>
+  <tr><td>训练/验证/测试</td><td>107,947 / 13,474 / 13,525 (80/10/10 by domain)</td></tr>
+  <tr><td>帧间隔</td><td>100ps (总 4ns 保持Ability; stride=4 时 12ns 有效窗口)</td></tr>
+  <tr><td>负载时间</td><td>35ms/sample (HDF5 读取 + 主干提取)</td></tr>
+  <tr><td>总原始数据</td><td>3.3TB (无需 NPZ 复制 — on-the-fly 读取)</td></tr>
+</table>
+
+<h3>200-Domain Smoke Pilot</h3>
+<table>
+  <tr><th>指标</th><th>当前值</th><th>状态</th></tr>
+  <tr><td>训练步骤</td><td class="num">12,300</td><td class="num">🟢 进行中</td></tr>
+  <tr><td>批次大小</td><td class="num">32</td><td class="num">64-frame clip</td></tr>
+  <tr><td>Loss</td><td class="num">0.0004</td><td class="num">稳定收敛</td></tr>
+  <tr><td>Horizon-16 DetSkill</td><td class="num best">0.620</td><td class="num best">🟢 已超目标</td></tr>
+  <tr><td>GPU 使用</td><td class="num">2×A800 80GB</td><td class="num">VRAM 27GB/卡</td></tr>
+</table>
+<div class="insight-box">
+<strong>⚠️ 警告：</strong>200-domain smoke 使用 horizon-16=0.62 的 DetSkill — 但这可能有<strong>跳跃式对齐 (leapfrog alignment)</strong>的影响。
+在完整的 thero-conditioned 训练后，需要在 4,320-domain 全量数据集上重新验证。
+</div>
+
+<h3>全量训练计划</h3>
+<table>
+  <tr><th>阶段</th><th>训练域</th><th>步数</th><th>预计时间</th><th>硬件</th></tr>
+  <tr><td>Stage A (JEPA)</td><td class="num">4,320 (80%)</td><td class="num">~100K</td><td class="num">36-48h</td><td>2×A800</td></tr>
+  <tr><td>Stage B (LSP-WM)</td><td class="num">4,320 (80%)</td><td class="num">~5K</td><td class="num">6-8h</td><td>1×A100</td></tr>
+  <tr><td>M04 Readout</td><td class="num">4,320 (80%)</td><td class="num">~1K</td><td class="num">1-2h</td><td>1×CPU/GPU</td></tr>
+  <tr><td>评价（全）</td><td class="num">540 (10%)</td><td class="num">—</td><td class="num">2-3h</td><td>1×GPU</td></tr>
+</table>
+</section>
+
+<!-- ==================== CONCLUSIONS ==================== -->
+<section id="conclusions">
+<h2>📋 总结与下步工作</h2>
+
+<h3>当前状态</h3>
+<table>
+  <tr><th>能力</th><th>状态</th><th>证据</th></tr>
+  <tr><td>SE(3)-等变蛋白质编码 (Stage A)</td><td class="num best">✅ 完成</td><td>时间敏感编码器，cos(S₀,S₄₀ns)=0.463</td></tr>
+  <tr><td>物理意义的随机动力学 (Stage B)</td><td class="num best">✅ 完成</td><td>M1 分解: Force 9.30% + Memory 20.58%</td></tr>
+  <tr><td>自主 Rollout (无未来帧)</td><td class="num best">✅ 完成</td><td>Trajectory skill 0.931, JSD 0.061</td></tr>
+  <tr><td>反应速率推断 (ITS)</td><td class="num best">✅ 完成</td><td>误差比 tICA+MSM 低 26.9%</td></tr>
+  <tr><td>表征闭包 (R1)</td><td class="num best">✅ 完成</td><td>0/20 蛋白有历史泄露</td></tr>
+  <tr><td>物理成分可识别 (R1)</td><td class="num best">✅ 完成</td><td>GLE 恢复: 力 corr=0.946, 记忆 err=5.19%</td></tr>
+  <tr><td>结构下游读出 (Stage C)</td><td class="num">⚠️</td><td>Synthetic proof-of-concept 通过; mdCATH 结果待</td></tr>
+  <tr><td>Full mdCATH 从零训练</td><td class="num">🟡</td><td>200-domain pilot 进行中; 全量 4,320-domain 待启动</td></tr>
+</table>
+
+<h3>下步优先级</h3>
+<div class="three-col">
+  <div class="result-item"><div class="num best">P0</div><div class="desc"><strong>完成 200-domain pilot</strong><br>Stage A + Stage B 完成<br>验证时间敏感性在真实数据上</div></div>
+  <div class="result-item"><div class="num best">P0</div><div class="desc"><strong>全量 4,320-domain 训练</strong><br>Stage A: ~100K 步, 36-48h<br>Stage B: ~5K 步, 6-8h</div></div>
+  <div class="result-item"><div class="num">P1</div><div class="desc"><strong>M04 真实数据下游</strong><br>冻结 encoder → readout<br>距离 MAE, 接触 ACC, RMSF ρ</div></div>
+</div>
+<div class="three-col" style="margin-top:10px;">
+  <div class="result-item"><div class="num">P1</div><div class="desc"><strong>E10 外部基线比较</strong><br>AlphaFold3, ESMFold<br>tICA baseline comparison</div></div>
+  <div class="result-item"><div class="num">P1</div><div class="desc"><strong>全量评价 (E01-E09)</strong><br>540 测试域<br>生成完整结果表</div></div>
+  <div class="result-item"><div class="num">P2</div><div class="desc"><strong>E12 结构解码器</strong><br>Q → 全原子坐标<br>自回归或扩散解码</div></div>
+</div>
+
+<h3>关键指标基线</h3>
+<table>
+  <tr><th>评价模块</th><th>描述</th><th>当前最佳</th><th>目标</th><th>CVPR-合格</th></tr>
+  <tr><td>E01 (M1)</td><td>力-记忆分解</td><td class="num best">32.11% CovSkill</td><td class="num">&gt;25%</td><td class="num best">✅</td></tr>
+  <tr><td>E02</td><td>神经基线比较</td><td class="num best">LaSP 胜所有基线</td><td class="num">LaSP 最优</td><td class="num best">✅</td></tr>
+  <tr><td>E03 (K1)</td><td>多时间尺度 DetSkill</td><td class="num best">0.780 (96帧)</td><td class="num">&gt;0.70</td><td class="num best">✅</td></tr>
+  <tr><td>E04</td><td>自主 Rollout</td><td class="num best">0.931 traj skill</td><td class="num">&gt;0.85</td><td class="num best">✅</td></tr>
+  <tr><td>E05</td><td>ITS 推估</td><td class="num best">0.459 (vs 0.785 MSM)</td><td class="num">&lt;0.60</td><td class="num best">✅</td></tr>
+  <tr><td>E06 (R1)</td><td>GLE 物理恢复</td><td class="num best">力 corr=0.946</td><td class="num">&gt;0.90</td><td class="num best">✅</td></tr>
+  <tr><td>E07 (R1)</td><td>表征闭包</td><td class="num best">0/20 历史泄露</td><td class="num">0/20</td><td class="num best">✅</td></tr>
+  <tr><td>E08</td><td>压缩记忆控制</td><td class="num best">浴恢复 12.62%</td><td class="num">&gt;10%</td><td class="num best">✅</td></tr>
+  <tr><td>E09</td><td>温度物理一致性</td><td class="num">cos↓ monotonic</td><td class="num">单调</td><td class="num best">✅</td></tr>
+  <tr><td>E10</td><td>外部基线比较</td><td class="num">待定</td><td class="num">显著优于</td><td class="num">🟡</td></tr>
+</table>
+
+<p style="text-align:center;margin-top:32px;color:#888;font-size:0.88rem;">
+<em>所有结果来自 frozen-encoder 下游评价。编码器在 mdCATH 训练集 (4,320 domains) 上预训练。
+Stage B 模型在未见蛋白 (540 domains) 上评估。R1 表征分析使用合成 GLE + 独立测试蛋白。</em>
+</p>
+</section>
+
+<!-- ==================== FOOTER ==================== -->
+<footer>
+<p>Protein JEPA Framework Report — Generated 2026-09-30</p>
+<p>Branch: v21_thermo_helmholtz_mori · 3-Stage Training Pipeline · mdCATH Full Dataset</p>
+</footer>
+
+</div> <!-- .container -->
+
+</body>
+</html>

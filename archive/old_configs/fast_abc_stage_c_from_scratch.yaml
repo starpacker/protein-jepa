@@ -1,0 +1,52 @@
+# Fast real-data Stage C iteration budget: 2 x 300 = 600 steps.
+output_dir: artifacts/fast_abc_stage_c
+seed: 42
+deterministic: false
+device: cuda:0
+log_every: 10
+save_every: 1
+checkpoint_every_steps: 300
+init_checkpoint: artifacts/fast_abc_stage_b/checkpoint_latest.pt
+stage_c_pretrained: null
+strict_init: false
+
+data:
+  manifest_path: artifacts/mdcath_manifest_200dom/train.jsonl
+  batch_size: 2
+  num_workers: 0
+  num_frames: 4
+  frame_stride: 4
+  window_stride: 4
+  max_residues: 256
+  coordinate_scale: 1.0
+  training_mode: paired_window
+  paired_horizons_frames: [32, 64, 96]
+  paired_all_horizons: false
+  paired_history_mode: uniform
+
+model:
+  model_type: stage_c
+  q_dim: 8
+  latent_dim: 128
+  encoder_depth: 4
+  temporal_depth: 2
+  num_heads: 4
+  num_rbf: 16
+  max_frames: 128
+  max_residues: 256
+  dropout: 0.1
+  feature_norm: true
+  time_conditioning: physical
+  thermodynamic_conditioning: true
+  anchor_noise_level: 0.5
+  q_weight_ramp_start: 0
+  q_weight_ramp_steps: 300
+
+optimization:
+  lr: 5.0e-5
+  epochs: 2
+  steps_per_epoch: 300
+  warmup_steps: 100
+  weight_decay: 0.01
+  grad_clip: 10.0
+  gradient_accumulation_steps: 4

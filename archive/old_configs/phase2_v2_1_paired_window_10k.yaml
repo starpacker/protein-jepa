@@ -1,0 +1,61 @@
+seed: 83
+device: auto
+output_dir: /liuyutian/protein_jepa_frame/artifacts/phase2_v2_1_paired_window_10k
+log_every: 20
+save_every: 1
+checkpoint_every_steps: 2000
+strict_init: true
+
+data:
+  manifest_path: /liuyutian/protein_jepa/artifacts/manifests/mdcath.train.jsonl
+  batch_size: 4
+  num_workers: 0
+  num_frames: 24
+  frame_stride: 2
+  window_stride: 8
+  max_residues: 384
+  sampling_mode: hierarchical
+  training_mode: paired_window
+  paired_horizons_frames: [8, 16, 24, 48]
+
+model:
+  latent_dim: 128
+  encoder_depth: 4
+  temporal_depth: 2
+  predictor_depth: 4
+  state_predictor_depth: 1
+  state_prediction_lags: []
+  frame_pooling: mean
+  time_conditioning: physical
+  thermodynamic_conditioning: true
+  orientation_features: true
+  temporal_causal: true
+  temporal_position_encoding: none
+  temporal_delta_features: true
+  transition_source: state
+  transition_thermodynamic_conditioning: true
+  paired_forecast: true
+  paired_predictor_depth: 3
+  slow_state_enabled: false
+  num_heads: 4
+  num_rbf: 16
+  dropout: 0.1
+  max_frames: 64
+  max_residues: 4096
+  feature_norm: true
+
+optimization:
+  epochs: 2
+  steps_per_epoch: 5000
+  lr: 0.0002
+  encoder_lr_scale: 0.2
+  weight_decay: 0.05
+  warmup_steps: 1000
+  ema_start: 0.996
+  ema_end: 1.0
+  grad_clip: 1.0
+  precision: float32
+  paired_delta_weight: 1.0
+  paired_state_weight: 0.25
+  paired_endpoint_variance_weight: 0.02
+  semigroup_weight: 0.0

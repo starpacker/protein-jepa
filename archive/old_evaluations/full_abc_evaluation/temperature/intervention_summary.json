@@ -1,0 +1,20 @@
+{
+  "t320K": {
+    "n": 2,
+    "q_norm_mean": NaN,
+    "q_norm_std": NaN,
+    "q_diff_mean": NaN
+  },
+  "t379K": {
+    "n": 2,
+    "q_norm_mean": NaN,
+    "q_norm_std": NaN,
+    "q_diff_mean": NaN
+  },
+  "t413K": {
+    "n": 2,
+    "q_norm_mean": NaN,
+    "q_norm_std": NaN,
+    "q_diff_mean": NaN
+  }
+}

@@ -1,0 +1,69 @@
+# Stage B v2: Force-floor regularisation + noise-scheduled rollout + multi-protein.
+#
+# Physics rationale:
+#   - Flat energy landscape (|F|~3e-4) was the root cause of 100% divergence
+#   - force_floor barrier pushes |F| ≥ 0.3 (equilibrium at ~0.298)
+#   - At |F|=0.3, D≈0.0025, dt=100ps×32steps: SNR≈0.6, noise/drift≈1.7
+#     → stochastic rollout becomes informative
+#   - Noise scheduling: deterministic below |F|=0.05, linear ramp to full FDT
+#     at |F|=0.3, preventing gradient collapse during the force-floor ramp-up
+output_dir: artifacts/full_abc_stage_b_v2
+seed: 42
+deterministic: false
+device: cuda:0
+log_every: 10
+save_every: 1
+checkpoint_every_steps: 500
+init_checkpoint: artifacts/full_abc_stage_a/checkpoint_latest.pt
+strict_init: false
+
+data:
+  manifest_path: artifacts/mdcath_manifest_200dom/train.jsonl
+  batch_size: 1
+  num_workers: 0
+  num_frames: 8
+  frame_stride: 4
+  window_stride: 4
+  max_residues: 256
+  coordinate_scale: 1.0
+  training_mode: paired_window
+  paired_horizons_frames: [32, 64, 96]
+  paired_all_horizons: false
+  paired_history_mode: uniform
+
+model:
+  model_type: stage_b
+  q_dim: 8
+  latent_dim: 128
+  encoder_depth: 4
+  temporal_depth: 2
+  num_heads: 4
+  num_rbf: 16
+  max_frames: 128
+  max_residues: 256
+  dropout: 0.1
+  feature_norm: true
+  time_conditioning: physical
+  thermodynamic_conditioning: true
+  lspwm_per_residue_enabled: true
+  lspwm_use_bath: true
+  lspwm_history_aware: true
+  lspwm_rollout_enabled: true
+  lspwm_rollout_steps: 32
+  lspwm_base_step_ps: 100.0
+
+optimization:
+  lr: 3.0e-5
+  epochs: 50
+  warmup_steps: 300
+  weight_decay: 0.01
+  grad_clip: 10.0
+  gradient_accumulation_steps: 1
+  steps_per_epoch: 500
+  lagged_state_jepa_weight: 1.0
+  state_jepa_weight: 0.02
+  variance_reg: 0.01
+  force_floor_weight: 5.0
+  force_floor_target: 0.3
+  lspwm_rollout_trajectory_nll_weight: 0.1
+  lspwm_semigroup_consistency_weight: 0.01
