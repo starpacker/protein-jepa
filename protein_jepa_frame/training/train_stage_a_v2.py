@@ -69,6 +69,16 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--weight-decay", type=float, default=0.02)
     p.add_argument("--grad-clip", type=float, default=1.0)
     p.add_argument("--batch-size", type=int, default=8)
+    p.add_argument("--frame-stride", type=int, default=1,
+                   help="Stride between frames in the context window.")
+    p.add_argument("--paired-history-mode", type=str, default="uniform",
+                   choices=["uniform", "multiscale"],
+                   help="'uniform': all context frames at frame_stride. "
+                        "'multiscale': recent frames at frame_stride, older frames at paired_slow_stride.")
+    p.add_argument("--paired-recent-frames", type=int, default=0,
+                   help="Number of recent frames in multiscale mode (at frame_stride).")
+    p.add_argument("--paired-slow-stride", type=int, default=0,
+                   help="Stride for older frames in multiscale mode.")
     p.add_argument(
         "--grad-accum",
         type=int,
@@ -119,8 +129,16 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--orth-weight", type=float, default=0.01)
     p.add_argument("--factor-activity-weight", type=float, default=0.01)
     p.add_argument("--encoder-variance-weight", type=float, default=0.01)
+    p.add_argument("--encoder-min-std", type=float, default=0.1,
+                   help="Per-channel std floor for cross-batch H variance floor V(H).")
     p.add_argument("--temporal-variance-weight", type=float, default=0.05)
     p.add_argument("--temporal-min-std", type=float, default=0.05)
+    p.add_argument("--temporal-contrast-weight", type=float, default=0.0,
+                   help="Weight on supervised temporal contrastive loss. "
+                        "Regresses norm(H_i-H_j)/sqrt(L*dH) onto tanh(CA_RMSD/scale). "
+                        "Set to 1.0-5.0 to break time-invariance with structural supervision.")
+    p.add_argument("--temporal-contrast-rmsd-scale", type=float, default=2.0,
+                   help="RMSD scale (Å) for temporal contrast target; tanh saturation point.")
     p.add_argument(
         "--struct-recon-weight",
         type=float,
@@ -250,8 +268,11 @@ def main() -> None:
         orth_weight=args.orth_weight,
         factor_activity_weight=args.factor_activity_weight,
         encoder_variance_weight=args.encoder_variance_weight,
+        encoder_min_std=args.encoder_min_std,
         temporal_variance_weight=args.temporal_variance_weight,
         temporal_min_std=args.temporal_min_std,
+        temporal_contrast_weight=args.temporal_contrast_weight,
+        temporal_contrast_rmsd_scale=args.temporal_contrast_rmsd_scale,
     )
     weights.validate()
 
@@ -278,6 +299,10 @@ def main() -> None:
         num_workers=args.num_workers,
         training_mode="paired_window",
         num_frames=num_frames,
+        frame_stride=args.frame_stride,
+        paired_history_mode=args.paired_history_mode,
+        paired_recent_frames=args.paired_recent_frames,
+        paired_slow_stride=args.paired_slow_stride,
         paired_horizons_frames=horizons,
         # All horizons are sampled from each context window every step.
         # collate_paired_windows flattens the grouped pairs so the effective
@@ -357,6 +382,8 @@ def main() -> None:
             temporal_out = model.forward_temporal_multilag(
                 paired, lags, recent_frac=args.recent_frac,
             )
+            # Inject context_coords so the contrastive loss can compute CA RMSD.
+            temporal_out["context_coords"] = paired["context_coords"]
             spatial_out = model.forward_spatial(clips)
             comp = compute_stage_a_v2_loss(
                 temporal_out,

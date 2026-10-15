@@ -26,7 +26,129 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import torch
+import torch.nn.functional as F
 from torch import Tensor
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Kabsch-aligned CA RMSD helper
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _kabsch_rmsd(P: Tensor, Q: Tensor, mask: Tensor) -> Tensor:
+    """Kabsch-aligned per-sample CA RMSD.
+
+    Args:
+        P:    [B, L, 3]  anchor CA coords
+        Q:    [B, L, 3]  target CA coords
+        mask: [B, L]     float or bool; 1 = valid residue
+
+    Returns:
+        rmsd: [B]  RMSD in Å after optimal rigid alignment
+    """
+    m = mask.float()  # [B, L]
+    n = m.sum(dim=-1, keepdim=True).clamp(min=1.0)  # [B, 1]
+
+    # Centre on centroid of valid residues
+    p_c = (P * m.unsqueeze(-1)).sum(1, keepdim=True) / n.unsqueeze(-1)  # [B,1,3]
+    q_c = (Q * m.unsqueeze(-1)).sum(1, keepdim=True) / n.unsqueeze(-1)
+    p = (P - p_c) * m.unsqueeze(-1)  # [B, L, 3]
+    q = (Q - q_c) * m.unsqueeze(-1)
+
+    # Covariance H = P^T Q  (sum over valid residues)
+    H = torch.bmm(p.transpose(1, 2), q)  # [B, 3, 3]
+    U, S, Vh = torch.linalg.svd(H)       # U [B,3,3], S [B,3], Vh [B,3,3]
+
+    # Ensure proper rotation (det = +1)
+    d = torch.linalg.det(torch.bmm(Vh.transpose(-1, -2), U.transpose(-1, -2)))  # [B]
+    diag = torch.stack([
+        torch.ones_like(d), torch.ones_like(d), d
+    ], dim=-1)  # [B, 3]
+    R = torch.bmm(
+        Vh.transpose(-1, -2) * diag.unsqueeze(-2),
+        U.transpose(-1, -2),
+    )  # [B, 3, 3]
+
+    # Rotate P, compute RMSD
+    p_rot = torch.bmm(p, R.transpose(-1, -2))  # [B, L, 3]
+    diff_sq = ((p_rot - q) ** 2).sum(-1) * m   # [B, L]
+    rmsd = (diff_sq.sum(-1) / n.squeeze(-1)).sqrt()  # [B]
+    return rmsd
+
+
+def compute_temporal_contrast_loss(
+    H_seq: Tensor,
+    coords_seq: Tensor,
+    valid: Tensor,
+    rmsd_scale: float = 2.0,
+) -> Tensor:
+    """Supervised temporal contrastive loss — ranking + regression hybrid.
+
+    For every consecutive frame pair (i, i+1) in the context window:
+
+    1. MSE regression: regress normalised H-distance to tanh(CA_RMSD / rmsd_scale).
+    2. Ranking (triplet) loss: for every pair of frame-pairs within a batch,
+       enforce that the pair with higher CA RMSD has larger H-distance by at
+       least a margin of 0.05.  This prevents the trivial solution of shrinking
+       all H-distances toward zero, which satisfies regression when most
+       consecutive RMSD values are small (tanh(small)≈0) but doesn't teach
+       the encoder to scale H-distance with structural change.
+
+    L = L_regression + L_ranking
+
+    Args:
+        H_seq:      [B, K, L, dH]  full (unmasked) context H
+        coords_seq: [B, K, L, 4, 3]  backbone coords; CA is index 1
+        valid:      [B, L]  bool/float residue mask
+        rmsd_scale: Å; tanh saturation point (~2 Å maps to tanh≈0.76)
+
+    Returns:
+        scalar loss averaged over all valid consecutive pairs
+    """
+    B, K, L, dH = H_seq.shape
+
+    ca = coords_seq[:, :, :, 1, :]  # [B, K, L, 3]  CA only
+    m = valid.float()                # [B, L]
+    L_valid = m.sum(-1).clamp(min=1.0)  # [B]
+
+    reg_losses = []
+    rank_losses = []
+    margin = 0.05  # minimum H-distance gap between a far pair and a near pair
+
+    for k in range(K - 1):
+        h_i = H_seq[:, k]       # [B, L, dH]
+        h_j = H_seq[:, k + 1]   # [B, L, dH]
+        ca_i = ca[:, k]
+        ca_j = ca[:, k + 1]
+
+        rmsd = _kabsch_rmsd(ca_i, ca_j, valid).detach()  # [B]
+
+        dH_dist = ((h_i - h_j) * m.unsqueeze(-1)).pow(2).sum((-1, -2))  # [B]
+        h_dist = (dH_dist / (L_valid * dH)).sqrt()  # [B]
+
+        target = torch.tanh(rmsd / rmsd_scale)  # [B]
+        reg_losses.append(F.mse_loss(h_dist, target))
+
+        # Ranking: all pairs (a, b) where rmsd[a] > rmsd[b] + margin_rmsd.
+        # Enforce h_dist[a] > h_dist[b] + margin.
+        # Use margin_rmsd = rmsd_scale * 0.25 (0.5 Å for default scale=2.0).
+        if B >= 2:
+            margin_rmsd = rmsd_scale * 0.25
+            # [B, B] pairwise RMSD difference: rmsd[a] - rmsd[b]
+            rmsd_diff = rmsd.unsqueeze(1) - rmsd.unsqueeze(0)  # [B, B]
+            # positive where a has higher RMSD than b by enough
+            pos_pairs = (rmsd_diff > margin_rmsd).float()  # [B, B]
+            n_pos = pos_pairs.sum().clamp(min=1.0)
+            # h_dist[a] should exceed h_dist[b] by margin
+            h_diff = h_dist.unsqueeze(1) - h_dist.unsqueeze(0)  # [B, B]
+            rank_viol = F.relu(margin - h_diff) * pos_pairs  # hinge
+            rank_losses.append(rank_viol.sum() / n_pos)
+
+    if not reg_losses:
+        return H_seq.new_zeros(())
+
+    L_reg = torch.stack(reg_losses).mean()
+    L_rank = torch.stack(rank_losses).mean() if rank_losses else L_reg.new_zeros(())
+    return L_reg + L_rank
 
 def _find_jepa_anything_src() -> Path:
     """Locate jepa-anything-core/src by walking up from this file."""
@@ -93,6 +215,19 @@ class StageAV2LossWeights:
     # γ=0.40 → γ²=0.16 >> natural per-step variance ~0.05, so the hinge
     # fires immediately and pushes H to vary along the trajectory.
 
+    # Supervised temporal contrastive loss: regress normalised H-distance onto
+    # tanh(CA_RMSD / rmsd_scale) so the encoder embeds conformational distance
+    # directly into H-space distance.  This is a direct supervised signal that
+    # breaks time-invariance without injecting unstructured noise.
+    #
+    # Loss = mean over frame pairs (i,j):
+    #   (||H_i - H_j||_F / sqrt(L·dH)  -  tanh(RMSD_ij / rmsd_scale))²
+    #
+    # rmsd_scale=2.0 Å maps the 0–4 Å range to tanh 0–0.96,
+    # so even small motions (1 Å) get a nonzero target (tanh≈0.46).
+    temporal_contrast_weight: float = 0.0    # λ_c; set >0 to enable
+    temporal_contrast_rmsd_scale: float = 2.0  # Å; controls target saturation
+
     # Activity floor thresholds
     factor_min_std: float = 0.1       # γ for factor activity
     encoder_min_std: float = 0.1      # γ for encoder variance
@@ -129,6 +264,7 @@ class StageAV2LossComponents:
     factor_activity: Tensor
     encoder_variance: Tensor
     temporal_variance: Tensor
+    temporal_contrast: Tensor
 
     def as_loggable_dict(self) -> dict[str, float]:
         return {
@@ -139,6 +275,7 @@ class StageAV2LossComponents:
             "loss/factor_activity": self.factor_activity.item(),
             "loss/encoder_variance": self.encoder_variance.item(),
             "loss/temporal_variance": self.temporal_variance.item(),
+            "loss/temporal_contrast": self.temporal_contrast.item(),
         }
 
 
@@ -314,6 +451,26 @@ def compute_stage_a_v2_loss(
     else:
         L_temporal = torch.zeros((), device=device)
 
+    # ── Supervised temporal contrastive loss ─────────────────────────────────
+    # Regress normalised H-distance onto tanh(CA_RMSD / rmsd_scale) for each
+    # consecutive frame pair in the context window.  This gives the encoder a
+    # direct structural supervision signal: pairs that move more (higher RMSD)
+    # must produce more distant H embeddings.  Unlike the unsupervised floor
+    # above, this loss specifies *which* directions in H-space should vary
+    # (those correlated with structural change) and cannot be satisfied by noise.
+    L_contrast = torch.zeros((), device=device)
+    if weights.temporal_contrast_weight > 0.0:
+        ctx_full_c = temporal_out.get("context_H_full")
+        ctx_coords = temporal_out.get("context_coords")   # injected by training loop
+        if (ctx_full_c is not None and ctx_coords is not None
+                and ctx_full_c.dim() == 4 and ctx_full_c.shape[1] > 1):
+            L_contrast = compute_temporal_contrast_loss(
+                H_seq=ctx_full_c,
+                coords_seq=ctx_coords,
+                valid=valid.float(),
+                rmsd_scale=weights.temporal_contrast_rmsd_scale,
+            )
+
     # ── Composite ─────────────────────────────────────────────────────────────
     total = (
         weights.future_weight * L_future
@@ -322,6 +479,7 @@ def compute_stage_a_v2_loss(
         + weights.factor_activity_weight * L_factor_act
         + weights.encoder_variance_weight * L_enc_var
         + weights.temporal_variance_weight * L_temporal
+        + weights.temporal_contrast_weight * L_contrast
     )
 
     return StageAV2LossComponents(
@@ -332,4 +490,5 @@ def compute_stage_a_v2_loss(
         factor_activity=L_factor_act.detach(),
         encoder_variance=L_enc_var.detach(),
         temporal_variance=L_temporal.detach(),
+        temporal_contrast=L_contrast.detach(),
     )

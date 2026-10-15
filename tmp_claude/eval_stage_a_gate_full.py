@@ -12,7 +12,7 @@ Frozen encoder, fixed held-out split.  Implements:
 Reports PASS/FAIL with hard thresholds.
 """
 from __future__ import annotations
-import sys, math
+import sys, math, os
 from collections import defaultdict
 from pathlib import Path
 import torch, torch.nn.functional as F
@@ -22,7 +22,7 @@ from protein_jepa_frame.config import DataConfig
 from protein_jepa_frame.data.dataset import build_dataset
 from protein_jepa_frame.models.stage_a_v2 import StageAV2, StageAV2Config
 
-CKPT     = "artifacts/abc_v3/stage_a_abs/checkpoint_latest.pt"
+CKPT     = os.environ.get("GATE_CKPT", "artifacts/abc_v3/stage_a_abs/checkpoint_latest.pt")
 MANIFEST = "artifacts/mdcath_manifest_200dom/train.jsonl"
 N_TOTAL  = 80          # proteins touched
 N_TRAIN  = 56          # fit readout on these, score on the rest
