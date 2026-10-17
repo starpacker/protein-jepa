@@ -102,6 +102,8 @@ def run(cfg: dict, cli_overrides: dict) -> dict:
         anchor_stride=cfg.get("anchor_stride", 1),
         skip_head_frames=cfg.get("skip_head_frames", 0),
         seed=seed,
+        temporal_lags=tuple(cfg.get("temporal_lags", ()) or ()),
+        emit_multi_lag=cfg.get("emit_multi_lag", True),
     )
 
     rows: list[PerProteinRow] = []
@@ -183,7 +185,7 @@ def run(cfg: dict, cli_overrides: dict) -> dict:
                     protein_id=w.protein_id, trajectory_id=w.trajectory_id,
                     temperature_k=w.temperature_k, horizon=w.horizon, variant=v,
                     rmsd=r, persist_rmsd=p_rmsd, oracle_rmsd=oracle_rmsd,
-                    msd=msd, n_residues=int(rmask.sum()),
+                    msd=msd, n_residues=int(rmask.sum()), lag=w.lag,
                 ))
 
     prev_key = None

@@ -38,6 +38,18 @@ class EvalProtocol:
     anchor_stride: int = 1                 # sub-sample anchors along the trajectory
     skip_head_frames: int = 0              # skip equilibration (raw frames)
     seed: int = 0
+    # ── multi-lag alignment with Stage-A training ──────────────────────────
+    # Stage A supervises MULTIPLE future offsets (temporal-lags) at once, so a
+    # single scalar "horizon" per window under-reports what the predictor was
+    # trained to do.  When `temporal_lags` is non-empty we emit one window per
+    # (anchor, horizon, lag), exactly mirroring the training loss: the base
+    # target is `anchor + horizon`, and lag `l` steps *backward* from the end
+    # of the future clip (l=0 -> the full horizon; larger l -> closer to the
+    # anchor).  This keeps training and evaluation on the same lag grid.
+    temporal_lags: tuple[int, ...] = ()
+    # If True, report each lag as its own `horizon` key (multi-lag sweep).
+    # If False, collapse lags to the lag-0 (full-horizon) target only.
+    emit_multi_lag: bool = True
 
 
 @dataclass
@@ -52,6 +64,7 @@ class EvalWindow:
     target: dict                            # clip dict (1 frame)
     context_frames: np.ndarray = field(default_factory=lambda: np.array([]))
     target_frame: int = -1
+    lag: int = 0                            # multi-lag index (0 = full horizon)
 
 
 def _select_trajectories(records, proto: EvalProtocol):
@@ -111,21 +124,33 @@ def iter_windows(proto: EvalProtocol):
             ctx_idx = clip_off + ctx_off   # [K] positions in clip
             ctx = _slice_clip(clip, ctx_idx)
             ctx_frames = frames[ctx_idx]
+            # Lag grid: training counts lags BACKWARD from the end of the
+            # future clip (lag 0 = full horizon, larger lag = closer to the
+            # anchor).  We mirror that exactly.  With no lags configured we
+            # keep the single full-horizon target (lag 0).
+            lags = tuple(proto.temporal_lags) if proto.temporal_lags else (0,)
+            if not proto.emit_multi_lag:
+                lags = (0,)
             for tau in proto.horizons_frames:
-                tgt_idx = np.array([clip_off + tau], dtype=np.int64)
-                tgt = _slice_clip(clip, tgt_idx)
-                yield EvalWindow(
-                    protein_id=rec.protein_id,
-                    trajectory_id=rec.trajectory_id,
-                    temperature_k=float(rec.temperature_k) if rec.temperature_k is not None else float("nan"),
-                    anchor_frame=int(anchor),
-                    horizon=int(tau),
-                    horizon_ps=float(tau) * float(getattr(rec, "frame_interval_ps", 1000.0) or 1000.0),
-                    context=ctx,
-                    target=tgt,
-                    context_frames=ctx_frames,
-                    target_frame=int(frames[clip_off + tau]),
-                )
+                for lag in lags:
+                    tau_lag = int(tau) - int(lag)      # frames after the anchor
+                    if tau_lag < 1:
+                        continue                        # target would be in/at the anchor
+                    tgt_idx = np.array([clip_off + tau_lag], dtype=np.int64)
+                    tgt = _slice_clip(clip, tgt_idx)
+                    yield EvalWindow(
+                        protein_id=rec.protein_id,
+                        trajectory_id=rec.trajectory_id,
+                        temperature_k=float(rec.temperature_k) if rec.temperature_k is not None else float("nan"),
+                        anchor_frame=int(anchor),
+                        horizon=int(tau_lag),
+                        horizon_ps=float(tau_lag) * float(getattr(rec, "frame_interval_ps", 1000.0) or 1000.0),
+                        context=ctx,
+                        target=tgt,
+                        context_frames=ctx_frames,
+                        target_frame=int(frames[clip_off + tau_lag]),
+                        lag=int(lag),
+                    )
 
 
 _FRAME_KEYS = {"coords", "atom_mask", "residue_mask", "time_ps", "forces", "msm_state_labels"}

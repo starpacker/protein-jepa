@@ -24,6 +24,7 @@ class PerProteinRow:
     oracle_rmsd: float | None = None
     msd: float | None = None
     n_residues: int = 0
+    lag: int = 0
 
 
 def _nanmedian(xs):

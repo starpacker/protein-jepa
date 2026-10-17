@@ -77,6 +77,16 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--energy-depth", type=int, default=3)
     p.add_argument("--step-ps", type=float, default=1000.0,
                    help="integration interval h (ps); MDcath = 1 ns/frame")
+    # Bath fix (B1B_DIAGNOSIS_AND_PLAN.md 目标 2): the old defaults left the
+    # bath contribution ~1e6x smaller than the diagonal diffusion R, so S was
+    # numerically dead (rollout MSD ~ 0.009 Å^2).  Raise coupling/diffusion so
+    # B_h P B_h^T is commensurate with R, and give c_net a live init.
+    p.add_argument("--coupling-scale", type=float, default=1.0e-3,
+                   help="Overall scale of the bath coupling C (fix: 1e-3 -> 0.1)")
+    p.add_argument("--diffusion-scale", type=float, default=1.0e-4,
+                   help="Scale of the diagonal diffusion D (fix: 1e-4 -> 1e-2)")
+    p.add_argument("--c-init-std", type=float, default=1.0e-1,
+                   help="Std of c_net output layer init (fix: give C a live start)")
 
     # Loss
     p.add_argument("--nll-weight", type=float, default=1.0)
@@ -174,6 +184,9 @@ def main() -> None:
         bath_dim=args.bath_dim,
         energy_depth=args.energy_depth,
         step_ps=args.step_ps,
+        coupling_scale=args.coupling_scale,
+        diffusion_scale=args.diffusion_scale,
+        c_init_std=args.c_init_std,
     )
     model = StageB1b(cfg).to(device)
     weights = StageB1bLossWeights(

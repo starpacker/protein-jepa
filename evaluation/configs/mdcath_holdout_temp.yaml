@@ -12,11 +12,14 @@ temperatures: [450.0]
 max_proteins: null
 n_rollout_reps: 4
 seed: 0
+# Multi-lag alignment with Stage-A training (see smoke.yaml).
+temporal_lags: [0, 4, 6, 7]
+emit_multi_lag: true
 anchor_stride: 80          # ~5 anchors per protein: bounds cost; multi-horizon grid retained
 oracle_max_horizon: 8      # only compute the (expensive) oracle decode for horizons <= 8 ns
 variants: [h_only, h_ft, h_plus_s, persist]
 models:
-  stage_a_ckpt: artifacts/abc_v3/stage_a_fix4_frozen/checkpoint_step6450.pt   # h_only encoder + predictor source
-  stage_a_predictor_ckpt: artifacts/abc_v3/stage_a_fix4_frozen/checkpoint_step6450.pt
-  b1a_ckpt: artifacts/abc_v3/stage_b1a_fix4_unfrozen/checkpoint_latest.pt
-  b1b_ckpt: artifacts/abc_v3/stage_b1b_mdcath/checkpoint_latest.pt
+  stage_a_ckpt: artifacts/abc_v3/stage_a_unified/checkpoint_latest.pt   # h_only encoder + predictor source
+  stage_a_predictor_ckpt: artifacts/abc_v3/stage_a_unified/checkpoint_latest.pt
+  b1a_ckpt: artifacts/abc_v3/stage_b1a_unified/checkpoint_latest.pt
+  b1b_ckpt: artifacts/abc_v3/stage_b1b_unified/checkpoint_latest.pt
