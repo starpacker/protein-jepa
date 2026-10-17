@@ -57,7 +57,10 @@ from protein_jepa_frame.training.train_utils import (
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Train Stage A V2")
-    p.add_argument("--manifest", type=str, default="artifacts/mdcath_manifest_200dom/train.jsonl")
+    p.add_argument("--manifest", type=str, default="artifacts/mdcath_manifest/train.jsonl",
+                   help="Path to training manifest JSONL.  Default is the full mdCATH dataset "
+                        "(5398 domains / 107947 trajectories).  Use "
+                        "artifacts/mdcath_manifest_200dom/train.jsonl for quick smoke tests.")
     p.add_argument("--output", type=str, default="artifacts/stage_a_v2_run")
     p.add_argument("--resume", type=str, default=None)
 
@@ -70,7 +73,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--grad-clip", type=float, default=1.0)
     p.add_argument("--batch-size", type=int, default=8)
     p.add_argument("--frame-stride", type=int, default=1,
-                   help="Stride between frames in the context window.")
+                   help="Stride between consecutive context frames in raw-frame units. "
+                        "Kept at 1: the multiscale mode (paired_slow_stride) already "
+                        "provides the physical reach back to ~28 ns, and raising "
+                        "frame_stride would grow the raw clip span past the minimum "
+                        "paired horizon, breaking the nonoverlap contract.  The "
+                        "conformational-regime fix lives in --temporal-lags instead.")
     p.add_argument("--paired-history-mode", type=str, default="uniform",
                    choices=["uniform", "multiscale"],
                    help="'uniform': all context frames at frame_stride. "
@@ -89,24 +97,32 @@ def parse_args() -> argparse.Namespace:
              "K× larger than a single-frame forward.",
     )
     p.add_argument("--num-workers", type=int, default=4)
+    p.add_argument("--max-residues", type=int, default=256,
+                   help="Crop each domain to at most this many residues before batching. "
+                        "Prevents OOM on the few large mdCATH domains (>256 residues) that "
+                        "would otherwise pad the entire batch. 256 covers >90%% of mdCATH.")
 
     # Model
     p.add_argument("--latent-dim", type=int, default=128)
     p.add_argument("--num-factors", type=int, default=4)
     p.add_argument("--encoder-depth", type=int, default=4)
     p.add_argument("--predictor-depth", type=int, default=4)
+    p.add_argument("--predictor-spatial-depth", type=int, default=2,
+                   help="Depth of the spatial residue-attention stage in the predictor. "
+                        "Fix 1: adds inter-residue interaction to capture collective motion.")
     p.add_argument("--history-frames", type=int, default=8)
     p.add_argument("--spatial-mask-ratio", type=float, default=0.40)
     p.add_argument(
         "--temporal-lags",
         type=int,
         nargs="+",
-        default=[1, 2, 4],
-        help="Frame gaps (each < history-frames) supervised by the temporal "
-             "objective from a single context window.  The predictor is "
-             "time-conditioned, so it predicts all lags; multi-lag supervision "
-             "guarantees the near-consecutive gap where MD carries signal is "
-             "trained, instead of only multi-ns chaotic endpoints.",
+        default=[0, 1, 2],
+        help="Future-clip offsets supervised by the temporal objective, counted "
+             "BACKWARD from the end of the future window (0 = last future frame "
+             "= anchor + full horizon; 1 = one offset earlier, etc.).  The "
+             "future window mirrors the context offsets shifted by the horizon, "
+             "so lag 0 is the cleanest out-of-window target (exactly one horizon "
+             "ahead of the anchor).  Each must be in [0, future_frames-1].",
     )
     p.add_argument(
         "--recent-frac",
@@ -132,11 +148,15 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--encoder-min-std", type=float, default=0.1,
                    help="Per-channel std floor for cross-batch H variance floor V(H).")
     p.add_argument("--temporal-variance-weight", type=float, default=0.05)
-    p.add_argument("--temporal-min-std", type=float, default=0.05)
-    p.add_argument("--temporal-contrast-weight", type=float, default=0.0,
-                   help="Weight on supervised temporal contrastive loss. "
-                        "Regresses norm(H_i-H_j)/sqrt(L*dH) onto tanh(CA_RMSD/scale). "
-                        "Set to 1.0-5.0 to break time-invariance with structural supervision.")
+    p.add_argument("--temporal-min-std", type=float, default=0.10,
+                   help="Per-step H variance floor γ (Fix 5: lowered from 0.40 so "
+                        "the floor is a gentle backstop, not a dominant gradient "
+                        "that pushes the encoder to inject noise).")
+    p.add_argument("--temporal-contrast-weight", type=float, default=1.0,
+                   help="Fix 4: supervised temporal contrastive loss ON by default. "
+                        "Regresses norm(H_i-H_j)/sqrt(L*dH) onto tanh(CA_RMSD/scale), "
+                        "the only loss that ties H-distance to structural distance. "
+                        "Set 0 to disable.")
     p.add_argument("--temporal-contrast-rmsd-scale", type=float, default=2.0,
                    help="RMSD scale (Å) for temporal contrast target; tanh saturation point.")
     p.add_argument(
@@ -252,6 +272,7 @@ def main() -> None:
         num_factors=args.num_factors,
         encoder_depth=args.encoder_depth,
         predictor_depth=args.predictor_depth,
+        predictor_spatial_depth=args.predictor_spatial_depth,
         spatial_mask_ratio=args.spatial_mask_ratio,
         identity_embed_scale=args.identity_embed_scale,
         ema_start=args.ema_start,
@@ -289,9 +310,12 @@ def main() -> None:
         )
 
     lags = tuple(sorted(set(int(l) for l in args.temporal_lags)))
-    if not lags or any(l < 1 or l >= num_frames for l in lags):
+    # lags are future-clip offsets counted back from the end; valid range is
+    # [0, future_frames-1].  The future clip has the same frame count as the
+    # context window (num_frames), so bound by that.
+    if not lags or any(l < 0 or l >= num_frames for l in lags):
         raise SystemExit(
-            f"--temporal-lags must be in [1, history_frames-1]={1, num_frames - 1}; got {lags}"
+            f"--temporal-lags must be in [0, future_frames-1]={0, num_frames - 1}; got {lags}"
         )
     data_cfg = DataConfig(
         manifest_path=args.manifest,
@@ -312,6 +336,11 @@ def main() -> None:
         # Hard guard: reject any horizon that would share frames with context.
         # With num_frames=K this enforces horizon >= K (gap >= 1 frame).
         paired_nonoverlap_only=True,
+        # Cap sequence length to prevent OOM on the few large mdCATH domains.
+        # Without this, collate pads to the longest sequence in the batch and
+        # BK × n_pairs × 3dH activations in struct_recon can exceed 50 GB on
+        # an 80 GB GPU.
+        max_residues=args.max_residues,
     )
     dataset = build_dataset(data_cfg)
     collate_fn = lambda s: build_paired_batch(s, args.history_frames)  # noqa: E731

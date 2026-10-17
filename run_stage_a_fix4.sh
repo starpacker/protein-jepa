@@ -39,7 +39,7 @@ CUDA_VISIBLE_DEVICES=0 python -m protein_jepa_frame.training.train_stage_a_v2 \
   --paired-recent-frames 4 \
   --paired-slow-stride   32 \
   --spatial-mask-ratio   0.4 \
-  --temporal-lags 1 2 4 7 \
+  --temporal-lags 0 1 2 4 \
   --recent-frac   0.5 \
   --paired-horizons-frames 101 150 200 \
   --orth-weight             0.01 \

@@ -60,14 +60,14 @@ class ModelConfig:
     decoder_ipa_blocks: int = 4
     decoder_torsion_bins: int = 36
     decoder_dropout: float = 0.1
-    # Hard bounds for anchor-relative Stage-C coordinate updates.
+    # DEPRECATED (legacy pipeline only).  The new Stage A/B decoder has a single
+    # positional path — the anchor-local displacement d_local in
+    # models/stage_c/structure_decoder.py DecoderConfig.max_local_position_update
+    # (see STAGE_AB_REDESIGN_PLAN.md §2.0.0).  The fields below are retained only
+    # so old experiment configs still parse; they are NOT consumed by it.
     decoder_max_translation_update: float = 0.5
     decoder_max_com_update: float = 4.0
     decoder_max_q_translation_update: float = 2.0
-    # iter_005: drive the canonical CA translation purely from the eval-legal
-    # analytic basin displacement, removing the learned per-residue translation
-    # residual that measurably destroys the contact map under the canonical
-    # metric.  See models/stage_c/structure_decoder.py DecoderConfig.
     decoder_basin_only_ca: bool = False
     # Stage-C controlled end-to-end fine-tuning.  The default preserves the
     # canonical frozen-AB protocol; experiments can selectively adapt the

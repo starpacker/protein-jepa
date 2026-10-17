@@ -1,0 +1,20 @@
+name: mdcath_holdout_protein
+# Held-out-PROTEIN axis: 20 val proteins (disjoint from train), all 5 temperatures.
+# Horizons 1..96 ns (mdCATH = 1 ns/frame).
+manifest: artifacts/mdcath_manifest_200dom/val.jsonl
+horizons_frames: [1, 2, 4, 8, 16, 24, 32, 48, 64, 96]
+context_frames: 8
+context_stride: 1
+frame_stride: 1
+temperatures: null
+max_proteins: null
+n_rollout_reps: 4
+seed: 0
+anchor_stride: 80          # ~5 anchors per protein: bounds cost; multi-horizon grid retained
+oracle_max_horizon: 8      # only compute the (expensive) oracle decode for horizons <= 8 ns
+variants: [h_only, h_ft, h_plus_s, persist]
+models:
+  stage_a_ckpt: artifacts/abc_v3/stage_a_fix4_frozen/checkpoint_step6450.pt   # h_only encoder + predictor source
+  stage_a_predictor_ckpt: artifacts/abc_v3/stage_a_fix4_frozen/checkpoint_step6450.pt
+  b1a_ckpt: artifacts/abc_v3/stage_b1a_fix4_unfrozen/checkpoint_latest.pt
+  b1b_ckpt: artifacts/abc_v3/stage_b1b_mdcath/checkpoint_latest.pt

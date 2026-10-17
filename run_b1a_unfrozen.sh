@@ -18,7 +18,7 @@ exec python -u -m protein_jepa_frame.training.train_stage_b1a \
   --unfreeze-top-n-blocks 2 \
   --encoder-lr-scale 0.1 \
   --lr 1e-4 --weight-decay 0.01 --grad-clip 1.0 \
-  --fape-weight 1.0 --ca-mse-weight 1.0 \
+  --fape-weight 1.0 \
   --torsion-weight 0.2 --distance-weight 0.1 \
   --phys-future-weight 0.5 --anchor-weight 0.1 \
   --resume artifacts/abc_v3/stage_b1a_sameframe/checkpoint_latest.pt \

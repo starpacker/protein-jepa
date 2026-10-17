@@ -39,9 +39,7 @@ def _make_cfg(dH=16, dS=4):
     return BathAwareDecoderConfig(
         latent_dim=dH, bath_dim=dS,
         c_hidden=32, n_ipa_blocks=1, n_heads=2, torsion_bins=8,
-        max_translation_update=1.0, max_q_translation_update=2.0,
-        max_com_update=4.0, direct_h_position=True,
-        max_direct_position_update=5.0,
+        max_local_position_update=5.0,
     )
 
 
@@ -66,22 +64,18 @@ def _dummy_inputs(B=2, L=6, dH=16, dS=4):
 
 
 def _untie_position_heads(decoder_module):
-    """Give the position heads non-zero weights.
+    """Give the position head non-zero weights.
 
-    The StructureDecoder deliberately zero-initialises its translation heads so
-    the decoded structure starts exactly at the anchor (plan §3.2).  At that
-    init, the backbone coordinates are the anchor regardless of H/S, so a raw
-    coordinate-difference test would wrongly conclude S is unused.  A trained
-    decoder has non-zero heads; we emulate that here so the "S moves the
-    structure" contract is tested on a decoder that can actually move atoms.
+    The StructureDecoder initialises its local-position head with a small
+    (near-zero) norm so the decoded structure starts close to the anchor.  At
+    that init the backbone coordinates are ~the anchor regardless of H/S, so a
+    raw coordinate-difference test would wrongly conclude S is unused.  A
+    trained decoder has a non-trivial head; we emulate that here so the
+    "S moves the structure" contract is tested on a decoder that can actually
+    move atoms.
     """
     sd = decoder_module.decoder
-    for p in sd.q_translation_head.parameters():
-        p.data.normal_(std=0.05)
-    if getattr(sd, "direct_h_position", False):
-        for p in sd.direct_position_head.parameters():
-            p.data.normal_(std=0.05)
-    for p in sd.frame_update.trans_net.parameters():
+    for p in sd.local_position_head.parameters():
         p.data.normal_(std=0.05)
 
 

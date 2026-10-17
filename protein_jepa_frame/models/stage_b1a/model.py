@@ -62,25 +62,52 @@ class StageBOracleConfig:
     decoder_n_heads: int = 4
     decoder_torsion_bins: int = 36
 
-    # Translation budget for the oracle decoder.  B1a is an *oracle*: it is
-    # handed the TRUE future H, so it must be able to reach the true future
-    # structure.  Measured per-residue internal (Kabsch-aligned) CA displacement
-    # over 8-48 ns horizons is 3.4-4.8 Å mean with per-sample means up to ~18 Å.
-    # The Stage-C defaults (0.5 Å local + 2.0 Å Q = 2.5 Å total) are far too
-    # tight for an oracle and floor FAPE/RMSD regardless of H quality, so we
-    # open the budget here.  This does NOT make the forecasting task easier
-    # because future H is given; it only removes an artificial decoder cap.
-    decoder_max_translation_update: float = 8.0
-    decoder_max_q_translation_update: float = 12.0
-    decoder_max_com_update: float = 20.0
-    # Enable the direct H-conditioned position head so the oracle decoder can
-    # actually place CA where H says it is, instead of being stuck at anchor.
-    decoder_direct_h_position: bool = True
-    decoder_max_direct_position_update: float = 25.0
+    # Anchor-local displacement budget for the oracle decoder.  B1a is an
+    # *oracle*: it is handed the TRUE future H, so it must be able to reach the
+    # true future internal conformation.  Measured per-residue internal
+    # (Kabsch-aligned) CA displacement over 8-48 ns horizons is 3.4-4.8 Å mean
+    # with per-sample means up to ~18 Å; the budget must exceed that or FAPE/RMSD
+    # floors regardless of H quality.  The decoder's ONLY positional path is
+    # this anchor-local displacement (X_hat = R_anchor @ d_local + t_anchor);
+    # see STAGE_AB_REDESIGN_PLAN.md §2.0.0.
+    decoder_max_local_position_update: float = 12.0
+    # Global-context pooling over the state path in the decoder's single
+    # representation.  Held-out ablations of this channel were done on a
+    # same-protein split and are NOT yet shown to pass a clean protein-level
+    # gate (see H_DECODABILITY_REPORT.md §3); it is kept because it is sound in
+    # principle (per-residue H alone carries no protein-global reference).
+    decoder_global_h_context: bool = True
+
+    # ── Anchor-free positional decoding ──────────────────────────────────────
+    # When True the decoder no longer adds a bounded per-residue displacement to
+    # a copy of the anchor structure.  Instead H predicts the whole internal CA
+    # cloud in a single canonical frame and the anchor (R_anchor, t_anchor) is
+    # applied only as a post-hoc rigid placement (see StructureDecoder).  This
+    # removes the structural shortcut that made real_H ≈ zero_H: with the anchor
+    # supplying the base geometry, H only had to emit ~0 and the positional
+    # gradient through H vanished.
+    decoder_anchor_free: bool = True
+    decoder_coord_scale: float = 40.0
 
     @property
     def torsion_output_dim(self) -> int:
         return self.num_torsion_outputs * 2  # sin + cos per angle
+
+    @classmethod
+    def from_saved(cls, config_dict: dict | None) -> "StageBOracleConfig":
+        """Build from a saved config dict, dropping unknown/legacy keys.
+
+        Old B1a checkpoints recorded decoder knobs that have since been removed
+        (decoder_max_q_translation_update, decoder_max_com_update,
+        decoder_direct_h_position, decoder_h_relative_position*, ...).  Those
+        are silently dropped so the HNormalizer/probe can still be loaded from
+        a legacy checkpoint.
+        """
+        if not config_dict:
+            return cls()
+        import dataclasses
+        valid = {f.name for f in dataclasses.fields(cls)}
+        return cls(**{k: v for k, v in config_dict.items() if k in valid})
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -196,12 +223,17 @@ class PhysicalFutureProbe(nn.Module):
 class StageBOracleDecoder(nn.Module):
     """Oracle decoder + physical probe for Stage B1a calibration.
 
-    Wraps StructureDecoder so it accepts H as both context (h_frozen) and
-    dynamics variable (q_dynamics).  The StructureDecoder expects:
-        h_frozen:    [B, L, context_dim]
-        q_dynamics:  [B, L, q_dim]
+    Wraps StructureDecoder, which has a SINGLE state pathway:
 
-    We pass the same H for both when context_dim == q_dim == dH.
+        q_dynamics: [B, L, dH]   invariant state Q := H_t
+
+    plus the equivariant rigid-body basis ``anchor = (R_anchor, t_anchor)``
+    that supplies absolute placement only.  Decoding is
+
+        X_hat = anchor_frame  x  d_local(Q := H_t, c)
+
+    (STAGE_AB_REDESIGN_PLAN.md §2.0.0).  There is no separate h_frozen context
+    pathway — H_t IS the dynamics state on the mainline.
 
     Also contains:
       - PhysicalFutureProbe: to check H info-content on future frames
@@ -214,20 +246,19 @@ class StageBOracleDecoder(nn.Module):
         self.config = config
         dH = config.latent_dim
 
-        # Structure decoder reused from Stage C, reconfigured for H-as-state
+        # Structure decoder reused from Stage C, reconfigured for H-as-state.
+        # One state pathway (q_dim = dH = context), no h_frozen context pathway.
         decoder_cfg = DecoderConfig(
-            context_dim=dH,
             q_dim=dH,
             c_hidden=config.decoder_c_hidden,
             n_ipa_blocks=config.decoder_n_ipa_blocks,
             n_heads=config.decoder_n_heads,
             torsion_bins=config.decoder_torsion_bins,
-            max_translation_update=config.decoder_max_translation_update,
-            max_q_translation_update=config.decoder_max_q_translation_update,
-            max_com_update=config.decoder_max_com_update,
-            direct_h_position=config.decoder_direct_h_position,
-            max_direct_position_update=config.decoder_max_direct_position_update,
+            max_local_position_update=config.decoder_max_local_position_update,
             freeze_ab=True,
+            global_h_context=getattr(config, "decoder_global_h_context", True),
+            anchor_free=getattr(config, "decoder_anchor_free", True),
+            coord_scale=getattr(config, "decoder_coord_scale", 40.0),
         )
         self.decoder = StructureDecoder(decoder_cfg)
 
@@ -248,11 +279,15 @@ class StageBOracleDecoder(nn.Module):
         t_anchor: torch.Tensor,   # [B, L, 3]     last observed frame translations
         residue_mask: torch.Tensor,  # [B, L]
     ) -> dict[str, torch.Tensor]:
-        """Decode structure from H.  H is used as both context and dynamics."""
+        """Decode structure from H (the invariant state) + anchor basis.
+
+        ``R_anchor/t_anchor`` are the last observed frame's rigid-body basis;
+        they fix absolute placement only.  The internal conformation
+        ``d_local`` is predicted from ``H`` alone.
+        """
         return self.decoder(
             aatype=aatype,
-            h_frozen=H,        # context_dim pathway
-            q_dynamics=H,      # q_dim pathway — same H as state
+            q_dynamics=H,      # single state pathway: Q := H_t
             R_anchor=R_anchor,
             t_anchor=t_anchor,
             residue_mask=residue_mask,

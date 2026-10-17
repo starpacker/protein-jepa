@@ -1,2 +1,0 @@
-{"protein_id": "1b4uB00", "horizon_ps": 32000.0, "L": 256, "temperature_k": 320.0, "n_steps": 320, "valid": false, "q_norm_init": 4.537428855895996, "q_norm_final": NaN, "q_diff_oracle": NaN, "q_mse_oracle": NaN, "q_cosine_oracle": 0.0, "acf_lag5": NaN}
-{"protein_id": "1b4uB00", "horizon_ps": 32000.0, "L": 256, "temperature_k": 320.0, "n_steps": 320, "valid": false, "q_norm_init": 4.53668737411499, "q_norm_final": NaN, "q_diff_oracle": NaN, "q_mse_oracle": NaN, "q_cosine_oracle": 0.0, "acf_lag5": NaN}

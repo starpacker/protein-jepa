@@ -27,17 +27,31 @@ def _cfg(**over):
     return StageAV2Config(**base)
 
 
-def _batch(B=2, K=8, L=10, device="cpu"):
+def _batch(B=2, K=8, L=10, horizon_frames=32, device="cpu"):
+    """Paired-window batch with both context_* and future_* keys.
+
+    The future clip mirrors the context (same frame count K) shifted forward in
+    time by ``horizon_frames``, matching collate_paired_windows().  This is what
+    forward_temporal_multilag now consumes: the target is drawn from future_*.
+    """
     coords = torch.randn(B, K, L, 4, 3, device=device)
     coords[..., 1, :] += torch.arange(L, device=device).view(1, 1, L, 1)
     rm = torch.ones(B, K, L, dtype=torch.bool, device=device)
+    fut_coords = torch.randn(B, K, L, 4, 3, device=device)
+    fut_coords[..., 1, :] += torch.arange(L, device=device).view(1, 1, L, 1)
+    ctx_t = torch.arange(K, device=device).float().expand(B, K).contiguous() * 1000.0
+    fut_t = ctx_t + float(horizon_frames) * 1000.0
     return dict(
         context_coords=coords,
         context_residue_mask=rm,
         context_aatype=torch.full((B, L), 20, dtype=torch.long, device=device),
         context_residue_index=torch.arange(L, device=device).expand(B, L).contiguous(),
         context_chain_id=torch.zeros(B, L, dtype=torch.long, device=device),
-        context_time_ps=torch.arange(K, device=device).float().expand(B, K).contiguous() * 1000.0,
+        context_time_ps=ctx_t,
+        future_coords=fut_coords,
+        future_residue_mask=rm.clone(),
+        future_time_ps=fut_t,
+        horizon_time_ps=torch.full((B,), float(horizon_frames) * 1000.0, device=device),
         temperature_k=torch.full((B,), 320.0, device=device),
     )
 
@@ -53,20 +67,20 @@ def test_fused_orientation_bias_matches_explicit_projection():
         assert torch.allclose(ref, got, atol=1e-5), f"chunk={chunk}"
 
 
-def test_multilag_lags_must_be_less_than_context():
+def test_multilag_lags_must_be_within_future_clip():
     model = StageAV2(_cfg()).eval()
-    batch = _batch(K=4)
+    batch = _batch(K=4)  # future clip has K=4 frames
     with pytest.raises(ValueError):
-        model.forward_temporal_multilag(batch, (4,))     # lag == K
+        model.forward_temporal_multilag(batch, (4,))     # lag == T_fut
     with pytest.raises(ValueError):
-        model.forward_temporal_multilag(batch, (0,))
+        model.forward_temporal_multilag(batch, (-1,))    # negative lag
 
 
 def test_multilag_shapes_and_lag_slots():
     torch.manual_seed(0)
     model = StageAV2(_cfg()).eval()
     batch = _batch(B=6, K=8, L=9)
-    out = model.forward_temporal_multilag(batch, (1, 2, 4, 7), recent_frac=0.5)
+    out = model.forward_temporal_multilag(batch, (0, 1, 2, 3), recent_frac=0.5)
     B, L = 6, 9
     assert out["pred_factors"].shape == (B, L, 4, 8)
     assert out["target_factors"].shape == (B, L, 4, 8)
@@ -74,69 +88,91 @@ def test_multilag_shapes_and_lag_slots():
     assert out["lag_sel"].shape == (B,)
     # recent_frac=0.5 -> first 3 samples restricted to the two shortest lags
     assert set(out["lag_slot"][:3].tolist()) <= {0, 1}
-    # all selected lags are valid and lag_ps is positive & finite
-    assert torch.all(out["lag_sel"] >= 1)
+    # all selected future indices are valid and lag_ps is positive & finite
+    assert torch.all(out["lag_sel"] >= 0)
     assert torch.all(out["lag_sel"] < 8)
     assert torch.all(out["lag_ps"] > 0) and torch.isfinite(out["lag_ps"]).all()
 
 
-def test_multilag_predictor_last_slot_is_anchor_not_target():
-    """The predictor's last visible slot is the anchor frame (frame before the
-    target), never the target frame itself.
-
-    With delta-target, anchor masking is removed — the anchor is encoded
-    normally and placed in the last slot.  context_H and context_H_full are
-    both the plain online-encoder trajectory; the identity-copy shortcut is
-    broken at the *target* level (target = P_j·(h̄_tgt - h̄_anchor) ≈ 0 for
-    a copy) rather than by hiding the anchor residues."""
+def test_multilag_target_comes_from_future_window():
+    """The teacher target must be the encoding of a FUTURE frame (outside the
+    context window), not any context frame.  lag=0 selects the last future
+    frame (= anchor + full horizon).  This is the core fix: Stage A now trains
+    exactly the way B1a / eval evaluates — predict out-of-window futures."""
     torch.manual_seed(0)
     model = StageAV2(_cfg()).eval()
-    batch = _batch(B=3, K=4, L=12)
-    out = model.forward_temporal_multilag(batch, (1,), recent_frac=1.0)
+    batch = _batch(B=3, K=4, L=12, horizon_frames=32)
+    out = model.forward_temporal_multilag(batch, (0,), recent_frac=1.0)
+
+    # lag=0 -> last future frame index T_fut-1.
+    assert torch.all(out["lag_sel"] == 3)
+
+    # The teacher target (future encoding) must match the teacher encoding of
+    # the selected FUTURE frame, not of any context frame.
+    with torch.no_grad():
+        fut_H = model.teacher_encoder(
+            coords=batch["future_coords"], residue_mask=batch["future_residue_mask"],
+            aatype=batch["context_aatype"], residue_index=batch["context_residue_index"],
+            chain_id=batch["context_chain_id"],
+        )[:, 3]   # last future frame
+    assert torch.allclose(out["h_teacher_full"], fut_H, atol=1e-4), \
+        "target must be the teacher encoding of the future frame"
+
+    # Predictor sees the full context: last slot is the real anchor encoding.
     with torch.no_grad():
         full = model.context_encoder(
             coords=batch["context_coords"], residue_mask=batch["context_residue_mask"],
             aatype=batch["context_aatype"], residue_index=batch["context_residue_index"],
             chain_id=batch["context_chain_id"],
         )
-    last_in = out["context_H"][:, -1]           # predictor's last slot
-    # lag=1, K=4 -> anchor index 2, target index 3.
-    # The last slot must NOT be the target.
-    assert not torch.allclose(last_in, full[:, 3], atol=1e-4)
-    # The last slot IS the anchor (no masking applied in delta-target mode).
-    assert torch.allclose(last_in, full[:, 2], atol=1e-4)
-    # context_H_full carries the unmasked trajectory (same as context_H now).
     assert torch.allclose(out["context_H_full"], full, atol=1e-4)
+    assert torch.allclose(out["anchor_H"], full[:, -1], atol=1e-4)
 
-    # Delta-target contract: target ≈ 0 for a static protein; the out dict
-    # must expose delta_teacher and h_teacher_anchor.
-    assert "delta_teacher" in out
-    assert "h_teacher_anchor" in out
+    # lag_ps equals the physical horizon (future_time - anchor_time).
+    expect = batch["future_time_ps"][:, 3] - batch["context_time_ps"][:, -1]
+    assert torch.allclose(out["lag_ps"], expect, atol=1e-3)
 
 
-def test_multilag_history_drops_future_frames():
-    """For lag > 1 no frame at or after the target may appear in the predictor
-    input; slots before the visible window are zero.  Masking disabled here so
-    the anchor's encoding is directly comparable to the full encoder output."""
+def test_multilag_lag_steps_back_from_horizon_end():
+    """Larger lags step BACKWARD through the future window (closer to anchor).
+    lag=0 -> last future frame; lag=2 -> two offsets earlier."""
     torch.manual_seed(0)
-    model = StageAV2(_cfg(spatial_mask_ratio=0.0)).eval()
+    model = StageAV2(_cfg()).eval()
     batch = _batch(B=2, K=8, L=6)
-    out = model.forward_temporal_multilag(batch, (4,), recent_frac=1.0)
-    H = out["context_H"]                        # [B,8,L,dH]
-    with torch.no_grad():
-        full = model.context_encoder(
-            coords=batch["context_coords"], residue_mask=batch["context_residue_mask"],
-            aatype=batch["context_aatype"], residue_index=batch["context_residue_index"],
-            chain_id=batch["context_chain_id"],
-        )
-    # lag=4, K=8 -> anchor index 3, target index 4; frames 4..7 must not appear.
-    for b in range(2):
-        for f in range(4, 8):
-            assert not torch.allclose(
-                H[b], full[b, f][None].expand(8, -1, -1), atol=1e-4
-            )
-        # frame 3 (anchor) appears at the last slot
-        assert torch.allclose(H[b, -1], full[b, 3], atol=1e-4)
+    out = model.forward_temporal_multilag(batch, (2,), recent_frac=1.0)
+    # lag=2, T_fut=8 -> future index 8-1-2 = 5
+    assert torch.all(out["lag_sel"] == 5)
+
+
+def test_delta_target_anchor_calibration():
+    """forward_temporal_multilag always emits a delta target: the output dict
+    carries all anchor fields, and compose(decompose(h_anchor)) roundtrips with
+    cos > 0.99 so 'pred=0 → reproduce anchor' holds in practice."""
+    torch.manual_seed(1)
+    model = StageAV2(_cfg()).eval()
+    batch = _batch(B=2, K=4, L=10)
+    out = model.forward_temporal_multilag(batch, (0,), recent_frac=1.0)
+
+    for key in ("h_teacher_anchor", "delta_teacher", "anchor_factors"):
+        assert key in out, f"missing key in delta-target output: {key}"
+
+    # compose(decompose(h_anchor)) must roundtrip (persistence fallback validity)
+    anchor_recon = model.opf.compose(out["anchor_factors"])
+    h_anc = out["h_teacher_anchor"]
+    cos = torch.nn.functional.cosine_similarity(
+        anchor_recon.reshape(-1), h_anc.reshape(-1), dim=0).item()
+    assert cos > 0.99, (
+        f"compose(decompose(h_anchor)) diverges from h_anchor: cos={cos:.4f}. "
+        "Anchor calibration is broken — pred=0 will not reproduce the anchor."
+    )
+
+    # target_factors are deltas; their norm must be smaller than absolute factors
+    tgt_norm = out["target_factors"].norm(dim=-1).mean().item()
+    abs_norm = model.opf.decompose(out["h_teacher_full"]).norm(dim=-1).mean().item()
+    assert tgt_norm < abs_norm, (
+        f"delta target norm ({tgt_norm:.4f}) >= absolute factor norm ({abs_norm:.4f}); "
+        "delta_target may not be subtracting the anchor."
+    )
 
 
 def test_temporal_variance_term_penalises_time_invariant_H():

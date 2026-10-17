@@ -39,8 +39,9 @@ from protein_jepa_frame.models.stage_a_v2 import StageAV2, StageAV2Config
 from protein_jepa_frame.models.stage_b1a import StageBOracleDecoder, StageBOracleConfig
 from protein_jepa_frame.models.stage_b1b import (
     StageB1b, StageB1bConfig, StageB1bLossWeights, compute_stage_b1b_loss,
+    ResidualCADecoder, ResidualDecoderConfig,
 )
-from protein_jepa_frame.models.stage_b1b.objectives import energy_score
+from protein_jepa_frame.models.stage_b1b.objectives import energy_score, kabsch_rmsd_loss
 from protein_jepa_frame.training.train_utils import (
     _device, _lr_scale, _move_batch, _set_reproducibility,
 )
@@ -83,6 +84,19 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--es-warmup-steps", type=int, default=2000)
     p.add_argument("--es-num-samples", type=int, default=4)
     p.add_argument("--es-horizon-steps", type=int, default=8)
+
+    # End-to-end RMSD head (residual CA decoder anchored on the context frame).
+    # This decodes rollout H into CA displacements relative to the last context
+    # frame and supervises Kabsch RMSD to the true future.  Zero-output => the
+    # persistence baseline, so it can only improve on persistence.
+    p.add_argument("--rmsd-weight", type=float, default=1.0,
+                   help="weight on the end-to-end Kabsch-RMSD loss (0 disables)")
+    p.add_argument("--rmsd-horizon-steps", type=int, default=4,
+                   help="number of rolled-out steps supervised by RMSD")
+    p.add_argument("--decoder-hidden", type=int, default=256)
+    p.add_argument("--decoder-depth", type=int, default=3)
+    p.add_argument("--decoder-lr", type=float, default=3e-4,
+                   help="separate LR for the residual decoder")
 
     p.add_argument("--log-every", type=int, default=20)
     p.add_argument("--save-every", type=int, default=1000)
@@ -130,7 +144,9 @@ def main() -> None:
     ck = torch.load(args.stage_a_ckpt, map_location=device)
     a_cfg = StageAV2Config(**ck.get("stage_a_v2_config", {}))
     stage_a = StageAV2(a_cfg).to(device)
-    stage_a.load_state_dict(ck["model"])
+    missing, unexpected = stage_a.load_state_dict(ck["model"], strict=False)
+    if missing:
+        print(f"[B1b] Stage A ckpt missing keys (ok if predictor-only): {missing[:4]}", flush=True)
     stage_a.eval()
     encoder = stage_a.context_encoder
     for p in encoder.parameters():
@@ -139,9 +155,12 @@ def main() -> None:
     # ---- Frozen H normaliser from B1a (else identity) ----
     if args.b1a_ckpt:
         b1a = torch.load(args.b1a_ckpt, map_location=device)
-        o_cfg = StageBOracleConfig(**b1a.get("stage_b1a_config", {}))
+        o_cfg = StageBOracleConfig.from_saved(b1a.get("stage_b1a_config"))
         oracle = StageBOracleDecoder(o_cfg)
-        oracle.load_state_dict(b1a["oracle"])
+        missing, unexpected = oracle.load_state_dict(b1a["oracle"], strict=False)
+        if missing:
+            print(f"WARNING: {len(missing)} missing keys when loading B1a oracle "
+                  f"(only the HNormalizer is required here): {missing[:4]}...", flush=True)
         normalizer = oracle.h_normalizer.to(device).eval()
         for p in normalizer.parameters():
             p.requires_grad_(False)
@@ -165,6 +184,17 @@ def main() -> None:
         es_horizon_steps=args.es_horizon_steps,
     )
 
+    # ---- Residual CA decoder for end-to-end RMSD supervision ----
+    decoder = None
+    if args.rmsd_weight > 0.0:
+        dec_cfg = ResidualDecoderConfig(
+            latent_dim=args.latent_dim,
+            hidden=args.decoder_hidden,
+            depth=args.decoder_depth,
+        )
+        decoder = ResidualCADecoder(dec_cfg).to(device)
+        print(f"residual CA decoder: hidden={args.decoder_hidden} depth={args.decoder_depth}", flush=True)
+
     # ---- Data: K history frames + (N+1) supervised frames in one window ----
     total = args.history_frames + args.horizon_steps + 1
     dcfg = DataConfig(
@@ -183,8 +213,10 @@ def main() -> None:
         drop_last=True, pin_memory=(device.type == "cuda"),
     )
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr,
-                                  weight_decay=args.weight_decay)
+    param_groups = [{"params": list(model.parameters()), "lr": args.lr}]
+    if decoder is not None:
+        param_groups.append({"params": list(decoder.parameters()), "lr": args.decoder_lr})
+    optimizer = torch.optim.AdamW(param_groups, weight_decay=args.weight_decay)
     for pg in optimizer.param_groups:
         pg["base_lr"] = pg["lr"]
 
@@ -240,56 +272,144 @@ def main() -> None:
             # The NLL depends on f = -grad_H U, so backward requires second-order
             # autograd through attention.  The flash/mem-efficient kernels do not
             # implement double backward; force kernels that do.
+            # The NLL force f = -grad_H U requires double-backward through the
+            # energy's attention.  Only the MATH kernel implements the needed
+            # second-order derivative; the flash/efficient kernels do not.
             backends = [SDPBackend.MATH]
-            if device.type == "cuda":
-                backends = [SDPBackend.EFFICIENT_ATTENTION, SDPBackend.MATH]
 
             with sdpa_kernel(backends):
                 # ---- Kalman innovation NLL (§2.4) ----
-                nll_sum = model.kalman_nll(
-                    H_hist, dt_hist, H_seq, rmask, temperature_k,
-                )
+                _want_diag = (step % args.log_every == 0)
+                if _want_diag:
+                    nll_sum, _diag = model.kalman_nll(
+                        H_hist, dt_hist, H_seq, rmask, temperature_k,
+                        return_diagnostics=True,
+                    )
+                    running["diag/bath_ratio"] = _diag.get("bath_ratio", float("nan"))
+                    running["diag/jitter_hits"] = float(_diag.get("jitter_hits", 0))
+                else:
+                    nll_sum = model.kalman_nll(
+                        H_hist, dt_hist, H_seq, rmask, temperature_k,
+                    )
                 n_valid = int(rmask.sum().item()) * (Np1 - 1) if Np1 > 1 else 1
                 n_valid = max(n_valid, 1)
 
                 # ---- Energy score (§2.5), added after warmup ----
                 es_val = None
                 lam = weights.lambda_es_at(step)
-                if lam > 0.0 and args.es_horizon_steps > 0:
+                nll_finite = torch.isfinite(nll_sum).all().item()
+                if lam > 0.0 and args.es_horizon_steps > 0 and nll_finite:
                     es_val = _energy_score_term(
                         model, H_hist, dt_hist, H_seq, rmask, temperature_k, weights,
                     )
+                    # Guard: if ES itself produced NaN/Inf, discard it
+                    if es_val is not None and not torch.isfinite(es_val).all():
+                        es_val = None
 
                 comp = compute_stage_b1b_loss(nll_sum, n_valid, weights, step=step, es_value=es_val)
 
+                # ---- End-to-end RMSD on teacher-forced one-step predictions ----
+                rmsd_loss = torch.zeros((), device=device)
+                pers_rmsd_val = 0.0
+                if decoder is not None and args.rmsd_weight > 0.0:
+                    rmsd_loss, pers_rmsd_val = _rmsd_term(
+                        decoder, H_seq, fut_c[:, :Np1], rmask,
+                        n_steps=args.rmsd_horizon_steps,
+                    )
+
+                total = comp.total + args.rmsd_weight * rmsd_loss
+
                 optimizer.zero_grad(set_to_none=True)
-                comp.total.backward()
+                total.backward()
             if args.grad_clip > 0:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+                clip_params = list(model.parameters())
+                if decoder is not None:
+                    clip_params = clip_params + list(decoder.parameters())
+                torch.nn.utils.clip_grad_norm_(clip_params, args.grad_clip)
             optimizer.step()
 
             seen += 1
             for k, v in comp.as_loggable_dict().items():
                 running[k] = running.get(k, 0.0) + v
+            running["loss/rmsd"] = running.get("loss/rmsd", 0.0) + float(rmsd_loss.item())
+            running["loss/persist_rmsd"] = running.get("loss/persist_rmsd", 0.0) + pers_rmsd_val
             if step % args.log_every == 0:
                 avg = {k: v / seen for k, v in running.items()}
+                # diag/* are instantaneous, not accumulated averages.
+                for k in [k for k in avg if k.startswith("diag/")]:
+                    avg[k] = running[k]
                 print(f"step {step:6d} | lr {optimizer.param_groups[0]['lr']:.2e} | "
                       f"{time.time()-t0:.1f}s | " +
-                      " ".join(f"{k.replace('b1b/','')}={v:.3f}" for k, v in avg.items()),
+                      " ".join(f"{k.replace('b1b/','')}={v:.3g}" for k, v in avg.items()),
                       flush=True)
                 running = {}
                 seen = 0
                 t0 = time.time()
 
             if step > 0 and step % args.save_every == 0:
-                _save(out_dir, model, optimizer, step, cfg, weights)
+                _save(out_dir, model, optimizer, step, cfg, weights, decoder)
             if args.dry_run and step >= 3:
                 print("dry-run complete", flush=True)
                 return
             step += 1
 
-    _save(out_dir, model, optimizer, step, cfg, weights)
+    _save(out_dir, model, optimizer, step, cfg, weights, decoder)
     print(f"training complete at step {step}", flush=True)
+
+
+def _rmsd_term(decoder, H_seq, fut_coords, rmask, n_steps):
+    """Kabsch-RMSD using oracle (true) future H as decoder input.
+
+    For each supervised step n (1..n_steps):
+        H_future = H_seq[:, n]        (true encoded future frame — oracle)
+        H_anchor = H_seq[:, 0]        (true encoded anchor frame)
+        X_hat    = decoder(H_future, H_anchor, X_anchor)
+        loss     = Kabsch_RMSD(X_hat, X_true[:, n])
+
+    Using true H gives the decoder a real signal: delta = H_future - H_anchor
+    has measurable variance tied to actual conformational change.  Training
+    the decoder with GLE-predicted mu (which is tiny and untrained) gives
+    delta ≈ 0 and no gradient signal.
+
+    Once the decoder learns to map H-deltas → displacements we can optionally
+    couple it back to GLE rollout in a second phase.
+
+    Returns (mean_rmsd_loss, mean_persistence_rmsd_float).
+    """
+    B, T, L, dH = H_seq.shape
+    N = min(n_steps, T - 1)
+    if N < 1:
+        return H_seq.new_zeros(()), 0.0
+
+    # CA coordinates [B, T, L, 3] from backbone atom index 1
+    ca = fut_coords[:, :, :, 1, :]                  # [B, T, L, 3]
+
+    H_anchor = H_seq[:, 0]                           # [B, L, dH]
+
+    # Center anchor CA over valid residues.
+    mask_f = rmask.unsqueeze(-1).to(ca.dtype)        # [B, L, 1]
+    def _center(x):
+        s = (x * mask_f).sum(1, keepdim=True)
+        n = mask_f.sum(1, keepdim=True).clamp_min(1.0)
+        return (x - s / n) * mask_f
+
+    X_anchor = _center(ca[:, 0])                      # [B, L, 3]
+
+    rmsd_losses = []
+    pers_vals = []
+    for n in range(1, N + 1):
+        H_future = H_seq[:, n]                        # oracle true H
+        out = decoder(H_future, H_anchor, X_anchor, rmask)
+        X_pred = out["ca_pred"]
+        X_true = _center(ca[:, n])
+
+        rmsd_losses.append(kabsch_rmsd_loss(X_pred, X_true, rmask))
+        with torch.no_grad():
+            pers_vals.append(kabsch_rmsd_loss(X_anchor, X_true, rmask).item())
+
+    loss = torch.stack(rmsd_losses).mean()
+    pers = float(sum(pers_vals) / len(pers_vals)) if pers_vals else 0.0
+    return loss, pers
 
 
 def _energy_score_term(model, H_hist, dt_hist, H_seq, rmask, temperature_k, weights):
@@ -336,13 +456,16 @@ def _energy_score_term(model, H_hist, dt_hist, H_seq, rmask, temperature_k, weig
     return es / B
 
 
-def _save(out_dir, model, optimizer, step, cfg, weights):
-    torch.save({"model": model.state_dict(),
-                "optimizer": optimizer.state_dict(),
-                "step": step,
-                "stage_b1b_config": cfg.__dict__,
-                "loss_weights": weights.__dict__},
-               out_dir / "checkpoint_latest.pt")
+def _save(out_dir, model, optimizer, step, cfg, weights, decoder=None):
+    payload = {"model": model.state_dict(),
+               "optimizer": optimizer.state_dict(),
+               "step": step,
+               "stage_b1b_config": cfg.__dict__,
+               "loss_weights": weights.__dict__}
+    if decoder is not None:
+        payload["decoder"] = decoder.state_dict()
+        payload["decoder_config"] = decoder.cfg.__dict__
+    torch.save(payload, out_dir / "checkpoint_latest.pt")
     print(f"checkpoint saved at step {step}", flush=True)
 
 

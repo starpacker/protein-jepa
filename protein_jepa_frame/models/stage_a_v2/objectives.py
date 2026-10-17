@@ -210,10 +210,12 @@ class StageAV2LossWeights:
     # the target (a run with temporal_variance_weight=1.0 drove L_future to 0
     # while adding nothing decodable).  It is also applied only to the *near-
     # consecutive* frame differences, where real MD carries signal.
-    temporal_variance_weight: float = 0.10  # λ_τ; temporal variance floor
-    temporal_min_std: float = 0.40         # γ; std floor (squared internally)
-    # γ=0.40 → γ²=0.16 >> natural per-step variance ~0.05, so the hinge
-    # fires immediately and pushes H to vary along the trajectory.
+    temporal_variance_weight: float = 0.05  # λ_τ; temporal variance floor
+    temporal_min_std: float = 0.10         # γ; std floor (squared internally)
+    # Fix 5: lowered from 0.40 → 0.10 so the floor is a gentle backstop, not
+    # a dominant gradient forcing noise injection.  γ=0.10 → γ²=0.01, still
+    # well above the natural per-step variance ~0.001 so the hinge fires, but
+    # no longer so aggressive that it overwhelms the prediction signal.
 
     # Supervised temporal contrastive loss: regress normalised H-distance onto
     # tanh(CA_RMSD / rmsd_scale) so the encoder embeds conformational distance
@@ -387,8 +389,11 @@ def compute_stage_a_v2_loss(
         )
 
     # ── Encoder variance loss V(H) ────────────────────────────────────────────
-    # context_H: [B, K, L, dH] or [B, L, dH] depending on forward path.
-    context_H = temporal_out["context_H"]   # [B, K, L, dH]
+    # Use context_H_full (the unmasked online encoder output for all K frames)
+    # rather than context_H (H_target_in), which contains zero-filled slots for
+    # frames beyond the visible history.  Zero-fill artificially deflates the
+    # cross-sample variance and causes the loss to over-estimate collapse.
+    context_H = temporal_out.get("context_H_full", temporal_out["context_H"])
     # valid_mask [B, L] needs to expand to cover all K frames if K>1
     if context_H.dim() == 4:
         B, K, L, D = context_H.shape

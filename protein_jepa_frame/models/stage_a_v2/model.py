@@ -80,6 +80,7 @@ class StageAV2Config:
 
     # Predictor
     predictor_depth: int = 4
+    predictor_spatial_depth: int = 2   # Fix 1: spatial stage depth
     predictor_heads: int = 4
     max_frames: int = 256         # for positional encoding
 
@@ -114,14 +115,15 @@ class StageAV2Config:
     struct_recon_pairs: int = 256      # CA-CA pairs sampled per frame per step
 
     # Delta-target toggle.  When True the temporal objective predicts the
-    # teacher-space displacement  P_j·(h̄_target − h̄_anchor)  (the original fix
-    # for time-invariant collapse).  That objective is, however, *antagonistic*
-    # to struct_recon: it rewards the encoder for discarding the static fold,
-    # which is exactly the information the decoder needs.  With struct_recon
-    # enabled H is already time-varying (structure changes between frames), so
-    # the absolute target  P_j·h̄_target  suffices and keeps H structural.  Set
-    # False to use the absolute teacher target.
-    delta_target: bool = True
+    # NOTE (redesign): forward_temporal_multilag now ALWAYS uses the
+    # anchor-calibrated delta target, because the target frame is drawn from the
+    # future window (outside the context) rather than from within the context.
+    # Predicting an out-of-window future from a copy of the anchor is no longer
+    # trivial, so the delta parameterisation (predict the displacement toward
+    # the future, add the anchor factors back for synthesis) is both correct and
+    # the right inductive bias.  This flag is retained only for checkpoint
+    # compatibility and no longer gates the temporal objective.
+    delta_target: bool = False
 
     @property
     def factor_dim(self) -> int:
@@ -197,12 +199,28 @@ class _TimeEmbedding(nn.Module):
 
 
 class CausalTransformerPredictor(nn.Module):
-    """Causal Transformer that takes H_{≤t} history and outputs J factor predictions.
+    """Two-stage predictor: causal temporal attention then spatial residue attention.
 
-    Input:  H_ctx  [B, K, L, dH]  — context frames (K frames, L residues)
+    Stage 1 — temporal (per-residue, causal over K frames):
+        Each residue independently aggregates its own history with causal
+        self-attention.  The last-frame token becomes the temporal summary.
+
+    Stage 2 — spatial (full residue attention on the temporal summary):
+        Full bidirectional attention over all L residues lets the predictor
+        model inter-residue correlations and collective motion modes — the
+        information the purely per-residue temporal stage cannot capture.
+
+    This mirrors the V-JEPA / I-JEPA predictor design: context tokens first
+    summarise their own history, then attend across space to form the target
+    prediction.  For protein dynamics the spatial stage is critical because
+    correlated fluctuations (collective modes) carry most of the predictable
+    signal, and they only emerge through inter-residue interactions.
+
+    Input:  H_ctx  [B, K, L, dH]  — context frames
             lag_ps     [B]         — physical lag τ in ps
             temperature_k  [B]     — temperature in Kelvin
-    Output: pred_factors  [B, L, J, r]  — predicted factor coordinates
+            target_frame   [B,1,L,dH] | None  — masked anchor slot
+    Output: pred_factors  [B, L, J, r]
     """
 
     def __init__(
@@ -214,6 +232,7 @@ class CausalTransformerPredictor(nn.Module):
         num_heads: int = 4,
         max_frames: int = 256,
         dropout: float = 0.1,
+        spatial_depth: int = 2,
     ) -> None:
         super().__init__()
         self.latent_dim = latent_dim
@@ -222,21 +241,52 @@ class CausalTransformerPredictor(nn.Module):
 
         self.pos_enc = _PositionalEncoding(latent_dim, max_frames)
         self.time_embed = _TimeEmbedding(latent_dim)
+        # Task embedding: distinguishes the two prediction regimes that share
+        # this predictor.  Spatial masking uses lag_ps = 0 (same-frame
+        # reconstruction) while the temporal objective uses lag_ps ~ 1e3–1e4 ps.
+        # Without this the time-embedding MLP sees two disjoint input ranges and
+        # the two tasks fight over the same weights.
+        #   0 = spatial (within-frame masked reconstruction)
+        #   1 = temporal (cross-frame causal prediction)
+        self.task_embed = nn.Embedding(2, latent_dim)
+        nn.init.normal_(self.task_embed.weight, std=latent_dim ** -0.5)
 
-        # Per-frame causal self-attention over frames (K-dim axis)
-        layer = nn.TransformerEncoderLayer(
+        # Stage 1: causal temporal attention — per-residue over K frames
+        # Input shape to transformer: [B*L, K, dH]
+        temporal_layer = nn.TransformerEncoderLayer(
             d_model=latent_dim,
             nhead=num_heads,
             dim_feedforward=latent_dim * 4,
             dropout=dropout,
-            batch_first=True,   # [B*L, K, dH]
+            batch_first=True,
             norm_first=True,
         )
-        self.transformer = nn.TransformerEncoder(layer, num_layers=depth)
+        self.temporal_transformer = nn.TransformerEncoder(
+            temporal_layer, num_layers=depth
+        )
 
-        # Output head: per-residue, J×r prediction
+        # Stage 2: spatial attention — full bidirectional over L residues
+        # Input shape: [B, L, dH] (the temporal summary at each position)
+        spatial_layer = nn.TransformerEncoderLayer(
+            d_model=latent_dim,
+            nhead=num_heads,
+            dim_feedforward=latent_dim * 4,
+            dropout=dropout,
+            batch_first=True,
+            norm_first=True,
+        )
+        self.spatial_transformer = nn.TransformerEncoder(
+            spatial_layer, num_layers=spatial_depth
+        )
+
+        # Output head: per-residue, J×r prediction.
+        # Small random init (not zero): with the delta-target objective the
+        # initial target is near zero, and a zero-initialised head produces
+        # exactly zero output and therefore zero gradient to the predictor on
+        # the first steps.  A small normal keeps the initial loss bounded while
+        # leaving the head trainable from step 0.
         self.out_head = nn.Linear(latent_dim, num_factors * factor_dim)
-        nn.init.zeros_(self.out_head.weight)
+        nn.init.normal_(self.out_head.weight, std=0.02)
         nn.init.zeros_(self.out_head.bias)
 
     def _causal_mask(self, K: int, device: torch.device) -> torch.Tensor:
@@ -251,38 +301,55 @@ class CausalTransformerPredictor(nn.Module):
         lag_ps: torch.Tensor,
         temperature_k: torch.Tensor,
         target_frame: torch.Tensor | None = None,
+        valid_mask: torch.Tensor | None = None,
+        task_id: int = 1,
     ) -> torch.Tensor:
         B, K, L, D = H_ctx.shape
 
-        # Optional masked-frame input: rebuild the causal sequence with the
-        # target frame standing in for the last context frame.  This prevents
-        # the predictor from satisfying the short-lag objective by simply
-        # copying the un-masked last context frame, which encodes the target's
-        # *own* geometry and carries no predictive content.
+        # Optional masked-frame input: replace the last context slot with a
+        # zeroed/masked token so the predictor cannot trivially copy anchor geometry.
         if target_frame is not None:
             x_hist = torch.cat([H_ctx[:, :-1], target_frame], dim=1)   # [B,K,L,D]
         else:
             x_hist = H_ctx
 
-        # Time conditioning added to the last frame token
+        # Time conditioning injected into the last frame token only.
+        # task_id selects the regime: 0 = spatial (within-frame reconstruction),
+        # 1 = temporal (cross-frame prediction).  The embedding is added on top
+        # of the log-time projection so the two tasks share geometry but not the
+        # conditioning range (spatial passes lag_ps=0, temporal ~1e3–1e4 ps).
         time_cond = self.time_embed(lag_ps, temperature_k)   # [B, D]
+        task = self.task_embed(
+            torch.full((B,), int(task_id), dtype=torch.long, device=H_ctx.device)
+        )   # [B, D]
+        cond = time_cond + task
 
-        # Add positional encoding
         x = self.pos_enc(x_hist)                              # [B, K, L, D]
-        x[:, -1] = x[:, -1] + time_cond[:, None, :]          # inject into last frame
+        x[:, -1] = x[:, -1] + cond[:, None, :]
 
-        # Reshape: treat each residue position independently over K frames
-        # [B, K, L, D] → [B*L, K, D]
-        x = x.permute(0, 2, 1, 3).reshape(B * L, K, D)
+        # ── Stage 1: temporal causal attention (per residue) ─────────────────
+        # Reshape [B, K, L, D] → [B*L, K, D] so each residue runs independently
+        x_t = x.permute(0, 2, 1, 3).reshape(B * L, K, D)
+        causal = self._causal_mask(K, x_t.device)
+        # Pass the explicit additive mask only.  Passing both `mask` and
+        # `is_causal=True` is version-dependent in PyTorch (some releases ignore
+        # the explicit mask), so we use the single unambiguous form.
+        x_t = self.temporal_transformer(x_t, mask=causal)
+        # Take the last-frame summary for each residue: [B*L, D] → [B, L, D]
+        summary = x_t[:, -1, :].reshape(B, L, D)
 
-        causal = self._causal_mask(K, x.device)
-        x = self.transformer(x, mask=causal, is_causal=True)  # [B*L, K, D]
+        # ── Stage 2: spatial attention (full bidirectional over residues) ─────
+        # Build key-padding mask from valid_mask so padding residues don't
+        # contribute to or receive attention: True = ignore.
+        key_padding_mask: torch.Tensor | None = None
+        if valid_mask is not None:
+            # valid_mask: [B, L] bool, True = valid; transformer expects True = pad
+            key_padding_mask = ~valid_mask   # [B, L]
+        summary = self.spatial_transformer(
+            summary, src_key_padding_mask=key_padding_mask
+        )   # [B, L, D]
 
-        # Use last-frame output as the context summary
-        summary = x[:, -1, :]                                  # [B*L, D]
-        summary = summary.reshape(B, L, D)
-
-        # Project to J×r factor predictions
+        # Project to factor predictions
         out = self.out_head(summary)                           # [B, L, J*r]
         return out.reshape(B, L, self.num_factors, self.factor_dim)  # [B, L, J, r]
 
@@ -343,6 +410,7 @@ class StageAV2(nn.Module):
             num_heads=config.predictor_heads,
             max_frames=config.max_frames,
             dropout=config.dropout,
+            spatial_depth=config.predictor_spatial_depth,
         )
 
         # EMA step counter (used externally to compute momentum schedule)
@@ -352,9 +420,19 @@ class StageAV2(nn.Module):
         # H vectors.  Symmetric in (i, j) by construction (concat both orders
         # and average).  Trained jointly with the encoder; keeps H structurally
         # faithful so the downstream decoder has a signal to read.
+        #
+        # Input is [H_i, H_j, H_mean]: the per-residue pair PLUS the frame's
+        # global mean.  Per-residue H alone is only locally informative under
+        # SE(3)-invariance (no canonical frame exists to place residue i in),
+        # so a head reading [H_i, H_j] cannot recover the i-j distance and
+        # collapses to predicting the batch mean.  The global mean supplies the
+        # missing reference frame, exactly as it does for the downstream
+        # decoder (per-residue alone → 4.38 Å; with global context → 1.17 Å).
+        # The constraint on H is preserved: H_mean is identical for every pair
+        # in a frame, so H_i and H_j must still carry pair-specific geometry.
         dH = config.latent_dim
         self.struct_recon_head = nn.Sequential(
-            nn.Linear(2 * dH, config.struct_recon_dim),
+            nn.Linear(3 * dH, config.struct_recon_dim),
             nn.GELU(),
             nn.Linear(config.struct_recon_dim, config.struct_recon_dim),
             nn.GELU(),
@@ -418,13 +496,32 @@ class StageAV2(nn.Module):
         residue_mask: torch.Tensor,   # [B, K, L]
         n_pairs: int | None = None,
     ) -> torch.Tensor:
-        """Regress CA-CA distances from H residue pairs; MSE loss in Å².
+        """Regress CA-CA distances from H residue pairs.
 
-        Samples n_pairs random (i,j) pairs per (batch, frame) and regresses
-        the Euclidean CA-CA distance.  Trains the online encoder and
-        struct_recon_head jointly so H retains internal geometry.
+        Three design points, each fixing a measured failure of the naive form
+        (raw MSE on [H_i, H_j]):
 
-        Returns a scalar MSE loss (Å²).
+        * **Global context.**  The head sees [H_i, H_j, H_mean] where H_mean is
+          the frame's mean over valid residues.  Under SE(3) invariance H_i
+          carries only local geometry, so the i-j distance is unrecoverable
+          from the pair alone; H_mean supplies the missing reference frame.
+          The constraint on H is unchanged — H_mean is shared by every pair,
+          so H_i and H_j must still encode pair-specific geometry.
+
+        * **log1p target.**  Raw CA-CA distances span 0–55 Å with variance
+          ≈ 63 Å².  Under squared error a handful of long-range pairs dominate
+          the gradient and the head minimises loss by predicting the frame
+          mean on every pair (measured: pred std 1.97 Å vs target std 7.92 Å,
+          MSE/baseline = 1.007 — a dead head).  Compressing the target with
+          log1p makes the residual distribution near-homoscedastic.
+
+        * **Per-frame normalisation.**  The returned loss is divided by the
+          per-frame variance of the (log1p) target, so it is O(1) — the same
+          scale as the JEPA terms.  Without this the auxiliary entered the
+          total loss at 0.3 × 100 = 31 against a JEPA total of 0.10 and
+          consumed 99.7 % of the encoder's gradient.
+
+        Returns a scalar loss O(1), not Å².
         """
         if n_pairs is None:
             n_pairs = self.config.struct_recon_pairs
@@ -435,35 +532,68 @@ class StageAV2(nn.Module):
         mask_flat = residue_mask.reshape(B * K, L).bool()   # [BK, L]
         BK = B * K
         dev = H_flat.device
-
-        # Sample random residue index pairs
-        idx_i = torch.randint(L, (BK, n_pairs), device=dev)   # [BK, n_pairs]
-        idx_j = torch.randint(L, (BK, n_pairs), device=dev)
-
         ar = torch.arange(BK, device=dev)[:, None]  # [BK, 1]
 
-        # H at each end of the pair — symmetric concat
+        # Global reference: masked mean of H over valid residues, per frame.
+        mf = mask_flat.float().unsqueeze(-1)                # [BK, L, 1]
+        h_mean = (H_flat * mf).sum(dim=1, keepdim=True) / mf.sum(dim=1, keepdim=True).clamp(min=1.0)
+
+        # Stratified pair sampling by sequence separation.  Uniform sampling
+        # buries the few local pairs (the ones carrying the tightest geometric
+        # constraint) under an ocean of long-range pairs.  Three bins —
+        # |i-j| <= 4 (backbone-local), 5–15 (medium), > 15 (tertiary contact)
+        # — give each regime a third of the pairs.  All clamp to valid range.
+        n_per = max(1, n_pairs // 3)
+        sign = torch.where(torch.rand(BK, n_per, device=dev) < 0.5,
+                           torch.ones(BK, n_per, dtype=torch.long, device=dev),
+                           -torch.ones(BK, n_per, dtype=torch.long, device=dev))
+        # local: offset in [1, 4]
+        i_lo = torch.randint(0, L, (BK, n_per), device=dev)
+        off_lo = torch.randint(1, 5, (BK, n_per), device=dev) * sign
+        j_lo = (i_lo + off_lo).clamp(0, L - 1)
+        # medium: offset in [5, 15]
+        i_md = torch.randint(0, L, (BK, n_per), device=dev)
+        off_md = torch.randint(5, 16, (BK, n_per), device=dev) * sign
+        j_md = (i_md + off_md).clamp(0, L - 1)
+        # long: offset >= 16, capped at L-1
+        lo_lg = min(16, max(1, L - 1))      # guard for tiny proteins
+        hi_lg = max(lo_lg + 1, L)
+        i_lg = torch.randint(0, L, (BK, n_per), device=dev)
+        off_lg = torch.randint(lo_lg, hi_lg, (BK, n_per), device=dev) * sign
+        j_lg = (i_lg + off_lg).clamp(0, L - 1)
+        idx_i = torch.cat([i_lo, i_md, i_lg], dim=1)        # [BK, 3*n_per]
+        idx_j = torch.cat([j_lo, j_md, j_lg], dim=1)
+
+        # H at each end of the pair — symmetric concat with global context.
         Hi = H_flat[ar, idx_i]   # [BK, n_pairs, dH]
         Hj = H_flat[ar, idx_j]
-        feat_ij = torch.cat([Hi, Hj], dim=-1)  # [BK, n_pairs, 2*dH]
-        feat_ji = torch.cat([Hj, Hi], dim=-1)
+        g_i = h_mean.expand(-1, idx_i.shape[1], -1)         # [BK, n_pairs, dH]
+        feat_ij = torch.cat([Hi, Hj, g_i], dim=-1)
+        feat_ji = torch.cat([Hj, Hi, g_i], dim=-1)
 
         # Average over both orderings for symmetry
         pred = 0.5 * (
             self.struct_recon_head(feat_ij) + self.struct_recon_head(feat_ji)
         ).squeeze(-1)  # [BK, n_pairs]
 
-        # Ground-truth CA-CA distance
+        # Ground-truth CA-CA distance, log1p-compressed
         cai = ca_flat[ar, idx_i]   # [BK, n_pairs, 3]
         caj = ca_flat[ar, idx_j]
         dist = (cai - caj).norm(dim=-1)  # [BK, n_pairs]
+        tgt = torch.log1p(dist)
 
         # Mask: both residues must be valid
         valid = mask_flat[ar, idx_i] & mask_flat[ar, idx_j]  # [BK, n_pairs]
         valid_f = valid.float()
 
-        n_valid = valid_f.sum().clamp(min=1.0)
-        return ((pred - dist) ** 2 * valid_f).sum() / n_valid
+        # Per-frame normalisation by the target variance, so the loss is O(1)
+        # and comparable to the JEPA terms.  Mean-prediction ⇒ loss ≈ 1.
+        tgt_dev = (tgt - tgt.mean(dim=1, keepdim=True)) ** 2
+        var = (tgt_dev * valid_f).sum(dim=1) / valid_f.sum(dim=1).clamp(min=1.0)
+        var = var.clamp(min=1e-3)                            # [BK]
+        se = (pred - tgt) ** 2 * valid_f                     # [BK, n_pairs]
+        per_frame = se.sum(dim=1) / valid_f.sum(dim=1).clamp(min=1.0)  # [BK]
+        return (per_frame / var).mean()
 
     # ── Teacher forward (always no_grad, eval mode) ──────────────────────────
 
@@ -551,7 +681,7 @@ class StageAV2(nn.Module):
         lag_ps = torch.zeros(B, device=coords.device)
         temp_k = batch.get("temperature_k", torch.full((B,), 348.0, device=coords.device))
 
-        pred_full = self.predictor(H_ctx, lag_ps, temp_k)   # [B, L, J, r]
+        pred_full = self.predictor(H_ctx, lag_ps, temp_k, valid_mask=valid, task_id=0)   # [B, L, J, r]
 
         # Compute factors only on masked (target) residues
         mask_idx = spatial_mask & valid   # [B, L]
@@ -633,7 +763,7 @@ class StageAV2(nn.Module):
         h_teacher = self._teacher_encode_clip(target_frame)   # [B, L, dH]
 
         # Predictor
-        pred = self.predictor(context_H, lag_ps, temp_k)   # [B, L, J, r]
+        pred = self.predictor(context_H, lag_ps, temp_k, valid_mask=valid, task_id=1)   # [B, L, J, r]
 
         # target factors: P_j · stop_grad(h̄)
         target_factors = self._project_to_factors(h_teacher.detach())  # [B, L, J, r]
@@ -654,51 +784,71 @@ class StageAV2(nn.Module):
         lags: tuple[int, ...],
         recent_frac: float = 0.5,
     ) -> dict:
-        """Multi-lag causal prediction from ONE context window.
+        """Causal prediction: full context window → target frame OUTSIDE the window.
 
-        For every lag L in `lags`, the target frame is context frame index
-        ``K-1-L`` while the visible context is ``context[:, :K-L]``.  The
-        predictor's last token is the *masked* online encoding of the target
-        frame, so it cannot resolve the target by copying its own geometry at
-        the last position; it must integrate the preceding history.
+        The target is drawn from ``future_*`` keys of the paired-window batch,
+        which are guaranteed non-overlapping with context by the dataset builder
+        (``paired_nonoverlap_only=True``).  This closes the core training/eval
+        mismatch: Stage A trains exactly as Stage B1a/eval evaluates.
 
-        Supervising several lags (in particular the short, near-consecutive
-        gap where MD actually carries signal) forces H to be temporally
-        informative instead of a static fold fingerprint.
+        ``lags`` controls which future offset is used for each sample.  When the
+        batch supplies multiple horizons (``paired_all_horizons=True``), each
+        sample already carries its own horizon via ``horizon_time_ps``; ``lags``
+        then selects which index inside the future clip to target (default: use
+        the first future frame, i.e., index 0 = the closest future frame).
 
         Args:
-            batch: paired-window batch (only ``context_*`` keys are used).
-            lags: positive frame gaps, each < K.
+            batch: paired-window batch with ``context_*`` AND ``future_*`` keys.
+            lags: future frame offsets within the future clip to supervise.
+                  Each must be < T_fut (number of future frames).  The first
+                  offset (lag=0) is the frame immediately after the context
+                  window.  Ratio-based sampling still applies.
             recent_frac: fraction of each batch (by sample index) restricted to
-                the two *shortest* lags.  Long horizons are intrinsically
-                unpredictable; without this the predictor can minimise the loss
-                by ignoring history and copying the recent frame.
+                the two *shortest* lags (smallest future offsets).
 
-        Returns dict with:
-            pred_factors:   [N, L_max, J, r]  (padded across lags)
-            target_factors: [N, L_max, J, r]
-            valid_mask:     [N, L_max]
-            lag_ps:         [N]
-            lag_slot:       [N] long, index into `lags`
+        Returns dict with the same keys as before so all downstream code is
+        unchanged:
+            pred_factors:    [B, L, J, r]
+            target_factors:  [B, L, J, r]
+            context_H:       [B, K, L, dH]  (full context, no zero-fill)
+            context_H_full:  [B, K, L, dH]  (same; kept for variance/contrast)
+            valid_mask:      [B, L]
+            lag_ps:          [B]
+            lag_slot:        [B] long
+            lag_sel:         [B] long
+            anchor_H:        [B, L, dH]  online encoding of last context frame
         """
-        ctx_coords = batch["context_coords"]       # [B, K, L, 4, 3]
-        ctx_rmask = batch["context_residue_mask"]  # [B, K, L]
-        aatype = batch["context_aatype"]
+        ctx_coords = batch["context_coords"]        # [B, K, L, 4, 3]
+        ctx_rmask  = batch["context_residue_mask"]  # [B, K, L]
+        fut_coords = batch["future_coords"]         # [B, T_fut, L, 4, 3]
+        fut_rmask  = batch["future_residue_mask"]   # [B, T_fut, L]
+        aatype        = batch["context_aatype"]
         residue_index = batch["context_residue_index"]
-        chain_id = batch["context_chain_id"]
-        ctx_t = batch.get("context_time_ps")
+        chain_id      = batch["context_chain_id"]
+        ctx_t    = batch.get("context_time_ps")
+        fut_t    = batch.get("future_time_ps")
         temp_all = batch.get("temperature_k")
 
         B, K, L = ctx_coords.shape[:3]
-        valid = ctx_rmask[:, 0]                     # residues fixed across frames
+        T_fut = fut_coords.shape[1]
+        valid = ctx_rmask[:, 0]   # [B, L] — residues fixed across frames
+
+        # ``lags`` are offsets counted from the END of the future clip.  The
+        # future clip mirrors the context offsets shifted by ``horizon``, and
+        # the context offsets are chronological with the anchor (= last context
+        # frame) at the final offset.  Therefore the LAST future frame
+        # (index T_fut-1) sits exactly ``horizon`` frames after the anchor — the
+        # cleanest, longest-signal future target — and earlier future frames are
+        # closer in absolute time to the anchor.  lag=0 selects the last future
+        # frame (full horizon); larger lags step backward toward the anchor.
         lags = tuple(sorted({int(l) for l in lags}))
         for l in lags:
-            if l < 1 or l >= K:
-                raise ValueError(f"lag {l} out of range for context K={K}")
+            if l < 0 or l >= T_fut:
+                raise ValueError(
+                    f"lag {l} out of range for future clip T_fut={T_fut}"
+                )
 
-        # Encode all context frames with the online encoder.  The anchor and
-        # target frames are additionally re-encoded with the teacher below to
-        # form the delta-target.
+        # ── Encode full context window with the online encoder ────────────────
         context_H = self.context_encoder(
             coords=ctx_coords,
             residue_mask=ctx_rmask,
@@ -707,10 +857,15 @@ class StageAV2(nn.Module):
             chain_id=chain_id,
         )   # [B, K, L, dH]
 
-        # Ratio-based sampling of short vs long lags.
-        n_short = max(1, min(len(lags), 2))
-        short_slots = torch.arange(n_short, dtype=torch.long)          # sorted asc
-        long_slots = torch.arange(n_short, len(lags), dtype=torch.long)
+        # anchor = last visible context frame
+        anchor_H = context_H[:, -1]   # [B, L, dH]
+
+        # ── Sample which future offset to supervise per sample ────────────────
+        # Slots are the sorted lag list; the two smallest lags (closest to the
+        # full horizon) are the "short" slots that recent_frac prioritises.
+        n_short  = max(1, min(len(lags), 2))
+        short_slots = torch.arange(n_short, dtype=torch.long)
+        long_slots  = torch.arange(n_short, len(lags), dtype=torch.long)
         n_recent = int(round(B * recent_frac))
         slot = torch.empty(B, dtype=torch.long)
         if n_recent > 0:
@@ -727,103 +882,97 @@ class StageAV2(nn.Module):
             ]
         slot = slot.to(ctx_coords.device)
 
-        # Select the target frame index for each sample.
-        lag_sel = torch.tensor([lags[int(s)] for s in slot.tolist()],
-                               dtype=torch.long, device=ctx_coords.device)
-        # Target frame sits `lag_sel` frames *after* the last visible frame.
-        anchor_idx = (K - 1) - lag_sel                # last visible frame
-        tgt_idx = anchor_idx + 1                      # target inside [1, K-1]
+        # Map slot → future-clip index, counting from the end.
+        lag_off = torch.tensor(
+            [lags[int(s)] for s in slot.tolist()],
+            dtype=torch.long, device=ctx_coords.device,
+        )   # [B] — offset back from the last future frame
+        lag_sel = (T_fut - 1 - lag_off).clamp(min=0)   # [B] index into future clip
+
         ar = torch.arange(B, device=ctx_coords.device)
-        tgt_idx = tgt_idx.clamp(max=K - 1)
-        tgt_coords = ctx_coords[ar, tgt_idx][:, None]       # [B,1,L,4,3]
-        tgt_rmask = ctx_rmask[ar, tgt_idx][:, None]         # [B,1,L]
+        tgt_coords_sel = fut_coords[ar, lag_sel][:, None]   # [B,1,L,4,3]
+        tgt_rmask_sel  = fut_rmask[ar, lag_sel][:, None]    # [B,1,L]
 
-        # Visible history: frames [0 .. anchor_idx], right-aligned so the last
-        # slot of the predictor input is the anchor frame.  Slots before the
-        # anchor that fall outside the window are zero-filled.
-        idx = torch.arange(K, device=ctx_coords.device)[None, :]     # [1,K]
-        # Output slot j takes source frame (j - (K-1-anchor_idx)); require src>=0.
-        src = idx - (K - 1 - anchor_idx[:, None])                    # [B,K]
-        valid_src = (src >= 0) & (src <= anchor_idx[:, None])
-        H_hist = torch.gather(
-            context_H, 1,
-            src.clamp(min=0, max=K - 1)[..., None, None].expand(
-                -1, -1, L, context_H.shape[-1]),
-        )
-        H_target_in = torch.where(
-            valid_src[..., None, None], H_hist, torch.zeros_like(H_hist)
-        )
-
-        # Physical lag in ps: interval from the anchor to the target frame.
-        if ctx_t is not None:
-            lag_ps = (ctx_t[ar, tgt_idx] - ctx_t[ar, anchor_idx]).to(torch.float32)
+        # ── Physical lag (ps): anchor → selected future frame ─────────────────
+        if ctx_t is not None and fut_t is not None:
+            anchor_t = ctx_t[:, -1]                          # [B] last context
+            fut_t_sel = fut_t[ar, lag_sel]                   # [B]
+            lag_ps = (fut_t_sel - anchor_t).to(torch.float32)
             bad = ~torch.isfinite(lag_ps) | (lag_ps <= 0)
-            lag_ps = torch.where(bad, lag_sel.float() * 1000.0, lag_ps)
+            # Fallback assumes 1 ns/frame; horizon_time_ps is the true gap.
+            hz = batch.get("horizon_time_ps")
+            if hz is not None:
+                fallback = hz.to(torch.float32)
+            else:
+                fallback = torch.full_like(lag_ps, 1000.0)
+            lag_ps = torch.where(bad, fallback, lag_ps)
         else:
-            lag_ps = lag_sel.float()
+            hz = batch.get("horizon_time_ps")
+            lag_ps = (hz.to(torch.float32) if hz is not None
+                      else torch.full((B,), 1000.0, device=ctx_coords.device))
+
         if temp_all is not None:
             temp_k = temp_all
         else:
             temp_k = torch.full((B,), 348.0, device=ctx_coords.device)
 
-        pred = self.predictor(H_target_in, lag_ps, temp_k)  # [B, L, J, r]
+        # ── Predictor: full context window → future ───────────────────────────
+        # The predictor receives the complete K-frame context (no zero-fill,
+        # no masked anchor slot) so it can use the full history signal.
+        # target_frame=None keeps the last slot as the real anchor encoding.
+        pred = self.predictor(
+            context_H, lag_ps, temp_k,
+            valid_mask=valid, task_id=1,
+        )   # [B, L, J, r]
 
-        # ── Delta-target (the fix for time-invariant collapse) ───────────────
-        # H is ~98% static fold-identity code and only ~2% time-varying, so an
-        # absolute target P_j·h̄(X_target) lets the predictor reach near-zero
-        # loss by copying the anchor (cos(H_t,H_{t+1})≈0.98) — zero temporal
-        # reasoning.  Instead we predict the *displacement* in teacher space:
-        #
-        #     target = P_j · ( h̄(X_target) - stop_grad(h̄(X_anchor)) )
-        #
-        # The static fold code cancels in the difference, so 100% of the target
-        # variance — and therefore 100% of the prediction gradient — comes from
-        # the conformational change between anchor and target.  Copying the
-        # anchor now yields target ≈ 0 and large error; the predictor is forced
-        # to model where the protein moves.  Both teacher encodings are detached
-        # (stop_grad); only the online encoder + predictor + projectors learn.
-        anchor_coords = ctx_coords[ar, anchor_idx][:, None]     # [B,1,L,4,3]
-        anchor_rmask = ctx_rmask[ar, anchor_idx][:, None]       # [B,1,L]
+        # ── Teacher target: future frame encoded by the EMA teacher ───────────
         tgt_frame_dict = {
-            "coords": tgt_coords,
-            "residue_mask": tgt_rmask,
+            "coords": tgt_coords_sel,
+            "residue_mask": tgt_rmask_sel,
             "aatype": aatype,
             "residue_index": residue_index,
             "chain_id": chain_id,
         }
+        h_teacher = self._teacher_encode_clip(tgt_frame_dict)   # [B, L, dH]
+
+        # Delta-target: predict displacement from anchor in teacher space.
+        # This cancels the ~98% static fold code so 100% of the gradient
+        # comes from the conformational change between anchor and future.
+        # target = P_j · (h̄(future) - stop_grad(h̄(anchor)))
+        # Copying the anchor yields target ≈ 0 and large error → predictor
+        # is forced to model where the protein actually moves.
         anchor_frame_dict = {
-            "coords": anchor_coords,
-            "residue_mask": anchor_rmask,
+            "coords": ctx_coords[:, -1:],   # [B,1,L,4,3] last ctx frame
+            "residue_mask": ctx_rmask[:, -1:],
             "aatype": aatype,
             "residue_index": residue_index,
             "chain_id": chain_id,
         }
-        h_teacher = self._teacher_encode_clip(tgt_frame_dict)        # [B, L, dH]
-        h_teacher_anchor = self._teacher_encode_clip(anchor_frame_dict)  # [B, L, dH]
-        if getattr(self.config, "delta_target", True):
-            delta_teacher = (h_teacher - h_teacher_anchor).detach()     # [B, L, dH]
-            target_factors = self._project_to_factors(delta_teacher)
-        else:
-            # Absolute teacher target.  Structurally-faithful H (driven by
-            # struct_recon) is already time-varying, so no delta is needed and
-            # H keeps the fold the decoder must read.
-            delta_teacher = (h_teacher - h_teacher_anchor).detach()
-            target_factors = self._project_to_factors(h_teacher.detach())
+        h_teacher_anchor = self._teacher_encode_clip(anchor_frame_dict)  # [B,L,dH]
+        delta_teacher    = (h_teacher - h_teacher_anchor).detach()        # [B,L,dH]
+        target_factors   = self._project_to_factors(delta_teacher)        # [B,L,J,r]
+
+        # Anchor factor coordinates for anchor-calibrated reconstruction:
+        #   H_hat(t) = compose( decompose(h_anchor) + pred_factors )
+        # → pred_factors = 0 exactly reproduces the anchor (persistence fallback).
+        anchor_factors = self._project_to_factors(h_teacher_anchor.detach())
 
         return {
-            "pred_factors": pred,
-            "target_factors": target_factors,
-            "context_H": H_target_in,
-            # Full unmasked context trajectory [B,K,L,dH] for the temporal
-            # contrast loss: the contrast must measure the true H trajectory.
-            "context_H_full": context_H,
-            "valid_mask": valid,
-            "h_teacher_full": h_teacher.detach(),
+            "pred_factors":    pred,
+            "target_factors":  target_factors,
+            # Feed the full context H (no zero-fill) so variance/contrast
+            # losses see the real encoder outputs.
+            "context_H":       context_H,
+            "context_H_full":  context_H,
+            "valid_mask":      valid,
+            "h_teacher_full":  h_teacher.detach(),
             "h_teacher_anchor": h_teacher_anchor.detach(),
-            "delta_teacher": delta_teacher,
-            "lag_ps": lag_ps,
-            "lag_slot": slot,
-            "lag_sel": lag_sel,
+            "delta_teacher":   delta_teacher,
+            "anchor_factors":  anchor_factors.detach(),   # [B, L, J, r]
+            "anchor_H":        anchor_H.detach(),         # [B, L, dH]
+            "lag_ps":          lag_ps,
+            "lag_slot":        slot,
+            "lag_sel":         lag_sel,
         }
 
     # ── Internal helpers ─────────────────────────────────────────────────────

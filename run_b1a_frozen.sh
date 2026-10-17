@@ -11,7 +11,7 @@ exec python -u -m protein_jepa_frame.training.train_stage_b1a \
   --history-frames 4 \
   --unfreeze-top-n-blocks 0 \
   --lr 3e-4 --weight-decay 0.01 --grad-clip 1.0 \
-  --fape-weight 1.0 --ca-mse-weight 10.0 \
+  --fape-weight 1.0 \
   --torsion-weight 0.2 --distance-weight 0.1 \
   --phys-future-weight 0.5 --anchor-weight 0.0 \
   --fit-normalizer-batches 20 \

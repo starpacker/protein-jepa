@@ -63,6 +63,50 @@ class StageB1bLossWeights:
 # Energy score
 # -----------------------------------------------------------------------------
 
+def kabsch_rmsd_loss(
+    pred_ca: Tensor, true_ca: Tensor, residue_mask: Tensor,
+) -> Tensor:
+    """Mean per-sample Kabsch CA RMSD (A), differentiable through the alignment.
+
+    Aligns pred onto true per batch element using masked centroids and the SVD
+    rotation, then returns the mean RMSD over the batch.  Gradients flow through
+    the rotation (SVD backward is supported by torch.linalg).
+
+    Args:
+        pred_ca: [B, L, 3]  predicted CA coordinates.
+        true_ca: [B, L, 3]  ground-truth CA coordinates.
+        residue_mask: [B, L]  valid-residue mask.
+    """
+    B = pred_ca.shape[0]
+    rmsds = []
+    for b in range(B):
+        m = residue_mask[b].bool()
+        n = int(m.sum())
+        if n < 3:
+            continue
+        P = pred_ca[b][m]              # [n,3]
+        Q = true_ca[b][m]
+        Pc = P - P.mean(0, keepdim=True)
+        Qc = Q - Q.mean(0, keepdim=True)
+        H = Pc.transpose(0, 1) @ Qc    # [3,3]
+        U, S, Vh = torch.linalg.svd(H)
+        d = torch.sign(torch.det(U @ Vh))
+        D = torch.diag(torch.stack([
+            torch.ones((), device=P.device, dtype=P.dtype),
+            torch.ones((), device=P.device, dtype=P.dtype),
+            d,
+        ]))
+        # Optimal rotation for min ||Pc @ R - Qc|| with H = Pc^T Qc = U S Vh
+        # is R = U diag(1,1,d) Vh (verified against scipy align_vectors).
+        R = U @ D @ Vh
+        aligned = Pc @ R
+        rmsd = ((aligned - Qc) ** 2).sum(-1).mean().clamp_min(1e-8).sqrt()
+        rmsds.append(rmsd)
+    if not rmsds:
+        return pred_ca.new_zeros(())
+    return torch.stack(rmsds).mean()
+
+
 def energy_score(samples: Tensor, target: Tensor) -> Tensor:
     """Proper energy score for a set of M forecast samples (2.5).
 

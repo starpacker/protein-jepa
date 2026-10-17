@@ -1,5 +1,0 @@
-frame_interval_ps: 1000.0
-long_ps: 64000.0
-medium_ps: 8000.0
-selection_split: train
-short_ps: 1000.0

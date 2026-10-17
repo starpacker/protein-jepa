@@ -1,34 +1,41 @@
-"""Stage B2 autonomous decode modes: D_chi(H_t, c) vs D_chi'(H_t, S_t, c).
+"""Stage B2 autonomous decode modes: D_chi(Q:=H_t, anchor, c) vs
+D_chi'(Q:=H_t, S_t, anchor, c).
 
 Implements §3.7 of STAGE_AB_REDESIGN_PLAN.md.  This file is ADDITIVE: it does
 not modify or replace the primary decoder path (§3.1–§3.6).  It adds a second,
 independently parametrised decoder that additionally receives the bath state
 S_t, and a shared autonomous rollout that can decode with either.
 
-Design contract
----------------
-The B1b kernel is the single source of the (H, S) transition.  This module calls
-``kernel.sample_step`` directly, so training/deployment kernel consistency
-(plan §8.3 test 7) is preserved by construction — no second copy of D/C/Gamma.
+Design contract (plan §2.0.0 / §3.1)
+------------------------------------
+- The invariant dynamics state is ``Q := H_t``; it is the SAME tensor as H_t
+  (there is no separate Q reader in this framework).
+- The decoder has ONE state pathway (``q_dynamics``) which carries Q := H_t on
+  the mainline, and Q := H_t with S_t appended on the comparison path.
+- ``anchor`` (R_anchor, t_anchor) supplies the equivariant rigid-body basis
+  (absolute placement) ONLY.  It never supplies internal conformation.
+- Decoding: ``X_hat = anchor_frame  x  d_local(Q:=H_t, c [, S_t])``.
 
 Decode modes
 ------------
-  "h_only"      D_chi (H_t, c)          primary; also the B1a oracle decoder.
-                 H_t is routed into BOTH the context and the q pathway
-                 (matches StageBOracleDecoder.decode_structure).
+  "h_only"      D_chi (Q:=H_t, anchor, c)          primary; also B1a oracle.
+                 state pathway input = H_t  (width dH).
 
-  "h_plus_bath" D_chi'(H_t, S_t, c)     comparison only (§3.7).
-                 H_t -> context pathway; S_t -> q pathway (q_dim = dS).
+  "h_plus_bath" D_chi'(Q:=H_t, S_t, anchor, c)     comparison only (§3.7).
+                 state pathway input = [H_t || S_t] (width dH + dS).
                  S_t comes strictly from the kernel recursion; no history,
                  anchor, or basin bypass is added.
+
+Capacity fairness (§11): the two decoders differ ONLY by the extra S_t input.
+Both feed H_t through the identical state pathway; neither feeds H twice.
 
 Red lines respected (§11)
 -------------------------
   - The primary decoder is unchanged; D_chi' is a separate module with its own
     parameters, selectable at evaluation time.
   - S_t is never fabricated for the direct mode; this rollout is autonomous only.
-  - D_chi' adds exactly ONE extra input (S_t).  The geometry generation layer
-    (OpenFold frames/torsions/atom37) is identical to §3.2.
+  - D_chi' adds exactly ONE extra input block (S_t); its H_t pathway is
+    capacity-matched to the mainline.
 """
 
 from __future__ import annotations
@@ -52,8 +59,9 @@ from protein_jepa_frame.models.stage_c.structure_decoder import (
 class BathAwareDecoderConfig:
     """Sizing for the two B2 decoders.
 
-    ``latent_dim`` is dH, ``bath_dim`` is dS.  The bath decoder routes S_t
-    through the decoder's q pathway, so ``q_dim == bath_dim``.
+    ``latent_dim`` is dH, ``bath_dim`` is dS.  Both decoders route the state
+    through the SAME pathway; the comparison decoder appends S_t to H_t, so it
+    has ``bath_extra_dim = dS`` while the mainline has 0.
     """
     latent_dim: int = 128           # dH
     bath_dim: int = 8               # dS
@@ -62,44 +70,29 @@ class BathAwareDecoderConfig:
     n_ipa_blocks: int = 4
     n_heads: int = 4
     torsion_bins: int = 36
-
-    # Translation budgets.  These mirror the B1a oracle budget so that D_chi
-    # and D_chi' are compared on equal footing (only the input differs).
-    max_translation_update: float = 8.0
-    max_q_translation_update: float = 12.0
-    max_com_update: float = 20.0
-    direct_h_position: bool = True
-    max_direct_position_update: float = 25.0
+    max_local_position_update: float = 12.0
 
     def h_only_decoder_config(self) -> DecoderConfig:
         return DecoderConfig(
-            context_dim=self.latent_dim,
-            q_dim=self.latent_dim,          # H into q pathway (B1a convention)
+            q_dim=self.latent_dim,          # state = Q := H_t
+            bath_extra_dim=0,
             c_hidden=self.c_hidden,
             n_ipa_blocks=self.n_ipa_blocks,
             n_heads=self.n_heads,
             torsion_bins=self.torsion_bins,
-            max_translation_update=self.max_translation_update,
-            max_q_translation_update=self.max_q_translation_update,
-            max_com_update=self.max_com_update,
-            direct_h_position=self.direct_h_position,
-            max_direct_position_update=self.max_direct_position_update,
+            max_local_position_update=self.max_local_position_update,
             freeze_ab=True,
         )
 
     def bath_decoder_config(self) -> DecoderConfig:
         return DecoderConfig(
-            context_dim=self.latent_dim,
-            q_dim=self.bath_dim,            # S into q pathway
+            q_dim=self.latent_dim,          # state = Q := H_t
+            bath_extra_dim=self.bath_dim,   # appended S_t (the only extra input)
             c_hidden=self.c_hidden,
             n_ipa_blocks=self.n_ipa_blocks,
             n_heads=self.n_heads,
             torsion_bins=self.torsion_bins,
-            max_translation_update=self.max_translation_update,
-            max_q_translation_update=self.max_q_translation_update,
-            max_com_update=self.max_com_update,
-            direct_h_position=self.direct_h_position,
-            max_direct_position_update=self.max_direct_position_update,
+            max_local_position_update=self.max_local_position_update,
             freeze_ab=True,
         )
 
@@ -109,7 +102,7 @@ class BathAwareDecoderConfig:
 # ─────────────────────────────────────────────────────────────────────────────
 
 class HOnlyDecoder(nn.Module):
-    """D_chi(H_t, c): the primary decoder path (unchanged semantics).
+    """D_chi(Q:=H_t, anchor, c): the primary decoder path.
 
     Owns its own StructureDecoder.  The optional ``S_t`` argument is accepted
     only so both decoders share one call signature; it is IGNORED here.
@@ -135,8 +128,7 @@ class HOnlyDecoder(nn.Module):
     ):
         return self.decoder(
             aatype=aatype,
-            h_frozen=H,
-            q_dynamics=H,                # H into both pathways (B1a convention)
+            q_dynamics=H,                # single state pathway: Q := H_t
             R_anchor=R_anchor,
             t_anchor=t_anchor,
             residue_mask=residue_mask,
@@ -148,10 +140,11 @@ class HOnlyDecoder(nn.Module):
 
 
 class BathAwareDecoder(nn.Module):
-    """D_chi'(H_t, S_t, c): comparison decoder that also receives S_t.
+    """D_chi'(Q:=H_t, S_t, anchor, c): comparison decoder that also gets S_t.
 
-    H_t -> context pathway; S_t -> q pathway.  Independently parametrised from
-    HOnlyDecoder — training one never touches the other.
+    State pathway input is ``[H_t || S_t]``; H_t's pathway is capacity-matched
+    to the mainline, so the only difference from D_chi is the extra S_t block.
+    Independently parametrised from HOnlyDecoder.
     """
 
     mode = "h_plus_bath"
@@ -178,10 +171,10 @@ class BathAwareDecoder(nn.Module):
             raise ValueError(
                 f"S_t last dim must be dS={self.cfg.bath_dim}, got {S.shape[-1]}"
             )
+        state = torch.cat([H, S], dim=-1)   # [B, L, dH + dS]
         return self.decoder(
             aatype=aatype,
-            h_frozen=H,
-            q_dynamics=S,                # S_t enters here
+            q_dynamics=state,            # [Q := H_t || S_t]
             R_anchor=R_anchor,
             t_anchor=t_anchor,
             residue_mask=residue_mask,

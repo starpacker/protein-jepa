@@ -4,6 +4,12 @@ __pycache__/
 artifacts/
 .venv/
 *.egg-info/
+*.pt
+*.h5
+*.npz
+*.zip
+*.tar
+*.tar.gz
 *.log
 *.out
 manifests/*.jsonl
@@ -29,8 +35,20 @@ logs/
 
 # paper drafts (not core code)
 paper/
+docs/
 
 # jepa_anything reference copy (external repo)
 jepa_anything/
 
 tmp_claude/
+.tmp_eval/
+archive/
+paper/
+protein_jepa_frame/models/*.bak*
+/*_REPORT.md
+/B1B_*.md
+/B2T_*.md
+/EVALUATION_RESULTS.md
+/H_*.md
+/NEW_FRAMEWORK_REPORT.md
+/STAGE_A_HONLY_DIAGNOSIS.md

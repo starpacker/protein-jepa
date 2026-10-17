@@ -106,29 +106,58 @@ class DecoderConfig:
     n_value_points: int = 4      # IPA value points
     torsion_bins: int = 36       # bins for torsion angle prediction (10-degree bins)
     freeze_ab: bool = True       # freeze Stage A/B encoders (must be True initially)
-    context_dim: int = 256       # H dimension from Stage A encoder
-    q_dim: int = 8               # Q dimension from Stage B
+    # State conditioning.  The decoder has ONE state pathway (``q_dynamics``),
+    # which carries the dynamics state Q := H_t for the mainline D_chi and
+    # (optionally) the bath state S_t appended for the D_chi' comparison
+    # (see stage_b2/bath_aware_decoder.py).  ``q_dim`` is the width of that
+    # pathway on the mainline and must equal dH.
+    q_dim: int = 128
+    # Extra bath-state width fed through the SAME conditioning path when > 0
+    # (D_chi' only).  Kept a separate knob so the mainline q_dim == dH is
+    # unambiguous and the D_chi' comparison is capacity-matched on H.
+    bath_extra_dim: int = 0
     dropout: float = 0.1
-    max_translation_update: float = 0.5  # per-component local-frame bound (Å)
-    max_com_update: float = 4.0          # per-component COM bound (Å)
-    max_q_translation_update: float = 2.0  # explicit Q→frame residual bound (Å)
-    # iter_005: when True, the canonical CA translation is driven purely by the
-    # eval-legal analytic basin displacement (context-mean CA in anchor frame).
-    # The learned per-residue frame_update/q_translation residuals -- which
-    # measurably destroy the contact map without improving Kabsch RMSD because
-    # context cannot predict internal deformation direction -- are removed from
-    # the CA position.  Rotation and torsion prediction are unaffected so the
-    # atom37 reconstruction geometry is preserved.
-    basin_only_ca: bool = False
-    # Direct H->position path.  The residual frame-translation head is bounded
-    # to a sub-Å tanh and the legacy COM head is disabled, which leaves the
-    # decoder with no way to move CA to where the latent says it should be.
-    # When True, add an unbounded (generously bounded) per-residue translation
-    # predicted directly from the H-conditioned representation.  This is
-    # essential for the Stage B1a oracle, whose whole purpose is to test how
-    # much positional information H carries.
-    direct_h_position: bool = False
-    max_direct_position_update: float = 25.0
+    # Anchor-local displacement budget: the ONLY positional head is
+    #
+    #     X_hat = anchor_frame  x  d_local(Q:=H_t, c [, S])
+    #
+    # with d_local bounded component-wise to +/- max_local_position_update (A).
+    # anchor (R_anchor, t_anchor) is the equivariant rigid-body basis and
+    # supplies absolute placement only; all internal conformation comes from
+    # the invariant state (H_t, c, [S]).  Legacy heads (direct_h_position,
+    # q_translation_update, basin_reversion, COM) have been removed.
+    max_local_position_update: float = 12.0
+
+    # Anchor-free positional decoding.
+    #
+    # When True the decoder no longer *starts* from the anchor structure and
+    # adds a bounded residual.  Instead H alone predicts the full internal CA
+    # cloud (expressed in the anchor-local rigid frame) BEFORE the IPA trunk
+    # runs, the IPA geometric bias / contact graph are built from those
+    # H-predicted positions, and the anchor (R_anchor, t_anchor) is applied only
+    # at the very end as the equivariant placement
+    #
+    #     X_hat = R_anchor @ x_internal(H) + t_anchor .
+    #
+    # Consequences:
+    #   * H = 0 => x_internal is the head's constant output => a single "mean
+    #     fold", i.e. the best the decoder can do without H.  Real H must beat
+    #     it, so the diagnostic real-H vs zero-H gap is no longer structurally
+    #     zero.
+    #   * The anchor can no longer satisfy the FAPE / distance losses by itself
+    #     (it enters only through a fixed rigid transform, which the SE(3)
+    #     quotient target is invariant to), so the positional gradient reaches H.
+    #
+    # coord_scale bounds the predicted internal radius (Å); the head output is
+    # multiplied by it before placement.
+    anchor_free: bool = False
+    coord_scale: float = 30.0
+
+    # Global-context pooling over the state pathway.  When True, pool the
+    # masked mean over residues of the state and add its projection to every
+    # residue in the single representation, giving each residue a protein-global
+    # summary (used only by the invariant pathway, not by anchor).
+    global_h_context: bool = False
 
 
 def reconstruct_atom37(
@@ -322,49 +351,38 @@ def _rodrigues(
 # ═══════════════════════════════════════════════════════════════════════
 
 class FrameUpdate(nn.Module):
-    """Predicts SE(3) frame updates from current representation."""
+    """Predicts the per-residue frame *orientation* update (quaternion).
 
-    def __init__(self, c_hidden: int = 128, max_translation_update: float = 0.5):
+    Translation is not produced here — it is owned solely by the decoder's
+    anchor-local displacement head.
+    """
+
+    def __init__(self, c_hidden: int = 128):
         super().__init__()
-        if max_translation_update <= 0:
-            raise ValueError("max_translation_update must be positive")
-        self.max_translation_update = float(max_translation_update)
+        # Orientation update only.  Translation is owned exclusively by the
+        # anchor-local displacement head (see StructureDecoder); there is no
+        # separate frame-translation residual.
         self.quat_net = nn.Sequential(
             nn.Linear(c_hidden, c_hidden),
             nn.SiLU(),
             nn.Linear(c_hidden, 4),
         )
-        self.trans_net = nn.Sequential(
-            nn.Linear(c_hidden, c_hidden),
-            nn.SiLU(),
-            nn.Linear(c_hidden, 3),
-        )
-        # Start from the anchor frame.  Random translation updates have no
-        # useful supervision under an SE(3)-invariant objective and can create
-        # large early coordinate excursions before the relative-position loss
-        # has shaped the head.
-        nn.init.zeros_(self.trans_net[-1].weight)
-        self.trans_net[-1].bias.data.zero_()
         # Initialize quaternion to identity (w=1) with small weight
         nn.init.normal_(self.quat_net[-1].weight, std=1e-3)
         self.quat_net[-1].bias.data.copy_(torch.tensor([1.0, 0.0, 0.0, 0.0]))
 
-    def forward(self, s: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """Predict frame updates.
+    def forward(self, s: torch.Tensor) -> torch.Tensor:
+        """Predict the frame orientation update.
 
         Args:
             s: [B, L, c_hidden]
 
         Returns:
-            dq: [B, L, 4] quaternion update (w,x,y,z)
-            dt: [B, L, 3] translation update (in local frame)
+            dq: [B, L, 4] quaternion update (w,x,y,z), unit-norm.
         """
         dq = self.quat_net(s)
         dq = dq / (dq.norm(dim=-1, keepdim=True) + 1e-8)
-        # A raw translation head is an unstable integrator: large position
-        # residuals can keep increasing dt even after gradient clipping.
-        dt = self.max_translation_update * torch.tanh(self.trans_net(s))
-        return dq, dt
+        return dq
 
 
 class TorsionHead(nn.Module):
@@ -518,16 +536,74 @@ class StructureDecoder(nn.Module):
         self.config = config or DecoderConfig()
         c = self.config
 
-        # Input projections
+        # Input projections.  One state pathway only: q_dynamics carries the
+        # dynamics state Q := H_t on the mainline, optionally with the bath
+        # state S_t appended on the D_chi' comparison path (bath_extra_dim > 0).
         self.aatype_embed = nn.Embedding(21, c.c_hidden)  # 20 AA + unknown
-        # Normalize raw H/Q to zero-mean unit-var per feature before projecting.
-        # The physical probe sees normalized H; without this the decoder had to
-        # cope with a different input distribution, slowing convergence.
-        self.h_input_norm = nn.LayerNorm(c.context_dim)
-        self.q_input_norm = nn.LayerNorm(c.q_dim)
-        self.h_proj = nn.Linear(c.context_dim, c.c_hidden)  # frozen H_t0
-        self.q_proj = nn.Linear(c.q_dim, c.c_hidden)        # dynamics Q_t
-        self.frame_condition_proj = nn.Linear(c.c_hidden * 2, c.c_hidden)
+        state_dim = c.q_dim + c.bath_extra_dim
+        self.state_input_norm = nn.LayerNorm(state_dim)
+        self.state_proj = nn.Linear(state_dim, c.c_hidden)
+
+        # Anchor-local displacement head: the ONE positional output.  Emits
+        # d_local in the anchor frame; applied as X_hat = R_anchor @ d_local +
+        # t_anchor (in forward).  Small-norm (not zero) init so the state
+        # pathway receives a gradient from step 0 while starting near the
+        # anchor (persistence-like) — zero init would starve the trunk.
+        self.local_position_head = nn.Sequential(
+            nn.Linear(c.c_hidden, c.c_hidden),
+            nn.SiLU(),
+            nn.Linear(c.c_hidden, 3),
+        )
+        nn.init.normal_(self.local_position_head[-1].weight, std=1e-3)
+        nn.init.zeros_(self.local_position_head[-1].bias)
+        self.max_local_position_update = float(c.max_local_position_update)
+
+        # ── Anchor-free positional head (optional) ────────────────────────────
+        # When c.anchor_free, H predicts the internal CA cloud in the anchor-local
+        # frame directly (no anchor baseline).  Two heads:
+        #   internal_position_head : s -> x_internal  (before IPA; seeds geometry)
+        #   internal_refine_head   : s -> Δx_internal (after IPA; refines it)
+        # Both are zero-ish init so training starts stable; the scale comes from
+        # c.coord_scale.
+        self.anchor_free = bool(getattr(c, "anchor_free", False))
+        self.coord_scale = float(getattr(c, "coord_scale", 30.0))
+        if self.anchor_free:
+            # Residue-order signal.  s carries sequence identity + H but no
+            # explicit ordering, which the anchored decoder got for free from
+            # the anchor positions.  The anchor-free decoder predicts the whole
+            # chain, so it needs to know where a residue sits along it.  This is
+            # a *canonical* (invariant) embedding of the sequence position and
+            # does not affect SE(3) equivariance (placement still happens via
+            # R0/c0).  Small init so it modulates rather than dominates H.
+            self.res_pos_embed = nn.Embedding(1024, c.c_hidden)
+            nn.init.normal_(self.res_pos_embed.weight, std=0.02)
+            self.internal_position_head = nn.Sequential(
+                nn.Linear(c.c_hidden, c.c_hidden),
+                nn.SiLU(),
+                nn.Linear(c.c_hidden, 3),
+            )
+            nn.init.normal_(self.internal_position_head[-1].weight, std=1e-2)
+            nn.init.zeros_(self.internal_position_head[-1].bias)
+            self.internal_refine_head = nn.Sequential(
+                nn.Linear(c.c_hidden, c.c_hidden),
+                nn.SiLU(),
+                nn.Linear(c.c_hidden, 3),
+            )
+            nn.init.normal_(self.internal_refine_head[-1].weight, std=1e-3)
+            nn.init.zeros_(self.internal_refine_head[-1].bias)
+
+        # Global-context pooling over the state pathway (see DecoderConfig).
+        # Zero-init the output layer so the decoder starts identical to the
+        # no-global-context decoder and the channel is learned in.
+        self.global_h_context = bool(getattr(c, "global_h_context", False))
+        if self.global_h_context:
+            self.global_h_proj = nn.Sequential(
+                nn.Linear(state_dim, c.c_hidden),
+                nn.SiLU(),
+                nn.Linear(c.c_hidden, c.c_hidden),
+            )
+            nn.init.zeros_(self.global_h_proj[-1].weight)
+            nn.init.zeros_(self.global_h_proj[-1].bias)
 
         # Contact graph builder (frozen after first forward)
         self.contact_builder = ContactGraphBuilder(cutoff=8.0)
@@ -559,192 +635,76 @@ class StructureDecoder(nn.Module):
 
         self.dropout = nn.Dropout(c.dropout)
 
-        # Output heads
-        self.frame_update = FrameUpdate(
-            c.c_hidden, max_translation_update=c.max_translation_update
-        )
-        if c.max_q_translation_update <= 0:
-            raise ValueError("max_q_translation_update must be positive")
-        # This path is deliberately Q-only.  Its zero final layer keeps the
-        # decoder numerically close to the anchor at initialization, while
-        # the dedicated relative-displacement loss below gives it an
-        # unavoidable training signal.
-        self.q_translation_head = nn.Sequential(
-            nn.Linear(c.q_dim, c.c_hidden),
-            nn.SiLU(),
-            nn.Linear(c.c_hidden, 3),
-        )
-        nn.init.zeros_(self.q_translation_head[-1].weight)
-        nn.init.zeros_(self.q_translation_head[-1].bias)
-        self.max_q_translation_update = float(c.max_q_translation_update)
+        # Frame orientation update only (quaternion).  Translation is handled
+        # exclusively by local_position_head; there is no separate frame
+        # translation residual (removed, see DecoderConfig).
+        self.frame_update = FrameUpdate(c.c_hidden)
         self.torsion_head = TorsionHead(c.c_hidden, num_torsions=NUM_TORSIONS, n_bins=c.torsion_bins)
-
-        # P3.2: Auxiliary COM predictor — bridges H→position, Q provides residual.
-        # Requires batch_size >= 4 for stable gradient (Q alone is SE(3)-invariant).
-        # Zero-init ensures this head does not contribute until
-        # H-anchored geometry converges downstream.
-        self.q_position_head = nn.Linear(c.q_dim + c.c_hidden, 3)
-        if c.max_com_update <= 0:
-            raise ValueError("max_com_update must be positive")
-        self.max_com_update = float(c.max_com_update)
-        nn.init.constant_(self.q_position_head.weight, 0.0)
-        self.q_position_head.bias.data.zero_()
-
-        # Direct H-conditioned per-residue position head (see DecoderConfig).
-        # Reads the sequence/H single representation `s` (which the IPA blocks
-        # have already refined) and emits a local-frame translation residual.
-        # Zero-init so it starts exactly at the anchor, like the other heads.
-        self.direct_h_position = bool(getattr(c, "direct_h_position", False))
-        self.max_direct_position_update = float(getattr(c, "max_direct_position_update", 25.0))
-        if self.direct_h_position:
-            self.direct_position_head = nn.Sequential(
-                nn.Linear(c.c_hidden, c.c_hidden),
-                nn.SiLU(),
-                nn.Linear(c.c_hidden, 3),
-            )
-            nn.init.zeros_(self.direct_position_head[-1].weight)
-            nn.init.zeros_(self.direct_position_head[-1].bias)
-
-        # ── Basin-reversion path ──
-        # Held-out measurement shows backbone dynamics at 8-96 ns are diffusive
-        # with NEGATIVE velocity autocorrelation (-0.35 at 1 ns): the target
-        # reverts toward the local conformational basin centre.  Predicting the
-        # Kabsch-aligned context temporal mean beats persistence on CA RMSD AND
-        # all contact-Jaccard metrics at every horizon (measured).  We expose
-        # that geometric prior as an explicit, per-residue-gated displacement:
-        #     dt_local += sigmoid(gate) * basin_dt_local
-        # where basin_dt_local is the aligned context-mean CA displacement in
-        # the anchor frame (supplied by caller; context-only, eval-legal).  The
-        # gate is conditioned on H+Q so the model can modulate reversion
-        # strength per residue (rigid cores revert little, flexible loops more).
-        self.basin_gate = nn.Sequential(
-            nn.Linear(c.context_dim + c.q_dim, c.c_hidden),
-            nn.SiLU(),
-            nn.Linear(c.c_hidden, 1),
-        )
-        # Bias initialised so sigmoid(gate)~0.6 — start near the measured
-        # optimum beta in [0.5, 1.0] rather than at persistence (beta=0).
-        nn.init.zeros_(self.basin_gate[-1].weight)
-        nn.init.constant_(self.basin_gate[-1].bias, 0.4)
 
     def embed_inputs(
         self,
         aatype: torch.Tensor,
-        h_frozen: torch.Tensor,
         q_dynamics: torch.Tensor,
+        residue_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Embed all inputs into single representation.
+        """Embed the invariant inputs into the single representation.
 
         Args:
-            aatype: [B, L] residue type indices
-            h_frozen: [B, L, 256] frozen H from Stage A context encoder
-            q_dynamics: [B, L, 8] dynamics variables from Stage B
+            aatype: [B, L] residue type indices (sequence c)
+            q_dynamics: [B, L, state_dim] invariant state = Q := H_t (mainline),
+                or [Q := H_t || S_t] on the D_chi' comparison path.
+            residue_mask: [B, L] optional valid-residue mask; required for a
+                correct global-mean pool when sequences are zero-padded.
 
         Returns:
             [B, L, c_hidden] single representation
         """
         B, L = aatype.shape
 
-        s_aa = self.aatype_embed(aatype)           # [B, L, c_hidden]
-        s_h = self.h_proj(self.h_input_norm(h_frozen))   # [B, L, c_hidden]
-        s_q = self.q_proj(self.q_input_norm(q_dynamics)) # [B, L, c_hidden]
-        s_frame = self.frame_condition_proj(
-            torch.cat([s_h, s_q], dim=-1)
-        )
+        state_in = self.state_input_norm(q_dynamics)     # [B, L, state_dim]
+        s_aa = self.aatype_embed(aatype)                 # [B, L, c_hidden]
+        s_q = self.state_proj(state_in)                  # [B, L, c_hidden]
 
-        # Combine: sum of all embeddings
-        s = s_aa + s_h + s_q + s_frame
+        # Combine invariant embeddings.  No separate h_frozen context pathway:
+        # the dynamics state IS H_t on the mainline (see DecoderConfig).
+        s = s_aa + s_q
+
+        # Global-context pooling: broadcast masked mean_j state[j] to every
+        # residue.  Uses only the invariant state — no anchor geometry — so it
+        # stays inside the §2.0.0/§3.1 decoder contract.
+        if self.global_h_context:
+            if residue_mask is None:
+                h_mean = state_in.mean(dim=1, keepdim=True)          # [B, 1, D]
+            else:
+                m = residue_mask.to(state_in.dtype).unsqueeze(-1)    # [B, L, 1]
+                h_mean = (state_in * m).sum(dim=1, keepdim=True) / m.sum(
+                    dim=1, keepdim=True).clamp(min=1.0)              # [B, 1, D]
+            s = s + self.global_h_proj(h_mean)                       # broadcast [B,1,C]
+
         return s
-
-    def q_translation_update(self, q_dynamics: torch.Tensor) -> torch.Tensor:
-        """Return the explicit Q-only local translation residual."""
-        return self.max_q_translation_update * torch.tanh(
-            self.q_translation_head(q_dynamics)
-        )
-
-    @staticmethod
-    def compute_basin_dt_local(
-        context_coords: torch.Tensor,
-        R_anchor: torch.Tensor,
-        t_anchor: torch.Tensor,
-        residue_mask: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        """Aligned context-mean CA displacement expressed in the anchor frame.
-
-        For each sample, every context frame's CA cloud is Kabsch-superimposed
-        onto the anchor (last context frame) CA cloud using the masked
-        residues, the aligned clouds are averaged to estimate the local
-        conformational basin centre, and the per-residue displacement of that
-        centre from the anchor CA is rotated into the anchor's local frame
-        (so the caller can add it to ``dt_local`` before the ``R_anchor @``
-        step, exactly like the other local translation residuals).
-
-        Uses only context coordinates — legal for direct and autonomous modes.
-
-        Args:
-            context_coords: [B, T, L, 4, 3] context backbone (N, CA, C, O)
-            R_anchor: [B, L, 3, 3] anchor frame rotations
-            t_anchor: [B, L, 3] anchor frame translations (anchor CA)
-            residue_mask: [B, L] valid residues (used for the rigid fit)
-
-        Returns:
-            [B, L, 3] basin-reversion displacement in the anchor local frame.
-        """
-        B, T, L = context_coords.shape[:3]
-        device = context_coords.device
-        dtype = context_coords.dtype
-        ca = context_coords[..., 1, :]  # [B, T, L, 3]
-        anchor_ca = ca[:, -1]           # [B, L, 3]
-        if residue_mask is None:
-            residue_mask = torch.ones(B, L, dtype=torch.bool, device=device)
-        mf = residue_mask.to(dtype).unsqueeze(-1)  # [B, L, 1]
-        n = mf.sum(dim=1, keepdim=True).clamp(min=1.0)  # [B, 1, 1]
-
-        mu_a = (anchor_ca * mf).sum(dim=1, keepdim=True) / n  # [B,1,3]
-        Ac = (anchor_ca - mu_a) * mf                          # [B,L,3]
-
-        aligned_sum = torch.zeros(B, L, 3, device=device, dtype=dtype)
-        for tt in range(T):
-            src = ca[:, tt]  # [B, L, 3]
-            mu_s = (src * mf).sum(dim=1, keepdim=True) / n
-            Sc = (src - mu_s) * mf
-            H = Sc.transpose(1, 2) @ Ac  # [B,3,3] maps src -> anchor
-            U, S, Vh = torch.linalg.svd(H.to(torch.float64))
-            d = torch.sign(
-                torch.linalg.det(Vh.transpose(-2, -1) @ U.transpose(-2, -1))
-            )
-            eye = torch.eye(3, device=device, dtype=torch.float64)
-            eye = eye.expand(B, 3, 3).clone()
-            eye[:, 2, 2] = d
-            Rm = (Vh.transpose(-2, -1) @ eye @ U.transpose(-2, -1)).to(dtype)
-            aligned = (Rm @ (src - mu_s).transpose(1, 2)).transpose(1, 2) + mu_a
-            aligned_sum = aligned_sum + aligned
-        center = aligned_sum / float(T)  # [B, L, 3] basin centre in anchor frame
-
-        disp_global = (center - anchor_ca)  # [B, L, 3]
-        disp_local = (
-            R_anchor.transpose(-2, -1) @ disp_global.unsqueeze(-1)
-        ).squeeze(-1)
-        return disp_local * residue_mask.to(dtype).unsqueeze(-1)
 
     def forward(
         self,
         aatype: torch.Tensor,
-        h_frozen: torch.Tensor,
         q_dynamics: torch.Tensor,
         R_anchor: torch.Tensor,
         t_anchor: torch.Tensor,
         residue_mask: torch.Tensor | None = None,
-        q_only_translation: bool = False,
-        basin_dt_local: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         """Forward pass of the structure decoder.
 
+        Decoding follows the invariant x equivariant decomposition:
+
+            X_hat = anchor_frame  x  d_local(Q := H_t, c [, S])
+
+        ``R_anchor/t_anchor`` supply only the equivariant rigid-body basis
+        (absolute placement); all internal conformation is predicted from the
+        invariant state ``q_dynamics`` (+ sequence ``aatype``).
+
         Args:
-            aatype: [B, L] residue type indices
-            h_frozen: [B, L, 256] frozen H features from context (last observed frame)
-            q_dynamics: [B, L, 8] dynamics variables at target time
-            R_anchor: [B, L, 3, 3] anchor frame orientations (from last observed structure)
+            aatype: [B, L] residue type indices (sequence c)
+            q_dynamics: [B, L, state_dim] invariant state (Q := H_t, [+ S_t])
+            R_anchor: [B, L, 3, 3] anchor frame orientations (last observed frame)
             t_anchor: [B, L, 3] anchor frame positions
             residue_mask: [B, L] optional mask
 
@@ -760,82 +720,124 @@ class StructureDecoder(nn.Module):
         B, L = aatype.shape
         device = aatype.device
 
-        # Embed inputs
-        s = self.embed_inputs(aatype, h_frozen, q_dynamics)  # [B, L, c_hidden]
+        # Invariant single representation from (Q := H_t, c [, S]) only.
+        s = self.embed_inputs(aatype, q_dynamics,
+                              residue_mask=residue_mask)  # [B, L, c_hidden]
 
-        # Build frozen contact graph from anchor structure
-        contact_graph = self.contact_builder(t_anchor, residue_mask)
+        if self.anchor_free:
+            # ── Anchor-free path ──────────────────────────────────────────────
+            # The decoder predicts the WHOLE internal structure from H, in one
+            # shared canonical frame, and the anchor enters only as a single
+            # rigid-body transform at the very end:
+            #
+            #     X_internal = f(H, c)                       (H alone)
+            #     X_global   = R0 @ X_internal + c0          (anchor, post-decode)
+            #
+            # The canonical frame (R0, c0) is derived deterministically from the
+            # anchor: c0 = masked centroid of the anchor CA cloud, R0 = the
+            # rotation of the anchor's first valid residue frame.  Because the
+            # frame is *shared* by all residues (not per-residue), X_internal is
+            # an actual structure — H has to produce the fold.  A zero/constant
+            # H yields a single mean structure and cannot satisfy the structural
+            # losses, so there is no anchor shortcut left.
+            c0 = self._masked_centroid(t_anchor, residue_mask)   # [B, 3]
+            R0 = self._reference_rotation(R_anchor, residue_mask)  # [B, 3, 3]
 
-        # Initialize frames at anchor
-        R = R_anchor.clone()
-        t = t_anchor.clone()
+            # Add a canonical residue-order embedding so the decoder can place
+            # residues along the chain (the anchor used to supply this).  Clamp
+            # to the table size for very long chains.
+            pos_idx = torch.arange(L, device=s.device).clamp(max=1023)  # [L]
+            s = s + self.res_pos_embed(pos_idx)[None]                   # [B,L,C]
 
-        # A global COM displacement is not identifiable under the requested
-        # relative-position objective.  Keep the legacy head in the state
-        # dict for checkpoint compatibility, but do not use it as a shortcut.
-        delta_com_local = torch.zeros(
-            B, 3, device=device, dtype=R_anchor.dtype
-        )
+            # H → internal CA positions in the canonical frame.
+            #
+            # Start from a compact, protein-like chain prior so the decoder does
+            # not begin from a degenerate point (every residue on the centroid)
+            # or from an over-extended line (which is 100s of Å long for real L).
+            # The prior is a deterministic self-avoiding-ish random-walk coil
+            # with the correct 3.8 Å CA-CA bond length; its radius of gyration
+            # scales like L^(1/2)·bond, close to a real folded chain.  H predicts
+            # a bounded correction on top.  The prior is purely internal; the
+            # anchor still enters only through (R0, c0) below.
+            prior = self._coil_prior(L, s.dtype, s.device)        # [L, 3]
+            delta = self.coord_scale * torch.tanh(
+                self.internal_position_head(s)
+            )                                                    # [B, L, 3]
+            x_int = prior.unsqueeze(0) + delta                   # [B, L, 3]
 
-        # Process through IPA blocks (refines internal geometry on coarsely-positioned frames)
-        for block, norm, transition in zip(self.ipa_blocks, self.layer_norms, self.transitions):
-            s_residual, _ = block(s, R, t, residue_mask)
-            s = norm(s + self.dropout(s_residual))
-            s = s + transition(s)
+            # Place into the global frame for the IPA geometric bias.
+            #   x_glob = R0 @ x_int + c0     (column-vector convention)
+            R0_l = R0.unsqueeze(1)                               # [B, 1, 3, 3]
+            t_ipa = (R0_l @ x_int.unsqueeze(-1)).squeeze(-1) + c0  # [B, L, 3]
 
-        # Predict frame updates (residual fine-tuning of position + rotation)
-        dq, dt_local = self.frame_update(s)
+            self.contact_builder(t_ipa, residue_mask)
+            R = R0_l.expand(B, L, 3, 3).clone()
+            t = t_ipa
 
-        # Explicit Q→structure path.  Unlike q_proj(s), this cannot be
-        # bypassed by the H/anchor-conditioned IPA representation.
-        q_dt_local = self.q_translation_update(q_dynamics)
-        # Phase 1 of Stage-C training intentionally removes the H/IPA
-        # translation shortcut.  The CA position must then be explained by Q;
-        # Phase 2 restores the normal joint residual path.
-        if q_only_translation:
-            dt_local = q_dt_local
+            for block, norm, transition in zip(
+                self.ipa_blocks, self.layer_norms, self.transitions
+            ):
+                s_residual, _ = block(s, R, t, residue_mask)
+                s = norm(s + self.dropout(s_residual))
+                s = s + transition(s)
+
+            # IPA-refined internal coordinates (residual in the canonical frame).
+            dx = (self.coord_scale * 0.1) * torch.tanh(
+                self.internal_refine_head(s)
+            )                                                    # [B, L, 3]
+            x_final = x_int + dx                                 # [B, L, 3]
+
+            # ── Anchor placement (the ONLY place the anchor is used) ──────────
+            dt_global = (R0_l @ x_final.unsqueeze(-1)).squeeze(-1)  # [B, L, 3]
+            t = dt_global + c0                                    # global CA
+
+            # Per-residue frame orientation: anchor-independent update composed
+            # onto the canonical basis (also rigged to H via s).
+            dq = self.frame_update(s)
+            R_update = rotation_matrix_from_quaternion(dq)
+            R = R0_l @ R_update                                  # [B, L, 3, 3]
+
+            # ``local_position_update_local`` keeps its historical meaning as a
+            # per-residue displacement measured from the anchor's own position,
+            # so downstream diagnostics that compare against a Kabsch-aligned
+            # displacement target stay valid.
+            d_local = (
+                R_anchor.transpose(-1, -2) @ (t - t_anchor).unsqueeze(-1)
+            ).squeeze(-1)
+            x_internal_out = x_final
+
         else:
-            dt_local = dt_local + q_dt_local
+            # ── Original anchor-anchored path ─────────────────────────────────
+            # Build frozen contact graph from anchor structure
+            self.contact_builder(t_anchor, residue_mask)
 
-        # ── Direct H-conditioned position residual ──
-        # The residual paths above are sub-Å bounded and the legacy COM head is
-        # disabled, so without this the decoder can only reproduce the anchor.
-        # This head reads the H/sequence representation and emits the missing
-        # per-residue translation needed to reach the structure encoded in H.
-        direct_dt_local = None
-        if self.direct_h_position:
-            direct_dt_local = self.max_direct_position_update * torch.tanh(
-                self.direct_position_head(s)
-            )
-            dt_local = dt_local + direct_dt_local
+            # Initialize frames at anchor
+            R = R_anchor.clone()
+            t = t_anchor.clone()
 
-        # ── Basin-reversion contribution ──
-        # Add the gated aligned context-mean displacement.  This is the
-        # dominant eval-legal signal at diffusive timescales; the IPA/Q
-        # residuals above only fine-tune around it.
-        basin_gate_val = None
-        if getattr(self.config, "basin_only_ca", False) and basin_dt_local is not None:
-            # iter_005: the canonical CA translation is EXACTLY the analytic
-            # basin displacement.  The learned frame_update/q_translation
-            # residuals are measured contact noise (they move CAs in internal
-            # directions context cannot predict), so they are removed from the
-            # CA position entirely.  gate is pinned to 1.0.
-            basin_gate_val = torch.ones(
-                B, L, 1, device=device, dtype=basin_dt_local.dtype
-            )
-            dt_local = basin_dt_local
-        elif basin_dt_local is not None:
-            gate_in = torch.cat([h_frozen, q_dynamics], dim=-1)
-            basin_gate_val = torch.sigmoid(self.basin_gate(gate_in))  # [B, L, 1]
-            dt_local = dt_local + basin_gate_val * basin_dt_local
+            # Process through IPA blocks (refines orientation on anchor-positioned frames)
+            for block, norm, transition in zip(self.ipa_blocks, self.layer_norms, self.transitions):
+                s_residual, _ = block(s, R, t, residue_mask)
+                s = norm(s + self.dropout(s_residual))
+                s = s + transition(s)
 
-        # Apply frame update: R_new = R_anchor @ R_update
-        R_update = rotation_matrix_from_quaternion(dq)
-        R = R_anchor @ R_update
+            # ── Anchor-local internal displacement (the ONE positional path) ──
+            # d_local is bounded component-wise and expressed in each residue's
+            # anchor-local frame; H (the invariant state) is responsible for it.
+            # Applied as X_hat = R_anchor @ d_local + t_anchor below.
+            d_local = self.max_local_position_update * torch.tanh(
+                self.local_position_head(s)
+            )                                          # [B, L, 3]
 
-        # Apply translation update (in local anchor frame)
-        dt_global = (R_anchor @ dt_local.unsqueeze(-1)).squeeze(-1)
-        t = t + dt_global  # residual on top of coarse positioning
+            # Orientation update (quaternion), composed onto the anchor frame.
+            dq = self.frame_update(s)
+            R_update = rotation_matrix_from_quaternion(dq)
+            R = R_anchor @ R_update
+
+            # Equivariant placement: local -> global via the anchor rotation basis.
+            dt_global = (R_anchor @ d_local.unsqueeze(-1)).squeeze(-1)
+            t = t + dt_global
+            x_internal_out = None
 
         # Predict torsions
         torsion_logits = self.torsion_head(s)
@@ -869,11 +871,8 @@ class StructureDecoder(nn.Module):
         return {
             "R": R,
             "t": t,
-            "delta_com_local": delta_com_local,
-            "translation_update_local": dt_local,
-            "q_translation_update_local": q_dt_local,
-            "direct_translation_update_local": direct_dt_local,
-            "basin_gate": basin_gate_val,
+            "local_position_update_local": d_local,
+            "translation_update_local": d_local,   # alias (legacy name)
             "torsion_logits": torsion_logits,
             "torsions": torsions,
             "backbone_direct": backbone_direct,    # frame-only, clean gradient
@@ -887,7 +886,97 @@ class StructureDecoder(nn.Module):
             "C": C_direct,
             "O": O_direct,
             "single_repr": s,
+            "x_internal": x_internal_out,          # anchor-free canonical coords (or None)
         }
+
+
+    @staticmethod
+    def _coil_prior(L: int, dtype, device) -> torch.Tensor:
+        """Deterministic compact chain prior [L, 3] with CA-CA ≈ 3.8 Å.
+
+        A self-avoiding random-walk coil: each step picks the direction, among a
+        fixed set of candidates, that points most away from the chain centroid
+        while keeping the bond length fixed.  This gives a globular-ish chain
+        whose extent grows like sqrt(L) rather than L, so long proteins do not
+        start as 100s-of-Å rods.  Cached per (L, dtype, device).
+        """
+        key = (L, dtype, device)
+        cache = getattr(StructureDecoder, "_coil_cache", None)
+        if cache is None:
+            cache = {}
+            StructureDecoder._coil_cache = cache
+        if key in cache:
+            return cache[key]
+
+        bond = 3.8
+        # Deterministic direction candidates (unit vectors) on a Fibonacci sphere.
+        n_dir = 32
+        k = torch.arange(n_dir, dtype=torch.float64)
+        golden = (1 + 5 ** 0.5) / 2
+        z = 1 - 2 * (k + 0.5) / n_dir
+        r = torch.sqrt(torch.clamp(1 - z * z, min=0.0))
+        theta = 2 * math.pi * k / golden
+        dirs = torch.stack([r * torch.cos(theta), r * torch.sin(theta), z], -1)
+        dirs = dirs.to(dtype=dtype, device=device)             # [n_dir, 3]
+
+        pts = torch.zeros(L, 3, dtype=dtype, device=device)
+        rng = torch.Generator(device="cpu").manual_seed(1234 + L)
+        # Self-avoiding walk: at each step pick the candidate whose endpoint is
+        # FARTHEST from all existing atoms (capped to a local window for speed).
+        # This folds the chain back on itself instead of shooting outward, giving
+        # a real protein-like globule with Rg ~ bond * sqrt(L).
+        for i in range(1, L):
+            cand = pts[i - 1].unsqueeze(0) + bond * dirs        # [n_dir, 3]
+            window = pts[:i]                                    # [i, 3]
+            if i > 64:                                          # local window
+                window = window[-64:]
+            # distance from each candidate to each existing atom
+            d = torch.cdist(cand, window)                       # [n_dir, w]
+            min_d = d.min(dim=1).values                         # [n_dir]
+            noise = (torch.randn(n_dir, generator=rng).to(dtype=dtype, device=device)
+                     * 0.05)
+            score = min_d + noise
+            pts[i] = cand[int(torch.argmax(score))]
+        pts = pts - pts.mean(dim=0, keepdim=True)
+        cache[key] = pts
+        return pts
+
+    @staticmethod
+    def _masked_centroid(
+        t: torch.Tensor, residue_mask: torch.Tensor | None
+    ) -> torch.Tensor:
+        """Masked mean over residues of [B, L, 3] -> [B, 1, 3] (broadcastable)."""
+        if residue_mask is None:
+            return t.mean(dim=1, keepdim=True)
+        m = residue_mask.to(t.dtype).unsqueeze(-1)       # [B, L, 1]
+        denom = m.sum(dim=1, keepdim=True).clamp_min(1.0)
+        return (t * m).sum(dim=1, keepdim=True) / denom  # [B, 1, 3]
+
+    @staticmethod
+    def _reference_rotation(
+        R_anchor: torch.Tensor, residue_mask: torch.Tensor | None
+    ) -> torch.Tensor:
+        """Pick a single canonical rotation per batch element from R_anchor.
+
+        Uses the first VALID residue's frame as the shared canonical basis so
+        the decoded internal structure is placed consistently with the anchor's
+        global orientation (equivariance), while all residues share ONE basis
+        (so the predicted internal coordinates form a real structure rather than
+        per-residue anchored offsets).
+
+        Returns [B, 3, 3].
+        """
+        B, L = R_anchor.shape[:2]
+        if residue_mask is None:
+            return R_anchor[:, 0]
+        # index of first valid residue per batch (fallback to 0)
+        valid = residue_mask.to(torch.int32)             # [B, L]
+        has_valid = valid.sum(dim=1) > 0
+        first_idx = torch.argmax(valid, dim=1)           # [B]
+        first_idx = torch.where(has_valid, first_idx,
+                                torch.zeros_like(first_idx))
+        ar = torch.arange(B, device=R_anchor.device)
+        return R_anchor[ar, first_idx]                   # [B, 3, 3]
 
 
 def _torsion_logits_to_angles(logits: torch.Tensor) -> torch.Tensor:

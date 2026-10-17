@@ -1,6 +1,0 @@
-{"protein_id": "1b4uB00", "L": 256, "base_temperature": 320.0, "intervention_temperature": 320.0, "horizon_ps": 32000.0, "q_norm": NaN, "q_diff_from_oracle": NaN}
-{"protein_id": "1b4uB00", "L": 256, "base_temperature": 320.0, "intervention_temperature": 379.0, "horizon_ps": 32000.0, "q_norm": NaN, "q_diff_from_oracle": NaN}
-{"protein_id": "1b4uB00", "L": 256, "base_temperature": 320.0, "intervention_temperature": 413.0, "horizon_ps": 32000.0, "q_norm": NaN, "q_diff_from_oracle": NaN}
-{"protein_id": "1b4uB00", "L": 256, "base_temperature": 320.0, "intervention_temperature": 320.0, "horizon_ps": 32000.0, "q_norm": NaN, "q_diff_from_oracle": NaN}
-{"protein_id": "1b4uB00", "L": 256, "base_temperature": 320.0, "intervention_temperature": 379.0, "horizon_ps": 32000.0, "q_norm": NaN, "q_diff_from_oracle": NaN}
-{"protein_id": "1b4uB00", "L": 256, "base_temperature": 320.0, "intervention_temperature": 413.0, "horizon_ps": 32000.0, "q_norm": NaN, "q_diff_from_oracle": NaN}

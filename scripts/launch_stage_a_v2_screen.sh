@@ -10,7 +10,7 @@ python -u -m protein_jepa_frame.training.train_stage_a_v2 \
   --steps 3000 --warmup-steps 300 \
   --batch-size 8 --grad-accum 4 --num-workers 10 \
   --history-frames 8 \
-  --temporal-lags 1 2 4 7 \
+  --temporal-lags 0 1 2 4 \
   --recent-frac 0.5 \
   --paired-horizons-frames 8 16 24 32 48 64 96 \
   --lr 3e-4 --encoder-lr-scale 0.2 \

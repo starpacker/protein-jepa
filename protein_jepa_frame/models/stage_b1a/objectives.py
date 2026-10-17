@@ -12,6 +12,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import torch
+import torch.nn.functional as F
 from torch import Tensor
 
 from protein_jepa_frame.models.stage_c.objectives import (
@@ -25,9 +26,16 @@ from protein_jepa_frame.models.stage_c.objectives import (
 class StageBOracleLossWeights:
     # Oracle decoder sub-weights
     fape_weight: float = 1.0
-    ca_mse_weight: float = 5.0
     torsion_weight: float = 0.5
     distance_weight: float = 0.2
+    # MAIN positional loss: anchor-local internal displacement (SE(3) quotient).
+    # The decoder's only positional path is X_hat = R_anchor @ d_local + t_anchor,
+    # so this supervises exactly what the state (H_t) is responsible for.
+    relative_disp_weight: float = 5.0
+    # DIAGNOSTIC only.  Kabsch-aligned absolute CA MSE mixes the anchor's
+    # rigid-body role with H's internal role and rewards memorising the global
+    # pose; it is logged but must NOT drive training (default weight 0).
+    ca_mse_weight: float = 0.0
 
     # Physical future probe
     phys_future_weight: float = 1.0     # λ_pred
@@ -56,6 +64,7 @@ class StageBOracleLossComponents:
     oracle_ca_mse: Tensor
     oracle_torsion: Tensor
     oracle_dist: Tensor
+    oracle_relative_disp: Tensor
     phys_torsion: Tensor
     phys_dist: Tensor
     phys_contact: Tensor
@@ -68,6 +77,7 @@ class StageBOracleLossComponents:
             "b1a/oracle_ca_mse": self.oracle_ca_mse.item(),
             "b1a/oracle_torsion": self.oracle_torsion.item(),
             "b1a/oracle_dist": self.oracle_dist.item(),
+            "b1a/oracle_relative_disp": self.oracle_relative_disp.item(),
             "b1a/phys_torsion": self.phys_torsion.item(),
             "b1a/phys_dist": self.phys_dist.item(),
             "b1a/phys_contact": self.phys_contact.item(),
@@ -115,13 +125,15 @@ def _kabsch_rotation(
     # Cross-covariance H = P^T T  -> [B, 3, 3]
     H = torch.einsum("bni,bnj->bij", p, t)
     U, S, Vh = torch.linalg.svd(H)
-    V = Vh.transpose(-1, -2)
+    # Coordinates are row vectors and the loss applies ``p @ R``.  Therefore
+    # the Kabsch rotation is U @ D @ Vh (the V @ U^T form is the column-vector
+    # convention and leaves a large rigid-body residual here).
     # Correct for reflection so det(R) == +1.
-    d = torch.sign(torch.linalg.det(torch.bmm(V, U.transpose(-1, -2))))
+    d = torch.sign(torch.linalg.det(torch.bmm(U, Vh)))
     d = torch.where(d == 0, torch.ones_like(d), d)
     D = torch.eye(3, device=pred.device, dtype=pred.dtype).unsqueeze(0).expand_as(H).clone()
     D[:, 2, 2] = d
-    R = torch.bmm(V, torch.bmm(D, U.transpose(-1, -2)))
+    R = torch.bmm(U, torch.bmm(D, Vh))
     return R
 
 
@@ -135,6 +147,11 @@ def kabsch_ca_mse_loss(
     Unlike ``fape_loss`` this is not normalised by L², so each residue
     contributes a full-magnitude gradient.  This gives the oracle decoder a
     clean, direct H→CA signal instead of the diluted FAPE path.
+
+    DIAGNOSTIC ONLY in B1a.  It mixes the anchor's rigid-body role with H's
+    internal role (the anchor fixes the global pose), so it must not be used as
+    a training objective — see STAGE_AB_REDESIGN_PLAN.md §2.0.0.  The training
+    objective is the anchor-local displacement (`relative_disp`).
     """
     if pred_ca.shape != target_ca.shape or pred_ca.shape[-1] != 3:
         raise ValueError("pred_ca and target_ca must both be [B, L, 3]")
@@ -185,12 +202,20 @@ def compute_stage_b1a_loss(
     H_anchor: Tensor,             # [B, L, dH]  frozen Stage A reference H (stop_grad)
 
     weights: StageBOracleLossWeights,
+    target_delta_local: Tensor | None = None,  # [B, L, 3], Kabsch-aligned
     target_atom_mask: Tensor | None = None,  # [B, L, 4]
     future_torsion_valid_mask: Tensor | None = None,  # [B,L,7] shared angle mask
     torsion_mask: Tensor | None = None,  # [3] bool; slots with real targets
     torsion_valid_mask: Tensor | None = None,  # [B,L,7] atom/chain validity
 ) -> StageBOracleLossComponents:
-    """Compute the composite Stage B1a calibration loss."""
+    """Compute the composite Stage B1a calibration loss.
+
+    Main positional term is the anchor-local internal displacement
+    ``L_relative_disp`` (SE(3) quotient): the decoder's only positional path is
+    ``X_hat = R_anchor @ d_local + t_anchor``, so this supervises exactly the
+    invariant, H-owned part.  ``L_ca_mse`` (Kabsch-aligned absolute CA) is a
+    DIAGNOSTIC logged for reference; its training weight defaults to 0.
+    """
     weights.validate()
     dev = H_current.device
 
@@ -230,16 +255,48 @@ def compute_stage_b1a_loss(
         pred_ca_pos = pred_backbone[:, :, 1, :]          # [B, L, 3]
         target_ca_pos = target_backbone_coords[:, :, 1, :]  # [B, L, 3]
         L_dist = pairwise_distance_loss(pred_ca_pos, target_ca_pos, mask=residue_mask)
-        L_ca_mse = kabsch_ca_mse_loss(pred_ca_pos, target_ca_pos, mask=residue_mask)
+        # Kabsch-aligned absolute CA MSE.  This is the natural positional target
+        # for the ANCHOR-FREE decoder (H predicts the whole internal cloud, the
+        # anchor is only a post-hoc rigid placement, so a Kabsch-aligned absolute
+        # CA loss supervises exactly H's output and is invariant to the anchor's
+        # rigid pose).  When ca_mse_weight == 0 it stays a detached diagnostic,
+        # preserving the old anchor-anchored behaviour.
+        if weights.ca_mse_weight > 0.0:
+            L_ca_mse = kabsch_ca_mse_loss(pred_ca_pos, target_ca_pos, mask=residue_mask)
+        else:
+            with torch.no_grad():
+                L_ca_mse = kabsch_ca_mse_loss(pred_ca_pos, target_ca_pos, mask=residue_mask)
     else:
         L_dist = _zero()
         L_ca_mse = _zero()
 
+    # ── MAIN positional loss: anchor-local internal displacement ─────────────
+    # The decoder's local displacement is applied as R_anchor @ d_local.  The
+    # target is Kabsch-aligned to the anchor first, so this asks H for internal
+    # conformational change only — never the global rigid-body motion (which is
+    # the anchor's job).
+    pred_delta_local = decoder_out.get("local_position_update_local")
+    if pred_delta_local is None:
+        pred_delta_local = decoder_out.get("translation_update_local")
+    if pred_delta_local is not None and target_delta_local is not None:
+        m = residue_mask.to(pred_delta_local.dtype).unsqueeze(-1)
+        L_relative_disp = F.smooth_l1_loss(
+            pred_delta_local,
+            target_delta_local.detach(),
+            reduction="none",
+        )
+        L_relative_disp = (L_relative_disp * m).sum() / (
+            m.sum() * 3.0 + weights.eps
+        )
+    else:
+        L_relative_disp = _zero()
+
     L_oracle = (
         weights.fape_weight * L_fape
-        + weights.ca_mse_weight * L_ca_mse
         + weights.torsion_weight * L_torsion
         + weights.distance_weight * L_dist
+        + weights.relative_disp_weight * L_relative_disp
+        + weights.ca_mse_weight * L_ca_mse
     )
 
     # ── Physical future probe losses ─────────────────────────────────────────
@@ -295,6 +352,7 @@ def compute_stage_b1a_loss(
         oracle_ca_mse=L_ca_mse.detach(),
         oracle_torsion=L_torsion.detach(),
         oracle_dist=L_dist.detach(),
+        oracle_relative_disp=L_relative_disp.detach(),
         phys_torsion=L_phys_tor.detach(),
         phys_dist=L_phys_dist.detach(),
         phys_contact=L_phys_contact.detach(),

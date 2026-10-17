@@ -50,11 +50,23 @@ class StageB1bConfig:
 
     reference_temperature_k: float = 348.0
 
-    # Bath parameter scales (static, (T,c)-conditioned)
-    diffusion_scale: float = 1.0e-4     # overall scale of D
+    # Bath parameter scales (static, (T,c)-conditioned).
+    # Calibrated against the measured per-dim H innovation variance (~0.078 at
+    # 1 ns on mdCATH): R = 2hD should be O(0.1-0.2).  The real prior bug was NOT
+    # D but C: the bath's contribution to V = R + B_h P B_h^T is *quadratic* in
+    # C (B_h = h*C), so with C initialised at ~0 its gradient w.r.t. C is exactly
+    # zero and it can never grow.  We therefore initialise C at a value where
+    # B_h P B_h^T is the same order as R, giving a non-zero gradient at step 0.
+    diffusion_scale: float = 1.0e-4     # R_init = 2hD ~ 0.2 (true innovation var ~0.078)
     coupling_scale: float = 1.0e-3      # overall scale of C
-    gamma_scale: float = 1.0            # overall scale of Gamma
-    gamma_floor: float = 0.05           # minimum bath relaxation rate
+    c_init_std: float = 1.0e-1          # C output init std: C_init ~ coupling_scale*std ~1e-4
+    # The bath time update uses the Euler discretisation A = 1 - h*Gamma, which
+    # is only stable for h*Gamma < 1 (otherwise A < 0 and P oscillates/explodes).
+    # With h = 1000 ps the OLD gamma_floor=0.05 gave A = 1 - 50 = -49: the bath
+    # covariance blew up (bath/R ~ 2e4).  Scale Gamma so h*Gamma stays in (0,1):
+    # Gamma ~ 1e-4 -> A ~ 0.9, stable with a steady-state P_ss ~ O(1).
+    gamma_scale: float = 2.0e-4         # softplus output scaled so h*Gamma < 1
+    gamma_floor: float = 2.0e-5         # minimum rate: h*gamma_floor = 0.02
 
     # History posterior
     history_hidden: int = 128
@@ -186,7 +198,10 @@ class StaticBathParams(nn.Module):
         if cfg.use_bath:
             self.gamma_net = nn.Sequential(nn.Linear(hid, hid), nn.SiLU(), nn.Linear(hid, dS))
             self.c_net = nn.Sequential(nn.Linear(hid, hid), nn.SiLU(), nn.Linear(hid, d * dS))
-            nn.init.normal_(self.c_net[-1].weight, std=1e-3)
+            # Non-zero init is essential: the bath term B_h P B_h^T is quadratic
+            # in C, so C=0 gives zero gradient forever.  Start at O(c_init_std)
+            # so the bath contributes at the same order as R from step 0.
+            nn.init.normal_(self.c_net[-1].weight, std=float(getattr(cfg, "c_init_std", 1e-1)))
             nn.init.zeros_(self.c_net[-1].bias)
         # Bias D toward diffusion_scale and Gamma toward 1 at init.
         nn.init.zeros_(self.d_net[-1].weight); nn.init.zeros_(self.d_net[-1].bias)
@@ -441,6 +456,8 @@ class StageB1b(nn.Module):
         B_h = h * C                                               # [B,L,dH,dS]
         R_mat = torch.diag_embed(R)                               # [B,L,dH,dH]
         I_dS = torch.eye(dS, device=device, dtype=dtype).expand(B, L, dS, dS)
+        innov_whitened = [] if return_diagnostics else None
+        bath_ratios = [] if return_diagnostics else None
 
         # Initial bath posterior from history network.
         m0, chol0 = self.history_posterior(H_hist, dt_hist, temperature_k, residue_mask)
@@ -458,16 +475,54 @@ class StageB1b(nn.Module):
 
             # Innovation covariance V = R + B_h P B_h^T   [B,L,dH,dH]
             BP = torch.einsum("blij,bljk->blik", B_h, P_n)        # [B,L,dH,dS]
-            V = R_mat + torch.einsum("blik,bljk->blij", BP, B_h)  # [B,L,dH,dH]
+            bath_cov = torch.einsum("blik,bljk->blij", BP, B_h)   # [B,L,dH,dH]
+            V = R_mat + bath_cov                                  # [B,L,dH,dH]
             V = 0.5 * (V + V.transpose(-1, -2))                   # symmetrise
+            if return_diagnostics:
+                # Ratio of the bath's mean diagonal contribution to R's: should be
+                # O(1) for the bath to matter.  ~0 => bath is numerically dead.
+                bd = torch.diagonal(bath_cov, dim1=-2, dim2=-1).mean()
+                rd = R.mean().clamp_min(1e-12)
+                bath_ratios.append(float((bd / rd).detach()))
 
-            # Cholesky solve/logdet (no explicit inverse)
-            V_j = V + cfg.jitter * torch.eye(d, device=device, dtype=dtype)
-            Lc, info = torch.linalg.cholesky_ex(V_j)
-            if (info != 0).any():
+            # Cholesky solve/logdet (no explicit inverse).
+            # V is PSD in exact arithmetic, but in practice its diagonal spans
+            # many orders of magnitude (R = 2hD can be ~0 while B_h P B_h^T is
+            # large), so a fixed jitter is meaningless.  Use a TRACE-RELATIVE
+            # jitter and escalate multiplicatively until the factorisation
+            # succeeds, then fall back to eigen-clamping.  Never raise: a step
+            # that cannot be factorised contributes zero NLL instead of killing
+            # the run.
+            V = torch.nan_to_num(V, nan=0.0, posinf=0.0, neginf=0.0)
+            eye_d = torch.eye(d, device=device, dtype=dtype)
+            tr = V.diagonal(dim1=-2, dim2=-1).abs().sum(-1) / d          # [B,L] mean diag
+            base = tr.clamp_min(1.0).unsqueeze(-1).unsqueeze(-1)         # [B,L,1,1]
+            Lc, info = None, None
+            for mult in (1e-6, 1e-5, 1e-4, 1e-3, 1e-2, 1e-1, 1.0):
+                V_j = V + (mult * base) * eye_d
+                Lc, info = torch.linalg.cholesky_ex(V_j)
+                if not (info != 0).any():
+                    break
                 jitter_hits += int((info != 0).sum().item())
-                V_j = V_j + 1e-3 * torch.eye(d, device=device, dtype=dtype)
-                Lc = torch.linalg.cholesky(V_j)
+            if (info != 0).any():
+                # Eigen-clamp: floor eigenvalues at (mult*mean diag).
+                evals, evecs = torch.linalg.eigh(V)
+                floor = (1e-6 * base).squeeze(-1).squeeze(-1).unsqueeze(-1)  # [B,L,1]
+                evals = torch.nan_to_num(evals, nan=0.0).clamp_min(floor)
+                V_j = torch.einsum("blij,blj,blkj->blik", evecs, evals, evecs)
+                V_j = 0.5 * (V_j + V_j.transpose(-1, -2))
+                # keep escalating until even the clamped matrix factors
+                for mult in (0.0, 1e-6, 1e-4, 1e-2, 1e-1, 1.0):
+                    V_js = V_j + (mult * base) * eye_d
+                    Lc, info = torch.linalg.cholesky_ex(V_js)
+                    if not (info != 0).any():
+                        V_j = V_js
+                        break
+                if (info != 0).any():
+                    # Give up on this step: zero contribution, identity factor.
+                    V_j = base.squeeze(-1).expand(B, L, d) * eye_d
+                    Lc = torch.linalg.cholesky(V_j)
+
             # quad = e^T V^-1 e via triangular solve
             e_col = e.unsqueeze(-1)                               # [B,L,dH,1]
             sol = torch.cholesky_solve(e_col, Lc)                 # V^-1 e
@@ -475,6 +530,11 @@ class StageB1b(nn.Module):
             logdetV = 2.0 * torch.log(torch.diagonal(Lc, dim1=-2, dim2=-1)).sum(-1)  # [B,L]
             step_nll = 0.5 * (quad + logdetV + d * log2pi)
             total_nll = total_nll + (step_nll * residue_mask.float()).sum()
+
+            if return_diagnostics:
+                # Whitened innovation ev = Lc^{-1} e, which should be ~N(0, I_dH).
+                ev = torch.linalg.solve_triangular(Lc, e_col, upper=False)[..., 0]  # [B,L,dH]
+                innov_whitened.append(ev.detach())
 
             # Joseph covariance update of the bath posterior.
             # K = P B_h^T V^-1   [B,L,dS,dH]
@@ -496,7 +556,13 @@ class StageB1b(nn.Module):
             P_n = 0.5 * (P_n + P_n.transpose(-1, -2))
 
         if return_diagnostics:
-            return total_nll, {"jitter_hits": jitter_hits}
+            diag = {"jitter_hits": jitter_hits}
+            if innov_whitened:
+                # [N, B, L, dH] stacked whitened innovations
+                diag["innov_whitened"] = torch.stack(innov_whitened, dim=0)
+            if bath_ratios:
+                diag["bath_ratio"] = float(sum(bath_ratios) / len(bath_ratios))
+            return total_nll, diag
         return total_nll
 
     # -- Deployment rollout (sampling) ---------------------------------------

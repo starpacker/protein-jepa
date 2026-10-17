@@ -162,18 +162,17 @@ def test_decoder_forward_produces_valid_openfold_atom37():
     torch.manual_seed(0)
     B, L = 2, 5
     cfg = DecoderConfig(c_hidden=32, c_ipa=16, n_heads=2, n_ipa_blocks=1,
-                        context_dim=16, q_dim=8)
+                        q_dim=16)
     dec = StructureDecoder(cfg)
     aatype = torch.randint(0, 20, (B, L))
-    h = torch.randn(B, L, 16)
-    q = torch.randn(B, L, 8)
+    q = torch.randn(B, L, 16)
     base = torch.arange(L).view(1, L, 1) * 3.8
     N = base + 0.1 * torch.randn(B, L, 3)
     CA = base + 0.1 * torch.randn(B, L, 3)
     C = base + 0.1 * torch.randn(B, L, 3)
     R0, t0 = RigidBodyFrame.from_backbone(N, CA, C)
 
-    out = dec(aatype, h, q, R0, t0)
+    out = dec(aatype, q, R0, t0)
     assert out["atom37_coords"].shape == (B, L, 37, 3)
     assert out["atom37_mask"].shape == (B, L, 37)
     assert out["atom37_mask"].any()
@@ -194,19 +193,19 @@ def test_gradients_flow_through_openfold_atom37():
     torch.manual_seed(0)
     B, L = 2, 5
     cfg = DecoderConfig(c_hidden=32, c_ipa=16, n_heads=2, n_ipa_blocks=1,
-                        context_dim=16, q_dim=8)
+                        q_dim=16)
     dec = StructureDecoder(cfg)
     aatype = torch.randint(0, 20, (B, L))
-    h = torch.randn(B, L, 16)
-    q = torch.randn(B, L, 8)
+    q = torch.randn(B, L, 16)
     base = torch.arange(L, dtype=torch.float32).view(1, L, 1) * 3.8
     N = base + 0.1 * torch.randn(B, L, 3)
     CA = base + 0.1 * torch.randn(B, L, 3)
     C = base + 0.1 * torch.randn(B, L, 3)
     R0, t0 = RigidBodyFrame.from_backbone(N, CA, C)
 
-    out = dec(aatype, h, q, R0, t0)
+    out = dec(aatype, q, R0, t0)
     out["atom37_coords"].sum().backward()
     assert dec.torsion_head.net[2].weight.grad is not None
     assert dec.torsion_head.net[2].weight.grad.abs().sum() > 0
-    assert dec.frame_update.trans_net[-1].weight.grad is not None
+    assert dec.local_position_head[-1].weight.grad is not None
+    assert dec.local_position_head[-1].weight.grad.abs().sum() > 0
