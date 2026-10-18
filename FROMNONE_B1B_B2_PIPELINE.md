@@ -127,3 +127,49 @@ held-out-protein selection protocol.
 - `Kabsch` vectorised (ns=96 step: 27s → 3s).
 - Learning confirmed: `val/skill` rose 0.0003 → 0.030 over ~300 steps.
 - Existing kernel files: additions are opt-in (defaults preserve legacy behaviour).
+
+---
+
+## Status & early results (2026-10-18)
+
+Two real runs launched (30k steps each), in the background:
+
+| run | GPU | split | selection | log |
+|---|---|---|---|---|
+| `artifacts/fromnone/stage_cb1b_main` | 4 | held-out protein | `val.jsonl` | `logs/fromnone_main.nohup` |
+| `artifacts/fromnone/stage_cb1b_temp` | 5 | held-out temperature (T=450) | `val_not450.jsonl` | `logs/fromnone_temp.nohup` |
+
+Monitor with `bash scripts/fromnone_status.sh`.
+
+### Selection skill (`1 - ca/persist`, >0 beats persistence)
+
+**Held-out protein (main)** — rising and stable:
+`0.004 → 0.005 → 0.008 → 0.009 → 0.014 → 0.012` (steps 500–3500)
+
+**Held-out temperature (temp)** — rising:
+`0.0036 → 0.0042 → 0.0045 → 0.0063 → 0.0073` (steps 500–3000)
+
+### Held-out-protein eval (`run_eval_fromnone`, best checkpoint, Kabsch CA RMSD Å)
+
+| horizon (ns) | persist | from-none | skill (Å) | contact Jaccard | persist J |
+|---:|---:|---:|---:|---:|---:|
+| 1  | 3.857 | 3.797 | **+0.060** | 0.781 | 0.792 |
+| 4  | 4.979 | 4.887 | **+0.092** | 0.737 | 0.744 |
+| 16 | 6.184 | 6.044 | **+0.140** | 0.699 | 0.702 |
+
+The margin **grows with horizon**, which is the expected signature of a model
+that adds real information over "do nothing".
+
+### Diagnostic: where is the ceiling?
+
+Oracle-H probe (true future H -> decoder) vs autonomous rollout vs persistence:
+
+| horizon (ns) | persist | oracle-H | autonomous |
+|---:|---:|---:|---:|
+| 4  | 3.972 | 3.950 | 3.951 |
+| 16 | 4.923 | 4.889 | 4.889 |
+
+`oracle-H ≈ autonomous` → the dynamics rollout is already near the decoder's
+upper bound at these horizons; the remaining limit is the **decoder/representation**,
+not the GLE rollout. This is consistent with the known difficulty of mdCATH
+4–16 ns (small drift, strong persistence). Longer horizons widen the gap.
