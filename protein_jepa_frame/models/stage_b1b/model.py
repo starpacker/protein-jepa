@@ -1,10 +1,10 @@
-"""Stage B1b: GLE dynamics in H space with Kalman innovation NLL.
+"""Autonomous H/S dynamics with a separate diagnostic Kalman likelihood.
 
 Implements STAGE_ABC_REDESIGN_PLAN.md 2.2-2.4:
   - HSpaceEnergy:     scalar U(H;T,c), force = -grad U via autograd
-  - StaticBathParams: D, C, Gamma depend only on (T, c), not on H
+  - StaticBathParams: D, C, Gamma depend on T and a fixed observed anchor feature
   - HistoryPosterior: causal GRU -> (m_0, chol_P_0) for bath initialisation
-  - StageB1b:         Kalman innovation NLL with Joseph covariance update
+  - StageB1b:         differentiable autonomous sampling, diagnostic Kalman NLL
   - sample_step:      single-step Euler sampler (training/deployment identical)
 
 Stop-grad contract (2.2):
@@ -60,12 +60,12 @@ class StageB1bConfig:
     diffusion_scale: float = 1.0e-4     # R_init = 2hD ~ 0.2 (true innovation var ~0.078)
     coupling_scale: float = 1.0e-3      # overall scale of C
     c_init_std: float = 1.0e-1          # C output init std: C_init ~ coupling_scale*std ~1e-4
-    # The bath time update uses the Euler discretisation A = 1 - h*Gamma, which
-    # is only stable for h*Gamma < 1 (otherwise A < 0 and P oscillates/explodes).
+    # The isolated bath Euler update A=1-h*Gamma is stable for 0<h*Gamma<2.
+    # Negative A may oscillate without diverging. Coupled stability is stricter.
     # With h = 1000 ps the OLD gamma_floor=0.05 gave A = 1 - 50 = -49: the bath
     # covariance blew up (bath/R ~ 2e4).  Scale Gamma so h*Gamma stays in (0,1):
     # Gamma ~ 1e-4 -> A ~ 0.9, stable with a steady-state P_ss ~ O(1).
-    gamma_scale: float = 2.0e-4         # softplus output scaled so h*Gamma < 1
+    gamma_scale: float = 2.0e-4
     gamma_floor: float = 2.0e-5         # minimum rate: h*gamma_floor = 0.02
 
     # History posterior
@@ -78,6 +78,29 @@ class StageB1bConfig:
 
     # Numerical jitter added to covariances for Cholesky stability
     jitter: float = 1.0e-6
+    # Bounds the isolated bath Euler factor. Coupled stability still requires
+    # held-out autonomous rollouts; this bound alone is not a stability proof.
+    max_gamma_step: float | None = None  # legacy configs retain their original kernel
+    # Optional elementwise clamp on the force magnitude |f| before it is scaled
+    # by h*D in the drift.  A fresh (untrained) energy can emit large gradients,
+    # and with h=1000 ps the drift h*D*f diverges within a few Euler steps.  The
+    # clamp keeps the one-step update bounded so from-scratch rollouts are stable;
+    # None preserves the legacy unbounded kernel exactly.
+    force_clip: float | None = None
+    # Quadratic-tail coefficient initialisation (see HSpaceEnergy).  Default 1e-3
+    # is the legacy value; a larger init (e.g. 1.0) makes an untrained from-none
+    # rollout mean-reverting.
+    tail_init: float = 1.0e-3
+
+    def __post_init__(self):
+        if self.latent_dim < 1 or self.bath_dim < 0:
+            raise ValueError("latent_dim must be positive and bath_dim nonnegative")
+        for name in ("step_ps", "diffusion_scale", "gamma_scale", "gamma_floor"):
+            if not math.isfinite(getattr(self, name)) or getattr(self, name) <= 0:
+                raise ValueError(f"{name} must be finite and positive")
+        if self.max_gamma_step is not None:
+            if not 0 < self.max_gamma_step < 2:
+                raise ValueError("max_gamma_step must lie strictly between 0 and 2")
 
     @property
     def use_bath(self) -> bool:
@@ -122,8 +145,12 @@ class HSpaceEnergy(nn.Module):
         )
         nn.init.normal_(self.energy_head[-1].weight, std=0.01)
         nn.init.zeros_(self.energy_head[-1].bias)
-        # Quadratic tail coefficient (positive via softplus) per channel.
-        self.log_tail = nn.Parameter(torch.full((d,), math.log(math.expm1(1e-3))))
+        # Quadratic tail coefficient (positive via softplus) per channel.  A
+        # larger init gives an immediate restoring force, which keeps the Euler
+        # rollout mean-reverting when the residual energy is untrained (from-none
+        # training).  Default 1e-3 preserves the legacy kernel behaviour.
+        tail0 = float(getattr(cfg, "tail_init", 1e-3))
+        self.log_tail = nn.Parameter(torch.full((d,), math.log(math.expm1(max(tail0, 1e-12)))))
 
     def _temp_feature(self, temperature_k, B, device, dtype) -> torch.Tensor:
         if temperature_k is None:
@@ -164,18 +191,17 @@ class HSpaceEnergy(nn.Module):
 
 
 # -----------------------------------------------------------------------------
-# Static bath parameters: D, C, Gamma conditioned on (T, c) only
+# Bath parameters held fixed throughout a rollout, conditioned on T and H0
 # -----------------------------------------------------------------------------
 
 class StaticBathParams(nn.Module):
     """D (dH diag), Gamma (dS diag), C (dH x dS) per residue.
 
-    Depends only on static conditions -- sequence c (via per-residue H at the
-    anchor frame used as a static sequence feature) and temperature T -- NOT on
-    the evolving H_t.  This avoids Ito divergence terms (2.2).
-
-    To honour "depends on sequence c, not on H_t", the sequence condition is a
-    *detached* per-residue feature; the networks never receive grad-carrying H.
+    The fixed condition is the observed anchor H0 and temperature, not merely
+    amino-acid sequence. The resulting process is explicitly conditioned on its
+    origin conformation. H0 is held fixed, so there are no state-dependent
+    mobility divergence terms within that conditional rollout. Detachment alone
+    would not turn a conformation into a sequence feature.
     D and Gamma are positive diagonals; C is a full per-residue dH x dS matrix.
     """
 
@@ -236,7 +262,17 @@ class StaticBathParams(nn.Module):
             return D, None, None
         dS = self.cfg.bath_dim
         gamma_raw = self.gamma_net(cond)
-        Gamma = self.gamma_floor + self.gamma_scale * F.softplus(gamma_raw)
+        gamma_unbounded = self.gamma_floor + self.gamma_scale * F.softplus(gamma_raw)
+        Gamma = gamma_unbounded
+        if self.cfg.max_gamma_step is not None:
+            gamma_cap = self.cfg.max_gamma_step / self.cfg.step_ps
+            if gamma_cap <= self.gamma_floor:
+                raise ValueError("gamma_floor must be smaller than max_gamma_step / step_ps")
+            # Smooth saturation; old checkpoints without this setting preserve
+            # their original kernel and are diagnostic-only to the new trainer.
+            Gamma = self.gamma_floor + (gamma_cap - self.gamma_floor) * torch.tanh(
+                (gamma_unbounded - self.gamma_floor) / (gamma_cap - self.gamma_floor)
+            )
         C = self.coupling_scale * self.c_net(cond).reshape(B, L, self.cfg.latent_dim, dS)
         return D, C, Gamma
 
@@ -322,7 +358,7 @@ class HistoryPosterior(nn.Module):
 # -----------------------------------------------------------------------------
 
 class StageB1b(nn.Module):
-    """H-space GLE dynamics with Kalman innovation NLL.
+    """Autonomous H/S dynamics; Kalman likelihood is diagnostic only.
 
     The encoder is NOT owned here: the training/eval script applies the frozen
     Stage A V2 encoder through the frozen B1a normalizer and passes H already
@@ -352,7 +388,11 @@ class StageB1b(nn.Module):
                 U, H_g, grad_outputs=torch.ones_like(U),
                 create_graph=create_graph, retain_graph=create_graph,
             )
-        return -grad * residue_mask.unsqueeze(-1).float()
+        f = -grad * residue_mask.unsqueeze(-1).float()
+        if self.cfg.force_clip is not None:
+            c = float(self.cfg.force_clip)
+            f = c * torch.tanh(f / c)
+        return f
 
     # -- Mean one-step drift (used by sampler + Kalman predict) --------------
 
@@ -370,6 +410,7 @@ class StageB1b(nn.Module):
 
     def sample_step(
         self, H, S, residue_mask, temperature_k, seq_feature=None, generator=None,
+        create_graph: bool = False,
     ):
         """One Euler-Maruyama step of the GLE kernel (2.2).
 
@@ -381,7 +422,7 @@ class StageB1b(nn.Module):
         if seq_feature is None:
             seq_feature = H
         D, C, Gamma = self.bath(seq_feature, temperature_k)       # D [B,L,dH]
-        f = self.compute_forces(H, residue_mask, temperature_k, create_graph=False)
+        f = self.compute_forces(H, residue_mask, temperature_k, create_graph=create_graph)
 
         mu_H = self._drift_H(H, f, D, C, S, h)
         noise_H = torch.randn(mu_H.shape, device=H.device, dtype=H.dtype, generator=generator)
@@ -399,13 +440,16 @@ class StageB1b(nn.Module):
         S_next = S_next * residue_mask.unsqueeze(-1).float()
         return H_next, S_next
 
-    # -- Kalman innovation NLL (main training loss, 2.4) ---------------------
+    # -- Diagnostic Kalman innovation NLL; never optimized by the trainer ---
 
     def kalman_nll(
         self, H_hist, dt_hist, H_seq, residue_mask, temperature_k,
         return_diagnostics: bool = False,
     ):
-        """Kalman innovation NLL scoring H_{1:N} | H_{-K+1:0} (2.4).
+        """Diagnostic likelihood scoring H_{1:N} | H_{-K+1:0}.
+
+        This observer-conditioned recursion is for density diagnostics only.
+        Every optimized B1b loss instead scores autonomous history-only samples.
 
         Args:
           H_hist:  [B, K, L, dH]  history frames (stop_grad'ed), for r_psi only.
@@ -421,6 +465,12 @@ class StageB1b(nn.Module):
         cfg = self.cfg
         h = cfg.step_ps
         B, T, L, d = H_seq.shape
+        if H_hist.ndim != 4 or H_hist.shape[0] != B or H_hist.shape[2:] != (L, d):
+            raise ValueError("diagnostic history and sequence shapes must match")
+        if not torch.equal(H_hist[:, -1], H_seq[:, 0]):
+            raise ValueError("diagnostic history must end at the shared H_seq anchor")
+        if dt_hist.shape != H_hist.shape[:2] or not torch.isfinite(dt_hist).all() or not (dt_hist > 0).all():
+            raise ValueError("diagnostic history intervals must be finite and positive")
         N = T - 1
         rmask = residue_mask.unsqueeze(-1).float()               # [B,L,1]
         device, dtype = H_seq.device, H_seq.dtype
@@ -429,19 +479,21 @@ class StageB1b(nn.Module):
         seq_feature = H_seq[:, 0]                                 # [B,L,dH]
         D, C, Gamma = self.bath(seq_feature, temperature_k)
         R = 2.0 * h * D                                           # [B,L,dH] diag of H noise
+        if not torch.isfinite(R).all() or not (R > 0).all():
+            raise FloatingPointError("diagnostic likelihood needs finite positive transition diffusion")
 
         total_nll = H_seq.new_zeros(())
         jitter_hits = 0
 
         if not cfg.use_bath:
             # Diagonal Gaussian: V = R, independent per channel.
-            logdetV = torch.log(R.clamp_min(cfg.jitter)).sum(-1)  # [B,L]
+            logdetV = torch.log(R).sum(-1)                      # [B,L]
             for n in range(N):
                 Hn, Hn1 = H_seq[:, n], H_seq[:, n + 1]
                 f = self.compute_forces(Hn, residue_mask, temperature_k, create_graph=True)
                 mu = Hn + h * D * f
                 e = (Hn1 - mu)                                    # [B,L,dH]
-                quad = (e * e / R.clamp_min(cfg.jitter)).sum(-1)  # [B,L]
+                quad = (e * e / R).sum(-1)                      # [B,L]
                 step_nll = 0.5 * (quad + logdetV + d * math.log(2 * math.pi))
                 total_nll = total_nll + (step_nll * residue_mask.float()).sum()
             if return_diagnostics:
@@ -454,7 +506,8 @@ class StageB1b(nn.Module):
         A_diag = 1.0 - h * Gamma                                  # [B,L,dS]
         W_diag = 2.0 * h * Gamma                                  # [B,L,dS]
         B_h = h * C                                               # [B,L,dH,dS]
-        R_mat = torch.diag_embed(R)                               # [B,L,dH,dH]
+        if not torch.isfinite(R).all() or not (R > 0).all():
+            raise FloatingPointError("diagnostic likelihood needs finite positive transition diffusion")
         I_dS = torch.eye(dS, device=device, dtype=dtype).expand(B, L, dS, dS)
         innov_whitened = [] if return_diagnostics else None
         bath_ratios = [] if return_diagnostics else None
@@ -462,7 +515,7 @@ class StageB1b(nn.Module):
         # Initial bath posterior from history network.
         m0, chol0 = self.history_posterior(H_hist, dt_hist, temperature_k, residue_mask)
         m_n = m0                                                  # [B,L,dS]
-        P_n = chol0 @ chol0.transpose(-1, -2) + cfg.jitter * I_dS  # [B,L,dS,dS]
+        P_n = chol0 @ chol0.transpose(-1, -2)                    # same prior as sampler
 
         log2pi = math.log(2 * math.pi)
         for n in range(N):
@@ -473,73 +526,52 @@ class StageB1b(nn.Module):
             mu = Hn + h * D * f + torch.einsum("blij,blj->bli", B_h, m_n)
             e = Hn1 - mu                                          # [B,L,dH]
 
-            # Innovation covariance V = R + B_h P B_h^T   [B,L,dH,dH]
-            BP = torch.einsum("blij,bljk->blik", B_h, P_n)        # [B,L,dH,dS]
-            bath_cov = torch.einsum("blik,bljk->blij", BP, B_h)   # [B,L,dH,dH]
-            V = R_mat + bath_cov                                  # [B,L,dH,dH]
-            V = 0.5 * (V + V.transpose(-1, -2))                   # symmetrise
+            # V = diag(R) + F F^T, F = B_h chol(P). All solves and
+            # determinants use only dS x dS matrices (Woodbury), avoiding a
+            # dense dH x dH covariance per residue. Numerical failures are
+            # explicit; the diagnostic must not silently score another kernel.
+            Lp, p_info = torch.linalg.cholesky_ex(P_n)
+            if (p_info != 0).any() or not torch.isfinite(Lp).all():
+                raise FloatingPointError("non-positive bath covariance in diagnostic likelihood")
+            F_low = B_h @ Lp
+            invR_F = F_low / R.unsqueeze(-1)
+            middle = I_dS + F_low.transpose(-1, -2) @ invR_F
+            middle = 0.5 * (middle + middle.transpose(-1, -2))
+            Lm, m_info = torch.linalg.cholesky_ex(middle)
+            if (m_info != 0).any() or not torch.isfinite(Lm).all():
+                raise FloatingPointError("nonfinite low-rank innovation covariance")
+
+            def solve_innovation(rhs):
+                invR_rhs = rhs / R.unsqueeze(-1)
+                correction = torch.cholesky_solve(F_low.transpose(-1, -2) @ invR_rhs, Lm)
+                return invR_rhs - invR_F @ correction
+
             if return_diagnostics:
                 # Ratio of the bath's mean diagonal contribution to R's: should be
                 # O(1) for the bath to matter.  ~0 => bath is numerically dead.
-                bd = torch.diagonal(bath_cov, dim1=-2, dim2=-1).mean()
+                bd = F_low.square().sum(-1).mean()
                 rd = R.mean().clamp_min(1e-12)
                 bath_ratios.append(float((bd / rd).detach()))
 
-            # Cholesky solve/logdet (no explicit inverse).
-            # V is PSD in exact arithmetic, but in practice its diagonal spans
-            # many orders of magnitude (R = 2hD can be ~0 while B_h P B_h^T is
-            # large), so a fixed jitter is meaningless.  Use a TRACE-RELATIVE
-            # jitter and escalate multiplicatively until the factorisation
-            # succeeds, then fall back to eigen-clamping.  Never raise: a step
-            # that cannot be factorised contributes zero NLL instead of killing
-            # the run.
-            V = torch.nan_to_num(V, nan=0.0, posinf=0.0, neginf=0.0)
-            eye_d = torch.eye(d, device=device, dtype=dtype)
-            tr = V.diagonal(dim1=-2, dim2=-1).abs().sum(-1) / d          # [B,L] mean diag
-            base = tr.clamp_min(1.0).unsqueeze(-1).unsqueeze(-1)         # [B,L,1,1]
-            Lc, info = None, None
-            for mult in (1e-6, 1e-5, 1e-4, 1e-3, 1e-2, 1e-1, 1.0):
-                V_j = V + (mult * base) * eye_d
-                Lc, info = torch.linalg.cholesky_ex(V_j)
-                if not (info != 0).any():
-                    break
-                jitter_hits += int((info != 0).sum().item())
-            if (info != 0).any():
-                # Eigen-clamp: floor eigenvalues at (mult*mean diag).
-                evals, evecs = torch.linalg.eigh(V)
-                floor = (1e-6 * base).squeeze(-1).squeeze(-1).unsqueeze(-1)  # [B,L,1]
-                evals = torch.nan_to_num(evals, nan=0.0).clamp_min(floor)
-                V_j = torch.einsum("blij,blj,blkj->blik", evecs, evals, evecs)
-                V_j = 0.5 * (V_j + V_j.transpose(-1, -2))
-                # keep escalating until even the clamped matrix factors
-                for mult in (0.0, 1e-6, 1e-4, 1e-2, 1e-1, 1.0):
-                    V_js = V_j + (mult * base) * eye_d
-                    Lc, info = torch.linalg.cholesky_ex(V_js)
-                    if not (info != 0).any():
-                        V_j = V_js
-                        break
-                if (info != 0).any():
-                    # Give up on this step: zero contribution, identity factor.
-                    V_j = base.squeeze(-1).expand(B, L, d) * eye_d
-                    Lc = torch.linalg.cholesky(V_j)
-
-            # quad = e^T V^-1 e via triangular solve
             e_col = e.unsqueeze(-1)                               # [B,L,dH,1]
-            sol = torch.cholesky_solve(e_col, Lc)                 # V^-1 e
+            sol = solve_innovation(e_col)
             quad = (e_col * sol).sum((-1, -2))                    # [B,L]
-            logdetV = 2.0 * torch.log(torch.diagonal(Lc, dim1=-2, dim2=-1)).sum(-1)  # [B,L]
+            logdetV = R.log().sum(-1) + 2*Lm.diagonal(dim1=-2, dim2=-1).log().sum(-1)
             step_nll = 0.5 * (quad + logdetV + d * log2pi)
             total_nll = total_nll + (step_nll * residue_mask.float()).sum()
 
             if return_diagnostics:
-                # Whitened innovation ev = Lc^{-1} e, which should be ~N(0, I_dH).
+                # Dense Cholesky is diagnostic-only to expose a conventional
+                # whitened innovation; it never changes the scored covariance.
+                V = torch.diag_embed(R) + F_low @ F_low.transpose(-1, -2)
+                Lc = torch.linalg.cholesky(V)
                 ev = torch.linalg.solve_triangular(Lc, e_col, upper=False)[..., 0]  # [B,L,dH]
                 innov_whitened.append(ev.detach())
 
             # Joseph covariance update of the bath posterior.
             # K = P B_h^T V^-1   [B,L,dS,dH]
             # cholesky_solve(X, L) solves L L^T K = X; X must be [B,L,dH,*]
-            Vinv_Bh = torch.cholesky_solve(B_h, Lc)                     # V^-1 B_h  [B,L,dH,dS]
+            Vinv_Bh = solve_innovation(B_h)
             K = torch.einsum("blsi,blij->blsj", P_n, Vinv_Bh.transpose(-1, -2))  # [B,L,dS,dH]
             m_plus = m_n + torch.einsum("blsk,blk->bls", K, e)   # [B,L,dS]
             KB = torch.einsum("blsk,blkt->blst", K, B_h)         # [B,L,dS,dS]
@@ -571,6 +603,7 @@ class StageB1b(nn.Module):
         self, H0, residue_mask, temperature_k, n_steps,
         H_hist=None, dt_hist=None, seq_feature=None, generator=None,
         S0=None, detach: bool = True,
+        return_bath: bool = False,
     ):
         """Rollout from H0 for n_steps.
 
@@ -602,9 +635,21 @@ class StageB1b(nn.Module):
                 S = m0 + torch.einsum("blij,blj->bli", chol0, eps)
 
         traj = [H0]
+        bath_traj = [S] if S is not None else None
         H = H0
         for _ in range(n_steps):
-            H, S = self.sample_step(H, S, residue_mask, temperature_k, seq_feature, generator)
+            H, S = self.sample_step(
+                H, S, residue_mask, temperature_k, seq_feature, generator,
+                create_graph=not detach,
+            )
             traj.append(H)
+            if bath_traj is not None:
+                bath_traj.append(S)
         out = torch.stack(traj, dim=1)
-        return out.detach() if detach else out
+        out = out.detach() if detach else out
+        if not return_bath:
+            return out
+        bath_out = torch.stack(bath_traj, dim=1) if bath_traj is not None else None
+        if detach and bath_out is not None:
+            bath_out = bath_out.detach()
+        return out, bath_out
