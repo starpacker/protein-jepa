@@ -63,8 +63,16 @@ def _bootstrap_ci(deltas, n_boot=2000, alpha=0.05, seed=0):
     return [lo, hi]
 
 
-def _build_cond(paired, cond_dim, dev):
-    """Mirror train_stage_ensemble._conditioning for eval (D1)."""
+def _build_cond(paired, cond_dim, dev, *, temp_override=None, temp_drop=False):
+    """Mirror train_stage_ensemble._conditioning for eval (D1).
+
+    TASK 3 (temperature generalization) options:
+        temp_override : float — feed this temperature instead of the true one
+                        ("wrong T" probe).
+        temp_drop     : bool  — replace the temperature slot with its mean
+                        (T=300 -> normalized 0), i.e. the model is asked to
+                        forecast without knowing the temperature ("no T" probe).
+    """
     if cond_dim <= 0:
         return None
     ht = paired.get("horizon_time_ps")
@@ -72,8 +80,13 @@ def _build_cond(paired, cond_dim, dev):
     t_norm = (torch.log(ht.to(dev).clamp_min(1.0)) / torch.log(torch.tensor(1e4, device=dev))
               if ht is not None else torch.zeros(B, device=dev))
     temp = paired.get("temperature_k")
-    T_norm = ((temp.to(dev).float() - 300.0) / 150.0
-              if temp is not None else torch.zeros(B, device=dev))
+    if temp_drop:
+        T_norm = torch.zeros(B, device=dev)
+    elif temp_override is not None:
+        T_norm = torch.full((B,), (float(temp_override) - 300.0) / 150.0, device=dev)
+    else:
+        T_norm = ((temp.to(dev).float() - 300.0) / 150.0
+                  if temp is not None else torch.zeros(B, device=dev))
     parts = [t_norm, T_norm]
     cond = torch.stack(parts[:cond_dim], dim=-1) if cond_dim <= 2 else torch.stack(
         parts + [torch.zeros_like(t_norm)] * (cond_dim - 2), dim=-1)
