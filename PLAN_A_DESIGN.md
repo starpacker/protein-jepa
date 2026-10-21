@@ -74,3 +74,55 @@ python -m scripts.paired_hs_vs_model1 \
   `--freeze-encoder` ablation for a pure-kernel baseline.
 - Kabsch absolute-position accuracy remains the shared weakness (§3.6); the GLE now
   at least does not hurt it (rollout decodes near the anchor rather than diverging).
+
+---
+
+## 7. Dense-trajectory supervision (2026-10-21, follow-up)
+
+**Question:** the rollout produces the whole path `[anchor, H_1, ..., H_T]` (T+1
+frames); are we using all T+1 of them, or only the last?
+
+**Answer (measured):** only the last.  `_rollout_decode` keeps `traj[:, -1]` and
+the loss decodes that single terminal H against a whole-window summary target.
+At H=8 that is **1 of 9 produced frames supervised**; at H=16, **1 of 17**.
+
+### What we now do (`--dense-trajectory`)
+
+Score **every** rollout frame against a *contiguous* future window
+`[anchor, t1, ..., tH]` (so rollout step i ↔ truth frame i), reusing the proven
+from-none loss family so behaviour is identical to the recipe that already
+produced v4e:
+
+| term | weight flag | role |
+|---|---|---|
+| per-step Kabsch CA point loss | `--dense-ca-weight` | beats persistence; clean per-frame encoder gradient |
+| energy score on the CA path | `--dense-es-weight` | distributional / spread (proper scoring rule) |
+| ensemble RMSF | `--dense-rmsf-weight` | match flexibility **amplitude** along the path |
+| ensemble RMSF-r | `--dense-rmsf-corr-weight` | match RMSF **profile shape** (the eval metric) |
+| ensemble variance | `--dense-var-weight` | log-domain variance match |
+
+Why it should help: RMSF / RMSF-r / W2 are *ensemble* metrics — they need the
+cloud of rollouts to spread like the true walk, not just land near one point.
+Dense supervision gives that signal at every step instead of one endpoint.
+
+### Data alignment (required, and the reason for the contiguous loader)
+
+The paired loader returns a FLAT future "window" (H frames at stride H), so step i
+has *no* matching true frame.  Dense mode therefore reuses the from-none
+contiguous protocol (`collate_clips` + `split_contiguous_window`, K+rollout_steps
+frames) so the correspondence is exact.  Trajectories are 40–450 frames, so H up
+to 64 is fully available (`--rollout-steps 64`).
+
+### Train-time safety
+
+- **Terminal-only** run: `run_plan_a_hs_1000dom.sh` (GPU 4) — Plan A, single terminal step.
+- **Dense** run: `run_plan_a_dense_1000dom.sh` (GPU 2) — all steps.
+Both share the same Stage-A init / frozen B1a decoder / GLE kernel; the only
+difference is how much of the rollout path the loss sees.
+
+### Rollback
+
+Everything is additive and flag-gated.  To revert to the previous behaviour:
+drop `--dense-trajectory` (terminal-only Plan A) or drop `--train-encoder`
+(frozen-encoder join).  No existing code path changes when the flags are absent;
+the `H_traj` key added to the producer's return dict is ignored by the old path.

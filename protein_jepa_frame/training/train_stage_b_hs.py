@@ -390,6 +390,8 @@ def _run_batch_dense(producer, paired, args, weights, device, generator=None):
                             device=device)
     ca_path = _decode_path(producer, H_traj, R_a, t_a, aatype, ctx_mask,
                            B, n_samples, L, None, step_idx)   # [B, n, T_sel, L, 3]
+    # The from-none losses expect the sample axis FIRST: [M, B, T, L, 3].
+    ca_path = ca_path.permute(1, 0, 2, 3, 4).contiguous()     # [n_samples, B, T_sel, L, 3]
     true_path = fut[:, step_idx, :, 1, :]                     # [B, T_sel, L, 3]
 
     # (1) per-step Kabsch CA point loss (differentiable; anchored to real positions)
@@ -404,14 +406,14 @@ def _run_batch_dense(producer, paired, args, weights, device, generator=None):
         for b in range(B):
             mb = fmask[b]
             for tis in range(T_sel):
-                smp = ca_path[b, :, tis][:, mb, :].reshape(n_samples, -1)   # [M, Lb*3]
+                smp = ca_path[:, b, tis][:, mb, :].reshape(n_samples, -1)   # [M, Lb*3]
                 tgt = true_path[b, tis][mb, :].reshape(-1)
                 rows.append(energy_score(smp, tgt) / (tgt.numel() ** 0.5))
         es = torch.stack(rows).mean()
 
     # (3) optional ensemble-profile terms on the path (needs M>=2 and T>=2)
     ens_rmsf = ens_rmsf_corr = ens_var = ca_loss.new_zeros(())
-    if ca_path.shape[1] >= 2 and ca_path.shape[2] >= 2:
+    if ca_path.shape[0] >= 2 and ca_path.shape[2] >= 2:
         if args.dense_rmsf_weight > 0:
             ens_rmsf = ensemble_rmsf_loss(ca_path, true_path, fmask)
         if args.dense_rmsf_corr_weight > 0:
@@ -566,6 +568,10 @@ def main():
             num_frames=args.history_frames, paired_all_horizons=False,
             max_residues=args.max_residues,
         )
+        # protocol_from_args reads paired_horizons_frames; None would crash it,
+        # so fall back to the canonical protocol grid when unset.
+        if args.paired_horizons_frames is None:
+            args.paired_horizons_frames = [8, 16, 24, 32, 48, 64, 96]
         protocol = protocol_from_args(args)
         apply_protocol(data_cfg, protocol)
         # Plan A alignment guard: the terminal GLE step should land on the scored

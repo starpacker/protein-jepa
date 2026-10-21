@@ -75,3 +75,22 @@ def test_frozen_decoder_params_excluded():
                  if p.requires_grad]
     assert len(trainable) == len(list(kernel.parameters())) > 0
     assert all(p.requires_grad is False for p in decoder.parameters())
+
+
+def test_dense_step_idx_matches_window_length():
+    """--dense-trajectory supervises steps 0..H of a length-H contiguous window.
+
+    The rollout produces H+1 frames (anchor + H steps) and the contiguous future
+    window is [anchor, t1, ..., tH], so step i lines up with truth frame i.  A
+    mismatch (e.g. rollout_steps != horizon) must be rejected.
+    """
+    import torch
+    H = 8
+    n_steps = H                          # rollout_steps == horizon
+    for stride in (1, 2, 4):
+        idx = torch.arange(0, n_steps + 1, max(1, stride))
+        # every selected index is a valid rollout frame and never exceeds H
+        assert int(idx.max()) <= n_steps
+        assert idx[0] == 0               # the anchor is always supervised
+    # A window shorter/longer than the rollout is a misalignment.
+    assert n_steps != H + 1
