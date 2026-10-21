@@ -193,6 +193,9 @@ def main():
     p.add_argument("--manifest-seen", default=None,
                    help="training-protein manifest (e.g. train_not450) to fill the "
                         "'seen protein' cells; optional")
+    p.add_argument("--manifest-seen-t450", default=None,
+                   help="TRAIN proteins at the held-out T=450 (train_t450) so the "
+                        "'seen protein, unseen temperature' cell can be filled; optional")
     p.add_argument("--device", default="auto")
     p.add_argument("--batch-size", type=int, default=2)
     p.add_argument("--num-workers", type=int, default=4)
@@ -252,6 +255,7 @@ def main():
     # ds_trainprots: TRAIN proteins at T in {320..413} (seen T, seen protein)
     ds_eval = build_ds(args.manifest)
     ds_unseen_T = build_ds(args.manifest_unseen_temp) if args.manifest_unseen_temp else None
+    ds_seen_T450 = build_ds(args.manifest_seen_t450) if args.manifest_seen_t450 else None
     ds_trainprots = build_ds(args.manifest_seen) if args.manifest_seen else None
 
     results = {"cond_dim": cond_dim, "n_samples": args.n_samples,
@@ -266,10 +270,10 @@ def main():
     for T in MDCATH_TEMPS:
         unseen_T = (T == 450.0)
         for ps_label, ds_base in sets:
-            # T=450 only exists in the unseen-temperature manifest (proteins there
-            # are held out; use ds_unseen_T for both protein-set labels).
+            # T=450 uses its own manifests: unseen-temperature+unseen-protein is
+            # `val_t450`; seen-protein+unseen-T is `train_t450`.
             if unseen_T:
-                ds = ds_unseen_T
+                ds = ds_seen_T450 if ps_label == "seen_protein" else ds_unseen_T
             else:
                 ds = ds_base
             if ds is None:

@@ -137,6 +137,31 @@ def parse_args(argv=None):
                         "letting the rollout shape it, rather than relearning H from scratch.")
     p.add_argument("--encoder-lr-scale", type=float, default=0.1,
                    help="LR multiplier for the encoder group when --train-encoder is set.")
+    # --- Dense trajectory supervision: score EVERY rollout frame, not just the last ---
+    p.add_argument("--dense-trajectory", action="store_true", default=False,
+                   help="Score the WHOLE GLE rollout path (all n+1 frames) against the true "
+                        "future window, instead of decoding only the terminal H.  The rollout "
+                        "already produces the full path; the default loss throws away n of the "
+                        "n+1 frames.  Requires the data window to be a CONTIGUOUS future "
+                        "([anchor, t1, ..., tH]) so rollout step i lines up with truth frame i.")
+    p.add_argument("--dense-stride", type=int, default=1,
+                   help="With --dense-trajectory, decode/supervise every k-th rollout frame "
+                        "(1 = every frame; raise it to bound memory at long horizons).")
+    p.add_argument("--dense-horizon", type=int, default=None,
+                   help="With --dense-trajectory, runaway-step guard: abort the rollout once "
+                        "||H_t - H_0|| exceeds this (units of H).  None disables the guard.")
+    p.add_argument("--dense-ca-weight", type=float, default=1.0,
+                   help="Weight on the per-step Kabsch CA point loss (beats persistence; "
+                        "gives the encoder a clean per-frame gradient).")
+    p.add_argument("--dense-es-weight", type=float, default=0.1,
+                   help="Weight on the distributional energy score of the CA path (spread).")
+    p.add_argument("--dense-rmsf-weight", type=float, default=0.0,
+                   help="Weight on the ensemble-RMSF loss along the path (>0 asks the M "
+                        "samples to spread like the true trajectory).")
+    p.add_argument("--dense-rmsf-corr-weight", type=float, default=0.0,
+                   help="Weight on the ensemble-RMSF-profile-correlation loss along the path.")
+    p.add_argument("--dense-var-weight", type=float, default=0.0,
+                   help="Weight on the ensemble-variance loss along the path.")
     # truncated BPTT: keep only the last k transitions differentiable
     p.add_argument("--rollout-grad-steps", type=int, default=None)
     p.add_argument("--temperature-k", type=float, default=320.0,
@@ -236,7 +261,8 @@ class HSEnsembleProducer(nn.Module):
         return {
             "ca_samples": ca, "ca_mean": ca_mean_decoded,
             "ca_mean_decoded": ca_mean_decoded, "H_terminal": H_tau,
-            "H_anchor": H_anchor,
+            "H_anchor": H_anchor, "H_traj": traj,          # full [BN, n+1, L, dH] path
+            "n_steps": n_steps, "B": B, "n_samples": n_samples,
             "backbone_samples": backbone,
             "atom37_samples": atom37,
             "atom37_mask": atom37_mask,
@@ -291,35 +317,213 @@ def _run_batch(producer, paired, args, weights, device, generator=None):
     return comp, targets, out
 
 
+def _decode_path(producer, H_traj, R_anchor, t_anchor, aatype, residue_mask,
+                 B, n_samples, L, L_, step_idx):
+    """Decode the CA cloud at the selected rollout steps of H_traj.
+
+    H_traj: [B*n, n_steps+1, L, dH]; step_idx: 1-D tensor of rollout indices.
+    Returns [B, n, T_sel, L, 3] CA in the anchor gauge (one cloud per step).
+    """
+    H_sel = H_traj.index_select(1, step_idx)                  # [BN, T_sel, L, dH]
+    T_sel = H_sel.shape[1]
+    flat = H_sel.reshape(B * n_samples * T_sel, L, -1)
+    R = R_anchor[:, None, None].expand(B, n_samples, T_sel, L, 3, 3).reshape(
+        B * n_samples * T_sel, L, 3, 3)
+    t = t_anchor[:, None, None].expand(B, n_samples, T_sel, L, 3).reshape(
+        B * n_samples * T_sel, L, 3)
+    aa = aatype[:, None, None].expand(B, n_samples, T_sel, L).reshape(
+        B * n_samples * T_sel, L)
+    rm = residue_mask[:, None, None].expand(B, n_samples, T_sel, L).reshape(
+        B * n_samples * T_sel, L)
+    out = producer.decoder.decode_structure(flat, aa, R, t, rm)
+    ca = out["backbone_coords"][:, :, 1, :]
+    return ca.reshape(B, n_samples, T_sel, L, 3)
+
+
+def _run_batch_dense(producer, paired, args, weights, device, generator=None):
+    """Dense-trajectory objective: score EVERY rollout step against the truth.
+
+    Uses a contiguous future window [anchor, t1, ..., tH] (``future_coords``), so
+    rollout step i corresponds to truth frame i.  Losses (all reused from the
+    from-none trainer, so behaviour is identical to the proven recipe):
+      * per-step Kabsch CA point loss   -> beats persistence, per-frame encoder grad
+      * energy score on the CA path     -> distributional (proper scoring rule)
+      * optional ensemble rmsf / rmsf-corr / variance on the path.
+    """
+    from protein_jepa_frame.training.train_stage_cb1b import (
+        weighted_ca_rmsd, persistence_ref_rmsd, normalized_path_es,
+    )
+    from protein_jepa_frame.models.stage_b1b_fromnone.objectives import (
+        energy_score, ensemble_rmsf_loss, ensemble_rmsf_corr_loss, ensemble_variance_loss,
+    )
+    fut = paired["future_coords"].to(device)                  # [B, H+1, L, 4, 3] contiguous
+    fmask = paired["future_residue_mask"].to(device)[:, -1].bool()   # [B, L]
+    aatype = paired["future_aatype"].to(device)
+    ri = paired["future_residue_index"].to(device)
+    ci = paired["future_chain_id"].to(device)
+    ctx = paired["context_coords"].to(device)
+    ctx_mask = paired["context_residue_mask"].to(device)[:, -1]
+    R_a, t_a = _anchors(paired, device)                       # anchor = ctx[-1] == fut[0]
+    B = ctx.shape[0]
+
+    producer._rollout_steps = args.rollout_steps
+    producer._rollout_grad_steps = args.rollout_grad_steps
+    out = producer.sample_future_ca(
+        ctx, ctx_mask, aatype, ri, ci, R_a, t_a,
+        n_samples=args.n_samples, generator=generator,
+        temperature_k=args.temperature_k,
+    )
+    H_traj = out["H_traj"]
+    n_samples, L = args.n_samples, ctx.shape[2]
+
+    # Reuse the autonomous-rollout runtime guard: n_steps is exactly the observed
+    # window length H, so the terminal step lands on the scored horizon.
+    n_steps = out["n_steps"]
+    horizon = fut.shape[1] - 1                                # H truth future frames
+    if n_steps != horizon:
+        raise ValueError(
+            f"--dense-trajectory needs rollout_steps == future horizon; got "
+            f"rollout_steps={n_steps}, future window={horizon}. Set "
+            f"--rollout-steps {horizon} and --paired-horizons-frames {horizon} "
+            f"(or use the contiguous loader).")
+    step_idx = torch.arange(0, n_steps + 1, max(1, args.dense_stride),
+                            device=device)
+    ca_path = _decode_path(producer, H_traj, R_a, t_a, aatype, ctx_mask,
+                           B, n_samples, L, None, step_idx)   # [B, n, T_sel, L, 3]
+    true_path = fut[:, step_idx, :, 1, :]                     # [B, T_sel, L, 3]
+
+    # (1) per-step Kabsch CA point loss (differentiable; anchored to real positions)
+    ca_loss = weighted_ca_rmsd(ca_path, true_path, fmask)
+    persist = persistence_ref_rmsd(true_path, ctx[:, -1, :, 1, :], fmask)
+
+    # (2) energy score on the CA path: model samples [M] vs true cloud at each step.
+    es = ca_path.new_zeros(())
+    if args.dense_es_weight > 0:
+        T_sel = len(step_idx)
+        rows = []
+        for b in range(B):
+            mb = fmask[b]
+            for tis in range(T_sel):
+                smp = ca_path[b, :, tis][:, mb, :].reshape(n_samples, -1)   # [M, Lb*3]
+                tgt = true_path[b, tis][mb, :].reshape(-1)
+                rows.append(energy_score(smp, tgt) / (tgt.numel() ** 0.5))
+        es = torch.stack(rows).mean()
+
+    # (3) optional ensemble-profile terms on the path (needs M>=2 and T>=2)
+    ens_rmsf = ens_rmsf_corr = ens_var = ca_loss.new_zeros(())
+    if ca_path.shape[1] >= 2 and ca_path.shape[2] >= 2:
+        if args.dense_rmsf_weight > 0:
+            ens_rmsf = ensemble_rmsf_loss(ca_path, true_path, fmask)
+        if args.dense_rmsf_corr_weight > 0:
+            ens_rmsf_corr = ensemble_rmsf_corr_loss(ca_path, true_path, fmask)
+        if args.dense_var_weight > 0:
+            ens_var = ensemble_variance_loss(ca_path, true_path, fmask)
+
+    total = (args.dense_ca_weight * ca_loss
+             + args.dense_es_weight * es
+             + args.dense_rmsf_weight * ens_rmsf
+             + args.dense_rmsf_corr_weight * ens_rmsf_corr
+             + args.dense_var_weight * ens_var)
+
+    class _Comp:
+        def __init__(self):
+            self.total = total
+        def as_loggable_dict(self):
+            return {"ens/total": float(total.detach()),
+                    "ens/ca": float(ca_loss.detach()),
+                    "ens/es": float(es.detach()),
+                    "ens/rmsf": float(ens_rmsf.detach()),
+                    "ens/rmsf_corr": float(ens_rmsf_corr.detach()),
+                    "ens/dist": float(ens_var.detach()),
+                    "ens/persist": float(persist.detach())}
+    return _Comp(), None, out
+
+
 @torch.no_grad()
 def _validate(producer, loader, args, weights, device, max_batches):
     producer.eval()
     from collections import defaultdict
     agg = defaultdict(float); pers = defaultdict(float); n = 0
+    dense = bool(getattr(args, "dense_trajectory", False))
     for i, batch in enumerate(loader):
         if i >= max_batches:
             break
         paired = _move_batch(batch, device)
-        comp, targets, _ = _run_batch(producer, paired, args, weights, device)
+        if dense:
+            comp, _, _ = _run_batch_dense(producer, paired, args, weights, device)
+        else:
+            comp, _, _ = _run_batch(producer, paired, args, weights, device)
         for k, v in comp.as_loggable_dict().items():
             agg[k] += v
-        ctx = paired["context_coords"].to(device)
-        pmask = paired["context_residue_mask"].to(device)
-        pca = persistence_ensemble(ctx, args.n_samples, pmask)
-        phist = targets.dist_hist_from_ca(pca)
-        thist = targets.dist_hist_true()
-        bin_w = (targets.dist_hi - targets.dist_lo) / (targets.dist_bins - 1)
-        pcomp = compute_ensemble_loss(
-            pca, targets.rmsf, targets.contact, phist, thist,
-            targets.mask, bin_w, weights, cutoff=args.cutoff)
-        for k, v in pcomp.as_loggable_dict().items():
-            pers[k] += v
+        if not dense:
+            ctx = paired["context_coords"].to(device)
+            pmask = paired["context_residue_mask"].to(device)
+            pca = persistence_ensemble(ctx, args.n_samples, pmask)
+            targets = _targets_from(paired, args, device)[0]
+            phist = targets.dist_hist_from_ca(pca)
+            thist = targets.dist_hist_true()
+            bin_w = (targets.dist_hi - targets.dist_lo) / (targets.dist_bins - 1)
+            pcomp = compute_ensemble_loss(
+                pca, targets.rmsf, targets.contact, phist, thist,
+                targets.mask, bin_w, weights, cutoff=args.cutoff)
+            for k, v in pcomp.as_loggable_dict().items():
+                pers[k] += v
         n += 1
     if n == 0:
         return {}
     out = {f"val/{k}": v / n for k, v in agg.items()}
     out.update({f"val_persist/{k}": v / n for k, v in pers.items()})
     return out
+
+
+def _build_contiguous_loaders(args):
+    """Contiguous-window loaders for --dense-trajectory (mirrors from-none cb1b).
+
+    A single clip of K + rollout_steps frames is split by ``split_contiguous_window``
+    into K history frames and a contiguous future [anchor, t1, ..., tH].  This is
+    the from-none data protocol; here it is used only because it aligns rollout
+    step i with truth frame i.
+    """
+    from protein_jepa_frame.data.collate import collate_clips
+    from protein_jepa_frame.data.protocol import split_contiguous_window, validate_manifest_split
+
+    K, H = args.history_frames, args.rollout_steps
+
+    def make(manifest, training):
+        cfg = DataConfig(
+            manifest_path=manifest, batch_size=args.batch_size,
+            num_workers=args.num_workers, training_mode="clip",
+            num_frames=K + H, frame_stride=args.frame_stride,
+            max_residues=args.max_residues,
+        )
+        ds = build_dataset(cfg)
+        if args.max_train_samples and training:
+            n_sub = min(len(ds), args.max_train_samples)
+            stride = max(1, len(ds) // n_sub)
+            ds = Subset(ds, list(range(0, len(ds), stride))[:n_sub])
+        if args.smoke:
+            ds = Subset(ds, list(range(0, min(len(ds), 16))))
+
+        def _collate(samples):
+            return split_contiguous_window(collate_clips(samples), K, H, step_ps=args.step_ps)
+
+        if training:
+            dl = DataLoader(ds, batch_size=args.batch_size, shuffle=True,
+                            num_workers=args.num_workers, collate_fn=_collate,
+                            drop_last=True, pin_memory=True)
+        else:
+            total = len(ds)
+            budget = args.val_batches * args.batch_size
+            idx = torch.linspace(0, total - 1, min(total, max(budget, 1))).long().tolist()
+            dl = DataLoader(Subset(ds, idx), batch_size=args.batch_size, shuffle=False,
+                            num_workers=0, collate_fn=_collate)
+        return dl
+
+    if args.manifest and args.val_manifest:
+        validate_manifest_split(args.manifest, args.val_manifest)
+    train_loader = make(args.manifest, True)
+    val_loader = make(args.val_manifest, False) if args.val_manifest else None
+    return train_loader, val_loader
 
 
 def main():
@@ -345,47 +549,58 @@ def main():
         dist_weight=args.dist_weight, pos_weight=args.pos_weight)
     weights.validate()
 
-    data_cfg = DataConfig(
-        manifest_path=args.manifest, batch_size=args.batch_size,
-        num_workers=args.num_workers, training_mode="paired_window",
-        num_frames=args.history_frames, paired_all_horizons=False,
-        max_residues=args.max_residues,
-    )
-    protocol = protocol_from_args(args)
-    apply_protocol(data_cfg, protocol)
-    # Plan A alignment guard: the terminal GLE step should land on the scored
-    # window, so warn when the rollout length is inconsistent with the horizon.
-    _h = min(args.paired_horizons_frames or protocol.horizons_frames)
-    if args.rollout_steps > _h:
-        print(f"[warn] --rollout-steps {args.rollout_steps} exceeds the shortest future "
-              f"horizon {_h}; the rollout is scored against a window it overruns.")
-    elif args.rollout_steps < _h:
-        print(f"[note] --rollout-steps {args.rollout_steps} < future horizon {_h}; the "
-              f"ensemble target spans a longer window than the rollout (set them equal "
-              f"for a matched objective).")
-    dataset = build_dataset(data_cfg)
-    if args.max_train_samples:
-        n_sub = min(len(dataset), args.max_train_samples)
-        stride = max(1, len(dataset) // n_sub)
-        idx = list(range(0, len(dataset), stride))[:n_sub]
-        dataset = Subset(dataset, idx)
-    collate_fn = lambda s: _truncate_history(collate_paired_windows(s), args.history_frames)  # noqa: E731
-    if args.smoke:
-        dataset = Subset(dataset, list(range(0, min(len(dataset), 16))))
-    loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True,
-                        num_workers=args.num_workers, collate_fn=collate_fn,
-                        drop_last=True, pin_memory=(device.type == "cuda"))
-    if not len(loader):
-        raise ValueError("training loader is empty")
+    # --- Dense-trajectory mode: contiguous future window [anchor, t1..tH] ---
+    # The paired loader returns a FLAT future "window" (H frames at one stride),
+    # which cannot be lined up 1:1 with rollout steps.  For dense supervision we
+    # reuse the proven from-none contiguous protocol: a single clip of
+    # K+rollout_steps frames split (via split_contiguous_window) into K history
+    # frames + a contiguous future [anchor, t1, ..., tH] so step i == truth i.
+    if args.dense_trajectory:
+        loader, val_loader = _build_contiguous_loaders(args)
+        print(f"[dense] contiguous window K={args.history_frames} H={args.rollout_steps} "
+              f"stride={args.dense_stride}", flush=True)
+    else:
+        data_cfg = DataConfig(
+            manifest_path=args.manifest, batch_size=args.batch_size,
+            num_workers=args.num_workers, training_mode="paired_window",
+            num_frames=args.history_frames, paired_all_horizons=False,
+            max_residues=args.max_residues,
+        )
+        protocol = protocol_from_args(args)
+        apply_protocol(data_cfg, protocol)
+        # Plan A alignment guard: the terminal GLE step should land on the scored
+        # window, so warn when the rollout length is inconsistent with the horizon.
+        _h = min(args.paired_horizons_frames or protocol.horizons_frames)
+        if args.rollout_steps > _h:
+            print(f"[warn] --rollout-steps {args.rollout_steps} exceeds the shortest "
+                  f"future horizon {_h}; the rollout is scored against a window it overruns.")
+        elif args.rollout_steps < _h:
+            print(f"[note] --rollout-steps {args.rollout_steps} < future horizon {_h}; the "
+                  f"ensemble target spans a longer window than the rollout (set them equal "
+                  f"for a matched objective).")
+        dataset = build_dataset(data_cfg)
+        if args.max_train_samples:
+            n_sub = min(len(dataset), args.max_train_samples)
+            stride = max(1, len(dataset) // n_sub)
+            idx = list(range(0, len(dataset), stride))[:n_sub]
+            dataset = Subset(dataset, idx)
+        collate_fn = lambda s: _truncate_history(collate_paired_windows(s), args.history_frames)  # noqa: E731
+        if args.smoke:
+            dataset = Subset(dataset, list(range(0, min(len(dataset), 16))))
+        loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True,
+                            num_workers=args.num_workers, collate_fn=collate_fn,
+                            drop_last=True, pin_memory=(device.type == "cuda"))
+        if not len(loader):
+            raise ValueError("training loader is empty")
 
-    val_loader = None
-    if args.val_manifest:
-        val_cfg = replace(data_cfg, manifest_path=args.val_manifest)
-        vd = build_dataset(val_cfg)
-        n_val = min(len(vd), args.val_batches * args.batch_size)
-        vidx = torch.linspace(0, len(vd) - 1, n_val).long().tolist()
-        val_loader = DataLoader(Subset(vd, vidx), batch_size=args.batch_size,
-                                num_workers=0, shuffle=False, collate_fn=collate_fn)
+        val_loader = None
+        if args.val_manifest:
+            val_cfg = replace(data_cfg, manifest_path=args.val_manifest)
+            vd = build_dataset(val_cfg)
+            n_val = min(len(vd), args.val_batches * args.batch_size)
+            vidx = torch.linspace(0, len(vd) - 1, n_val).long().tolist()
+            val_loader = DataLoader(Subset(vd, vidx), batch_size=args.batch_size,
+                                    num_workers=0, shuffle=False, collate_fn=collate_fn)
 
     # Plan A: optionally fine-tune the (otherwise frozen) Stage-A encoder jointly
     # with the GLE kernel.  The decoder stays frozen either way.
@@ -440,7 +655,8 @@ def main():
             # The energy module's attention backward is only implemented for the
             # MATH SDP backend (efficient/flash attention backward is missing).
             with sdpa_kernel([SDPBackend.MATH]):
-                comp, _, out = _run_batch(producer, paired, args, weights, device, generator=gen)
+                run = _run_batch_dense if args.dense_trajectory else _run_batch
+                comp, _, out = run(producer, paired, args, weights, device, generator=gen)
             opt.zero_grad(set_to_none=True)
             comp.total.backward()
             torch.nn.utils.clip_grad_norm_(clip_params, args.grad_clip)
@@ -451,10 +667,16 @@ def main():
             step += 1
             if step % args.log_every == 0:
                 d = comp.as_loggable_dict()
-                print(f"step {step:6d} | lr {opt.param_groups[0]['lr']:.2e} | "
-                      f"{time.time()-t0:6.1f}s | ens/total={d['ens/total']:.4f} "
-                      f"rmsf={d['ens/rmsf']:.4f} contact={d['ens/contact']:.4f} "
-                      f"dist={d['ens/dist']:.4f}", flush=True)
+                if args.dense_trajectory:
+                    print(f"step {step:6d} | lr {opt.param_groups[0]['lr']:.2e} | "
+                          f"{time.time()-t0:6.1f}s | total={d['ens/total']:.4f} "
+                          f"ca={d['ens/ca']:.4f} es={d['ens/es']:.4f} "
+                          f"persist={d['ens/persist']:.4f}", flush=True)
+                else:
+                    print(f"step {step:6d} | lr {opt.param_groups[0]['lr']:.2e} | "
+                          f"{time.time()-t0:6.1f}s | ens/total={d['ens/total']:.4f} "
+                          f"rmsf={d['ens/rmsf']:.4f} contact={d['ens/contact']:.4f} "
+                          f"dist={d['ens/dist']:.4f}", flush=True)
             if val_loader is not None and step % args.val_every == 0:
                 v = _validate(producer, val_loader, args, weights, device, args.val_batches)
                 print(f"  [val {step}] {json.dumps({k: round(x,4) for k,x in v.items()})}",
