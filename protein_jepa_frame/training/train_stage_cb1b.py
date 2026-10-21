@@ -107,6 +107,21 @@ def parse_args(argv=None):
                    help="Optional held-out temperature (K); its trajectories are excluded from train.")
     p.add_argument("--output", default="artifacts/fromnone/stage_cb1b")
     p.add_argument("--resume")
+    # --- Plan A: warm-start the stack from the already-good Stage-A / GLE models ---
+    p.add_argument("--init-encoder-from", default=None,
+                   help="Plan A: initialise the encoder from a Stage-A checkpoint's "
+                        "``context_encoder`` instead of random weights.  Stage A's H already "
+                        "scores well on the ensemble metrics and is linearly decodable to "
+                        "CA displacement (ridge R^2 ~ +0.29), so this keeps that signal and "
+                        "lets the GLE rollout refine it rather than relearning from scratch.")
+    p.add_argument("--init-decoder-from", default=None,
+                   help="Warm-start the CA decoder from a from-none checkpoint's ``decoder`` "
+                        "(e.g. the v4e run) so a frozen decoder is still a good decoder.")
+    p.add_argument("--freeze-encoder", action="store_true", default=False,
+                   help="Plan A ablation: keep Stage A's encoder entirely fixed (no fine-tune); "
+                        "only the GLE kernel (and decoder, unless also frozen) train.")
+    p.add_argument("--freeze-decoder", action="store_true", default=False,
+                   help="Plan A: freeze the CA decoder; only encoder + GLE kernel train.")
     p.add_argument("--device", default="auto")
     p.add_argument("--steps", type=int, default=30000)
     p.add_argument("--warmup-steps", type=int, default=500)
@@ -940,11 +955,45 @@ def main(argv=None):
     kernel = build_kernel(args, device)
     decoder = build_decoder(args, device)
     normalizer = EMANormalizer(args.latent_dim).to(device)
+
+    # --- Plan A warm start: keep Stage A's encoder, don't relearn H from scratch ---
+    if getattr(args, "init_encoder_from", None):
+        a_ck = torch.load(args.init_encoder_from, map_location=device, weights_only=False)
+        model_sd = a_ck.get("model", a_ck)
+        enc_sd = {k[len("context_encoder."):]: v for k, v in model_sd.items()
+                  if k.startswith("context_encoder.")}
+        if not enc_sd:
+            raise ValueError(
+                f"--init-encoder-from {args.init_encoder_from} has no context_encoder.* keys; "
+                "expected a Stage-A (StageAV2) checkpoint.")
+        result = encoder.load_state_dict(enc_sd, strict=False)
+        print(f"[init-encoder] from {args.init_encoder_from}: "
+              f"missing={result.missing_keys} unexpected={result.unexpected_keys}", flush=True)
+    if getattr(args, "init_decoder_from", None):
+        d_ck = torch.load(args.init_decoder_from, map_location=device, weights_only=False)
+        dec_sd = d_ck.get("decoder", d_ck)
+        result = decoder.load_state_dict(dec_sd, strict=False)
+        print(f"[init-decoder] from {args.init_decoder_from}: "
+              f"missing={result.missing_keys} unexpected={result.unexpected_keys}", flush=True)
+
+    if getattr(args, "freeze_encoder", False):
+        for p in encoder.parameters():
+            p.requires_grad_(False)
+    if getattr(args, "freeze_decoder", False):
+        for p in decoder.parameters():
+            p.requires_grad_(False)
+    if args.freeze_encoder and args.freeze_decoder:
+        raise ValueError("freezing BOTH encoder and decoder leaves only the kernel; "
+                         "that is the (broken) train_stage_b_hs contract, use it instead.")
+
     # Encoder gets an optionally-scaled LR; dynamics/decoder share --lr.
     param_groups = [
-        {"params": encoder.parameters(), "lr": args.lr * args.encoder_lr_scale},
-        {"params": list(kernel.parameters()) + list(decoder.parameters()), "lr": args.lr},
+        {"params": [p for p in encoder.parameters() if p.requires_grad],
+         "lr": args.lr * args.encoder_lr_scale, "name": "encoder"},
+        {"params": [p for p in list(kernel.parameters()) + list(decoder.parameters())
+                    if p.requires_grad], "lr": args.lr, "name": "dynamics"},
     ]
+    param_groups = [g for g in param_groups if g["params"]]
     optimizer = torch.optim.AdamW(param_groups, weight_decay=args.weight_decay)
     weights = FromNoneWeights(es_weight=args.es_weight, ca_weight=args.ca_weight,
                               phys_weight=args.phys_weight, anchor_weight=args.anchor_weight,
@@ -1007,8 +1056,9 @@ def main(argv=None):
                 break
             n_steps = horizon_schedule(args, step)
             base_lr = args.lr * _lr_scale(step, args.steps, args.warmup_steps)
-            optimizer.param_groups[0]["lr"] = base_lr * args.encoder_lr_scale
-            optimizer.param_groups[1]["lr"] = base_lr
+            for pg in optimizer.param_groups:
+                pg["lr"] = base_lr * (args.encoder_lr_scale
+                                      if pg.get("name") == "encoder" else 1.0)
             optimizer.zero_grad(set_to_none=True)
             gen = torch.Generator(device=device).manual_seed(args.seed * 7919 + step)
             with sdpa_kernel([SDPBackend.MATH]):

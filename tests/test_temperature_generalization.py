@@ -75,3 +75,33 @@ def test_rmsf_corr_zero_for_constant_true():
     ca = torch.randn(B, n, L, 3)
     r = _rmsf_corr(ca, true_rmsf, torch.ones(B, L, dtype=torch.bool))
     assert torch.isfinite(r).all()                   # guarded, not NaN
+
+
+# ---------------------------------------------------------------------------
+# Model-2 (from-none) temperature-conditioning ablation: temperature_override
+# ---------------------------------------------------------------------------
+from evaluation.run_eval_fromnone import temperature_override
+
+
+def test_m2_override_correct_passthrough():
+    t = torch.tensor([320.0, 450.0])
+    out = temperature_override(t, "correct", torch.device("cpu"))
+    assert torch.allclose(out, t)
+
+
+def test_m2_override_wrong_is_constant_override():
+    t = torch.tensor([348.0, 413.0])
+    out = temperature_override(t, "wrong", torch.device("cpu"), override_k=320.0)
+    assert torch.allclose(out, torch.full((2,), 320.0))
+
+
+def test_m2_override_none_drops_temperature():
+    t = torch.tensor([348.0, 413.0])
+    assert temperature_override(t, "none", torch.device("cpu")) is None
+
+
+def test_m2_override_wrong_with_missing_temp_uses_batch_len():
+    out = temperature_override(None, "wrong", torch.device("cpu"),
+                               override_k=450.0, B=3)
+    assert out.shape == (3,)
+    assert torch.allclose(out, torch.full((3,), 450.0))

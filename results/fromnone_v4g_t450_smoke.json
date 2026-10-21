@@ -1,0 +1,91 @@
+{
+  "ckpt": "artifacts/fromnone/stage_cb1b_v4g/checkpoint_latest.pt",
+  "split": "temp",
+  "manifest": "artifacts/mdcath_manifest_1000dom_temp/val_t450.jsonl",
+  "heldout_temperature": 450.0,
+  "n_windows": 320,
+  "step_ps": 1000.0,
+  "n_rollout_reps": 4,
+  "by_horizon": {
+    "1": {
+      "horizon_ns": 1.0,
+      "n_proteins": 8,
+      "n_windows": 80,
+      "rmsd": 4.087020261585712,
+      "persist_rmsd": 4.307550230622292,
+      "skill": 0.22052996903657984,
+      "delta_vs_persist": -0.22052996903657915,
+      "delta_ci95": [
+        -0.4196989595890045,
+        -0.07168507598340512
+      ],
+      "contact_jaccard": 0.7573978794928279,
+      "persist_contact_jaccard": 0.7810070238078789,
+      "contact_delta": -0.023609144315051053,
+      "contact_ci95": [
+        -0.04673566528011995,
+        -0.004733540862577074
+      ]
+    },
+    "4": {
+      "horizon_ns": 4.0,
+      "n_proteins": 8,
+      "n_windows": 80,
+      "rmsd": 5.380219253897668,
+      "persist_rmsd": 5.712107217311859,
+      "skill": 0.33188796341419113,
+      "delta_vs_persist": -0.3318879634141922,
+      "delta_ci95": [
+        -0.6489700727164749,
+        -0.11287074878811826
+      ],
+      "contact_jaccard": 0.6840036811127943,
+      "persist_contact_jaccard": 0.733436984512674,
+      "contact_delta": -0.049433303399879766,
+      "contact_ci95": [
+        -0.0838690480817132,
+        -0.01930090259147376
+      ]
+    },
+    "16": {
+      "horizon_ns": 16.0,
+      "n_proteins": 8,
+      "n_windows": 80,
+      "rmsd": 6.511281281709671,
+      "persist_rmsd": 7.041714063286781,
+      "skill": 0.5304327815771099,
+      "delta_vs_persist": -0.5304327815771102,
+      "delta_ci95": [
+        -1.0844702154397963,
+        -0.12330884426832217
+      ],
+      "contact_jaccard": 0.6363707347643368,
+      "persist_contact_jaccard": 0.6912771193921583,
+      "contact_delta": -0.05490638462782149,
+      "contact_ci95": [
+        -0.08876226616883295,
+        -0.023510525781795754
+      ]
+    },
+    "64": {
+      "horizon_ns": 64.0,
+      "n_proteins": 8,
+      "n_windows": 80,
+      "rmsd": 8.763014960289002,
+      "persist_rmsd": 9.364254161715508,
+      "skill": 0.6012392014265053,
+      "delta_vs_persist": -0.6012392014265058,
+      "delta_ci95": [
+        -1.1121645800769322,
+        -0.1246807452291253
+      ],
+      "contact_jaccard": 0.5361684750470628,
+      "persist_contact_jaccard": 0.6213962469689696,
+      "contact_delta": -0.08522777192190671,
+      "contact_ci95": [
+        -0.13098676400002263,
+        -0.04441011919978673
+      ]
+    }
+  }
+}

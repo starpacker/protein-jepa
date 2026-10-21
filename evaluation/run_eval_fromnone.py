@@ -40,6 +40,11 @@ def parse_args(argv=None):
     p.add_argument("--manifest", required=True, help="JSONL to evaluate (held-out proteins).")
     p.add_argument("--split", choices=["protein", "temp"], default="protein")
     p.add_argument("--heldout-temperature", type=float, default=None)
+    p.add_argument("--temp-mode", choices=["correct", "wrong", "none"], default="correct",
+                   help="Temperature-conditioning ablation: feed the true T, a fixed "
+                        "wrong T (--temp-override), or drop T entirely (None).")
+    p.add_argument("--temp-override", type=float, default=320.0,
+                   help="Temperature (K) used when --temp-mode=wrong.")
     p.add_argument("--horizons", type=int, nargs="+", default=[1, 2, 4, 8, 16, 24, 32, 48, 64, 96])
     p.add_argument("--history-frames", type=int, default=8)
     p.add_argument("--frame-stride", type=int, default=1)
@@ -57,6 +62,22 @@ def _device(name):
     if name == "auto":
         return torch.device("cuda" if torch.cuda.is_available() else "cpu")
     return torch.device(name)
+
+
+def temperature_override(temp, mode: str, device, *, override_k: float = 320.0, B: int = 1):
+    """Task-3 temperature-conditioning ablation for the from-none rollout.
+
+    ``mode``:
+      - ``"correct"`` -> return ``temp`` unchanged (feed the true T).
+      - ``"wrong"``   -> return a constant ``override_k`` tensor (wrong T).
+      - ``"none"``    -> return ``None`` (drop the temperature feature).
+    """
+    if mode == "none":
+        return None
+    if mode == "wrong":
+        shape = tuple(temp.shape) if temp is not None else (B,)
+        return torch.full(shape, float(override_k), device=device, dtype=torch.float32)
+    return temp
 
 
 @torch.no_grad()
@@ -126,7 +147,10 @@ def evaluate(args):
             continue
         dt = ctx["time_ps"].diff(dim=-1)
         dt = torch.cat([dt[:, :1], dt], dim=-1)             # [1,K]
-        temp = ctx.get("temperature_k")
+        temp = temperature_override(
+            ctx.get("temperature_k"), getattr(args, "temp_mode", "correct"), device,
+            override_k=float(getattr(args, "temp_override", 320.0)),
+            B=ctx["coords"].shape[0])
         preds = []
         for rep in range(args.n_rollout_reps):
             gen = torch.Generator(device=device).manual_seed(args.seed + rep)
@@ -160,7 +184,9 @@ def evaluate(args):
     # aggregate: per-protein mean per horizon, then mean + paired bootstrap
     horizons = sorted({r["horizon"] for r in rows})
     out = {"ckpt": args.ckpt, "split": args.split, "manifest": args.manifest,
-           "heldout_temperature": args.heldout_temperature, "n_windows": n_windows,
+           "heldout_temperature": args.heldout_temperature,
+           "temp_mode": getattr(args, "temp_mode", "correct"),
+           "temp_override": getattr(args, "temp_override", None), "n_windows": n_windows,
            "step_ps": step_ps, "n_rollout_reps": args.n_rollout_reps, "by_horizon": {}}
     for h in horizons:
         rs = [r for r in rows if r["horizon"] == h]
