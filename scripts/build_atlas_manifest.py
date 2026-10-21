@@ -1,17 +1,26 @@
 #!/usr/bin/env python3
-"""Build a protein-level train/val/test manifest for the 1 ns/frame ATLAS NPZ.
+"""Build a protein-level train/val/test manifest for an ATLAS NPZ directory.
 
-The manifest records the SAME time contract as mdCATH:
-  frame_interval_ps = 1000.0  (1 ns per stored frame)
-  temperature_k     = 300.0
+The ``--frame-interval-ps`` value is the *physical* duration between stored
+frames and MUST match the npz's own ``frame_interval_ps`` field, because the
+training script multiplies ``frame_interval_ps`` by the rollout length to get
+absolute time.  Building a 100 ps dataset with the 1000 ps default (or vice
+versa) silently mislabels every horizon by 10x.
 
-so the two datasets can be mixed under one absolute-time axis.  Splits are by
-protein (all replicas of a protein stay in one split) to avoid leakage.
+Preflighted against the actual npz contents: the manifest refuses to write if
+the requested interval disagrees with what the files store.
+
+Splits are by protein (all replicas of a protein stay in one split) to avoid
+leakage.
 
 Usage:
   python scripts/build_atlas_manifest.py \
       --npz-dir /liuyutian/protein_jepa/datasets/ATLAS_NPZ_1ns \
       --output-dir artifacts/atlas_manifest
+
+  python scripts/build_atlas_manifest.py \
+      --npz-dir /liuyutian/protein_jepa/datasets/ATLAS_NPZ_100ps \
+      --output-dir artifacts/atlas_manifest_100ps --frame-interval-ps 100.0
 """
 from __future__ import annotations
 
@@ -20,11 +29,16 @@ import json
 import random
 from pathlib import Path
 
+import numpy as np
+
 
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--npz-dir", default="/liuyutian/protein_jepa/datasets/ATLAS_NPZ_1ns")
     ap.add_argument("--output-dir", default="artifacts/atlas_manifest")
+    ap.add_argument("--frame-interval-ps", type=float, default=1000.0,
+                    help="Physical ps between stored frames. Must equal the npz's own "
+                         "frame_interval_ps (1000 for ATLAS_1ns, 100 for ATLAS_100ps).")
     ap.add_argument("--train-ratio", type=float, default=0.9)
     ap.add_argument("--val-ratio", type=float, default=0.1)
     ap.add_argument("--seed", type=int, default=42)
@@ -32,7 +46,19 @@ def main() -> None:
 
     npz_dir = Path(args.npz_dir)
     records = []
+    checked = 0
     for npz in sorted(npz_dir.glob("*.npz")):
+        # Verify the declared interval against the file itself on the first few
+        # entries; a mismatch means every horizon would be mislabelled.
+        if checked < 5 and "frame_interval_ps" in np.load(npz, mmap_mode="r").files:
+            with np.load(npz, mmap_mode="r") as data:
+                stored = float(data["frame_interval_ps"])
+            if abs(stored - args.frame_interval_ps) > 1e-3:
+                raise SystemExit(
+                    f"{npz.name}: stored frame_interval_ps={stored} but "
+                    f"--frame-interval-ps={args.frame_interval_ps}; refusing to "
+                    f"write a manifest with a mislabelled time axis")
+            checked += 1
         # filename = <protein_id>_<replica>.npz ; protein ids may contain "_"
         stem = npz.stem
         protein_id, _, replica = stem.rpartition("_")
@@ -46,7 +72,7 @@ def main() -> None:
             "domain_id": protein_id,
             "format": "npz",
             "dataset": "atlas",
-            "frame_interval_ps": 1000.0,
+            "frame_interval_ps": args.frame_interval_ps,
             "first_frame_time_ps": 0.0,
             "temperature_k": 300.0,
         })

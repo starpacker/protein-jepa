@@ -1,0 +1,48 @@
+{
+ "manifest": "artifacts/mdcath_manifest_1000dom/val.jsonl",
+ "n_windows": 1200,
+ "n_samples": 4,
+ "horizons": [
+  1,
+  4,
+  16
+ ],
+ "static": {
+  "coverage_mean": 0.5,
+  "n_proteins": 8,
+  "free_energy_mae_kcal_mean": 0.36660078865781875,
+  "population_tv_mean": 0.140625,
+  "population_jsd_mean": 0.022743179609808303
+ },
+ "dynamics": {
+  "1": {
+   "model_accuracy": 0.17114093959731544,
+   "model_macro_f1": 0.1066392714552537,
+   "model_balanced_accuracy": 0.13962412561940496,
+   "persist_accuracy": 0.3221476510067114,
+   "n_eval": 1192
+  },
+  "4": {
+   "model_accuracy": 0.1832191780821918,
+   "model_macro_f1": 0.12393643915660846,
+   "model_balanced_accuracy": 0.14584279067713007,
+   "persist_accuracy": 0.25513698630136983,
+   "n_eval": 1168
+  },
+  "16": {
+   "model_accuracy": 0.19682835820895522,
+   "model_macro_f1": 0.1289589481531484,
+   "model_balanced_accuracy": 0.16217085783871438,
+   "persist_accuracy": 0.2248134328358209,
+   "n_eval": 1072
+  },
+  "true_msm_timescales": [
+   7.9015774423345215,
+   2.394769171621833,
+   1.635296241450178,
+   1.400132252668337,
+   0.9811628329373229
+  ],
+  "true_msm_n_states": 14
+ }
+}

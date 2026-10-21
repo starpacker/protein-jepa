@@ -46,6 +46,50 @@ from evaluation.msm_metrics import (
 )
 
 
+def _load_full_trajectories(manifest, max_proteins, max_residues=192, stride=1):
+    """Load full time-ordered CA trajectories per (protein, T, replica).
+
+    Returns dict protein_id -> list of [T, L, 3] numpy arrays (one per trajectory),
+    for the FIRST temperature/replica of each protein (deterministic).
+    """
+    from protein_jepa_frame.data.dataset import TrajectoryClipDataset
+    from protein_jepa_frame.data.manifest import load_manifest
+    from protein_jepa_frame.config import DataConfig
+
+    recs = load_manifest(manifest)
+    seen, out = {}, {}
+    for r in recs:
+        p = r.protein_id
+        if p not in seen:
+            if len(seen) >= max_proteins:
+                continue
+            seen[p] = True
+        if seen.get(p) is not None and p in out:
+            continue  # already have one trajectory for this protein
+        n = int(r.num_frames or TrajectoryClipDataset._read_num_frames(r))
+        frames = np.arange(0, n, stride)
+        ds = TrajectoryClipDataset([r], DataConfig(manifest_path=None, num_frames=len(frames),
+                                                   max_residues=max_residues))
+        clip = ds._read_clip(r, frames)
+        ca = ca_from_backbone(torch.as_tensor(clip["coords"])).numpy()  # [T,L,3]
+        m = np.asarray(clip["residue_mask"])
+        m = m.all(0) if m.ndim == 2 else m
+        out[p] = [(ca, m.astype(bool))]
+    return out
+
+
+def _cls_metrics(y_true, y_pred, n_states):
+    """Accuracy, macro-F1, balanced accuracy for integer state labels."""
+    from sklearn.metrics import accuracy_score, f1_score, balanced_accuracy_score
+    y_true = np.asarray(y_true); y_pred = np.asarray(y_pred)
+    if len(y_true) == 0:
+        return float("nan"), float("nan"), float("nan")
+    labels = list(range(n_states))
+    return (float(accuracy_score(y_true, y_pred)),
+            float(f1_score(y_true, y_pred, labels=labels, average="macro", zero_division=0)),
+            float(balanced_accuracy_score(y_true, y_pred)))
+
+
 def parse_args(argv=None):
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--stage-a-ckpt", required=True)
@@ -106,6 +150,7 @@ def main():
     prot_feat: dict[str, np.ndarray] = {}
 
     n_win = 0
+    windows_meta: list[dict] = []   # carries (protein, frames, horizon, model feats)
     for w in iter_windows(proto):
         ctx = {k: (v.unsqueeze(0) if torch.is_tensor(v) else v) for k, v in w.context.items()}
         tgt = {k: (v.unsqueeze(0) if torch.is_tensor(v) else v) for k, v in w.target.items()}
@@ -132,35 +177,71 @@ def main():
         model_by_ph[key].append(model_ca.cpu().numpy())
         pers_by_ph[key].append(np.repeat(anchor_ca.cpu().numpy()[None], args.n_samples, 0))
         prot_ca[w.protein_id].append(true_ca.cpu().numpy())
+
+        # model-sample features for MSM state labelling (same recipe as the MSM)
+        mc = torch.tensor(model_ca.cpu().numpy()[0], dtype=torch.float32)  # [L,3]
+        mmask = rmask[0].cpu()
+        mf, _ = internal_distance_features(mc.unsqueeze(0), mmask, min_sep=3,
+                                           max_pairs=256, seed=args.seed)
+        windows_meta.append({
+            "protein_id": w.protein_id, "horizon": int(w.horizon),
+            "anchor_frame": int(w.anchor_frame), "target_frame": int(w.target_frame),
+            "model_feats": mf.numpy(),
+        })
         n_win += 1
         if n_win % 5 == 0:
             print(f"[states-msm] windows={n_win} proteins={len(prot_ca)}", flush=True)
 
-    # ---------- Fixed MSM fit on TRUE trajectories ----------
-    # Use the concatenated true future frames per protein as the "trajectory".
-    prot_arrays = {p: np.stack(v) for p, v in prot_ca.items() if len(v) >= 3}
-    msm_model = None
-    msm_feats = {}
-    if prot_arrays:
-        # Build per-protein feature arrays (rotation invariant) for the MSM.
-        feats_list = []
-        for p, arr in prot_arrays.items():
-            ca_t = torch.tensor(arr, dtype=torch.float32)              # [N,L,3]
-            m = torch.ones(ca_t.shape[1], dtype=torch.bool)
-            f, _ = internal_distance_features(ca_t, m, min_sep=3, max_pairs=256, seed=args.seed)
-            msm_feats[p] = f.numpy()
-            feats_list.append(f.numpy())
-        try:
-            msm_model = fit_msm(feats_list, lag=1, n_micro=args.n_micro)
-        except Exception as e:
-            print(f"[states-msm] MSM fit failed: {e}")
+    # ---------- MSM fit on TRUE time-ordered trajectories ----------
+    # The MSM must be fit on REAL temporal trajectories (not shuffled anchor
+    # windows), otherwise the transition matrix is degenerate. We load the full
+    # NA-frame trajectory for each protein and fit a joint MSM over proteins
+    # (TICA + KMeans on internal-distance features + reversible MSM).
+    full_traj = {}
+    try:
+        full_traj = _load_full_trajectories(args.manifest, args.max_proteins,
+                                            max_residues=args.max_residues, stride=1)
+    except Exception as e:
+        print(f"[states-msm] full-trajectory load failed: {e}", flush=True)
 
-    # ---------- Static metrics (coverage + free energy), averaged over proteins ----------
+    msm_model = None
+    msm_traj_feats: dict[str, np.ndarray] = {}
+    msm_traj_lab: dict[str, np.ndarray] = {}
+    if full_traj:
+        feats_list, ids = [], []
+        for p, arrs in full_traj.items():
+            for ca, m in arrs:
+                ca_t = torch.tensor(np.asarray(ca), dtype=torch.float32)   # [T,L,3]
+                mt = torch.tensor(np.asarray(m), dtype=torch.bool)
+                if int(mt.sum()) < 4:
+                    continue
+                f, _ = internal_distance_features(ca_t, mt, min_sep=3,
+                                                  max_pairs=256, seed=args.seed)
+                msm_traj_feats[p] = f.numpy()
+                feats_list.append(f.numpy())
+                ids.append(p)
+        if feats_list:
+            try:
+                msm_model = fit_msm(feats_list, lag=1, n_micro=args.n_micro,
+                                    n_states=args.k_states, seed=args.seed)
+                for p in msm_traj_feats:
+                    msm_traj_lab[p] = msm_model.label(msm_traj_feats[p])
+                print(f"[states-msm] fit MSM on {len(feats_list)} true trajectories "
+                      f"({msm_model.n_states} states)", flush=True)
+            except Exception as e:
+                print(f"[states-msm] MSM fit failed: {e}", flush=True)
+
+    # ---------- Static metrics (coverage + free energy) ----------
+    # Prefer the true full trajectories as the reference ensemble; fall back to
+    # the pooled future frames when unavailable.
+    static_ref = {p: nparr for p, arrs in full_traj.items() for nparr, _m in [arrs[0]]} \
+        if full_traj else {}
+    ref_pool = {p: np.stack(v) for p, v in prot_ca.items() if len(v) >= 3}
     cov_rows, fe_rows = [], []
-    for p, arr in prot_arrays.items():
-        ca_t = torch.tensor(arr, dtype=torch.float32)
-        m = torch.ones(ca_t.shape[1], dtype=torch.bool)
-        # reference = true frames of this protein; model = all model samples at any horizon
+    ref_source = static_ref if static_ref else ref_pool
+    for p, arr in ref_source.items():
+        ca_t = torch.tensor(np.asarray(arr), dtype=torch.float32)
+        m = torch.ones(ca_t.shape[-2], dtype=torch.bool)
         model_all = []
         for (pp, h), v in model_by_ph.items():
             if pp == p:
@@ -171,7 +252,6 @@ def main():
         cov = reference_state_coverage(model_cat, ca_t, m, k_states=args.k_states,
                                        eps_angstrom=args.eps_angstrom, seed=args.seed)
         cov_rows.append(cov["coverage"])
-        # free energy: label model and true with shared centroids
         ref_feat, _ = internal_distance_features(ca_t, m, min_sep=3, max_pairs=256, seed=args.seed)
         mod_feat, _ = internal_distance_features(model_cat, m, min_sep=3, max_pairs=256, seed=args.seed)
         C, ref_lab = _kmeans(ref_feat, args.k_states, seed=args.seed)
@@ -189,48 +269,84 @@ def main():
         "population_jsd_mean": float(np.mean([r["population_jsd"] for r in fe_rows])) if fe_rows else None,
     }
 
-    # ---------- Dynamics metrics (lagged state prediction) ----------
+    # ---------- Dynamics metrics (lagged MSM state prediction) ----------
+    # For each anchor window we know the true target frame index in the real
+    # trajectory (w.* metadata). We map that frame to its true MSM state, and
+    # map each model sample to a predicted state. Accuracy is measured with a
+    # lag tau = horizon (the model predicts tau frames ahead).
     dynamics = {}
     if msm_model is not None:
+        # accumulate per-horizon (true_label, pred_label) pairs across windows
+        # for BOTH the fine microstate discretization and PCCA macrostates.
+        per_h: dict[int, list] = defaultdict(list)        # micro
+        per_h_macro: dict[int, list] = defaultdict(list)  # macro
+        per_h_pers: dict[int, list] = defaultdict(list)   # micro persistence
+        per_h_pers_macro: dict[int, list] = defaultdict(list)
+        per_h_change: dict[int, list] = defaultdict(list)  # true state change flag
+        n_macro = int(msm_model.n_macro or msm_model.n_states)
+        macro_lab = {p: (msm_model.macro_map[np.clip(v, 0, len(msm_model.macro_map) - 1)]
+                         if msm_model.macro_map is not None else v)
+                     for p, v in msm_traj_lab.items()}
+        for w in windows_meta:
+            p = w["protein_id"]
+            if p not in msm_traj_lab:
+                continue
+            lab = msm_traj_lab[p]
+            t_tgt = int(w["target_frame"])
+            if t_tgt < 0 or t_tgt >= len(lab):
+                continue
+            h = int(w["horizon"])
+            fm = w["model_feats"]
+            if fm is None or len(fm) == 0:
+                continue
+            y_true = int(lab[t_tgt])
+            pred = msm_model.label(np.asarray(fm)).astype(int)
+            per_h[h].extend([(y_true, int(pp)) for pp in pred])
+
+            lab_m = macro_lab[p]
+            y_true_m = int(lab_m[t_tgt])
+            pred_m = msm_model.label_macro(np.asarray(fm)).astype(int) if msm_model.macro_map is not None else pred
+            per_h_macro[h].extend([(y_true_m, int(pp)) for pp in pred_m])
+
+            # persistence baseline: predict the anchor frame's own state
+            t_anc = int(w["anchor_frame"])
+            y_pers = int(lab[t_anc]) if 0 <= t_anc < len(lab) else y_true
+            y_pers_m = int(lab_m[t_anc]) if 0 <= t_anc < len(lab_m) else y_true_m
+            per_h_pers[h].extend([(y_true, y_pers) for _ in pred])
+            per_h_pers_macro[h].extend([(y_true_m, y_pers_m) for _ in pred])
+            per_h_change[h].append(int(y_true_m != y_pers_m))
+
         for h in args.horizons:
-            acc_rows, pers_rows = [], []
-            for p, arr in prot_arrays.items():
-                f_p = msm_feats[p]
-                true_lab = msm_model.label(f_p)
-                # predicted labels: label model samples at this horizon (pooled per protein)
-                mod_labs = []
-                for (pp, hh), v in model_by_ph.items():
-                    if pp == p and hh == h:
-                        mm = torch.tensor(np.concatenate(v, 0), dtype=torch.float32)
-                        mk = torch.ones(mm.shape[1], dtype=torch.bool)
-                        fm, _ = internal_distance_features(mm, mk, min_sep=3, max_pairs=256, seed=args.seed)
-                        mod_labs.append(msm_model.label(fm.numpy()))
-                if not mod_labs or len(true_lab) < 2:
-                    continue
-                pred_lab = np.concatenate(mod_labs, 0)
-                # Align lengths: evaluate lagged accuracy on the min length, tau = h frames
-                n = min(len(true_lab), len(pred_lab))
-                tau = int(h)
-                if n <= tau:
-                    continue
-                res = lagged_state_prediction(true_lab[:n], pred_lab[:n], tau=tau,
-                                              n_states=msm_model.n_states)
-                # also persistence-in-state baseline (pred[t]=true[t])
-                res_p = lagged_state_prediction(true_lab[:n], true_lab[:n], tau=tau,
-                                                n_states=msm_model.n_states)
-                if res.get("n_eval", 0) > 0:
-                    acc_rows.append(res)
-                    pers_rows.append(res_p)
-            if acc_rows:
-                dynamics[str(h)] = {
-                    "model_accuracy": float(np.mean([r["accuracy"] for r in acc_rows])),
-                    "model_macro_f1": float(np.mean([r["macro_f1"] for r in acc_rows])),
-                    "model_balanced_accuracy": float(np.mean([r["balanced_accuracy"] for r in acc_rows])),
-                    "persist_accuracy": float(np.mean([r["persist_accuracy"] for r in acc_rows])),
-                    "n_eval": int(sum(r["n_eval"] for r in acc_rows)),
-                }
-        # implied timescales of the true MSM
-        if msm_model is not None and msm_model.msm is not None:
+            pairs = per_h.get(int(h), [])
+            if not pairs:
+                continue
+            yt = np.array([a for a, _ in pairs]); yp = np.array([b for _, b in pairs])
+            acc, mf1, bacc = _cls_metrics(yt, yp, msm_model.n_states)
+            pt = np.array([a for a, _ in per_h_pers.get(int(h), [])])
+            pp_ = np.array([b for _, b in per_h_pers.get(int(h), [])])
+            pacc = _cls_metrics(pt, pp_, msm_model.n_states)[0] if len(pt) else float("nan")
+
+            mac = per_h_macro.get(int(h), [])
+            ytm = np.array([a for a, _ in mac]); ypm = np.array([b for _, b in mac])
+            macc, mmf1, mbacc = _cls_metrics(ytm, ypm, n_macro) if len(mac) else (np.nan,)*3
+            ptm = np.array([a for a, _ in per_h_pers_macro.get(int(h), [])])
+            ppm = np.array([b for _, b in per_h_pers_macro.get(int(h), [])])
+            pmacc = _cls_metrics(ptm, ppm, n_macro)[0] if len(ptm) else float("nan")
+
+            # true transition rate: fraction of windows where the macrostate
+            # changed between anchor and target (model-independent reference).
+            changed = per_h_change.get(int(h), [])
+
+            dynamics[str(h)] = {
+                "micro_accuracy": acc, "micro_macro_f1": mf1,
+                "micro_balanced_accuracy": bacc, "micro_persist_accuracy": pacc,
+                "macro_accuracy": float(macc), "macro_macro_f1": float(mmf1),
+                "macro_balanced_accuracy": float(mbacc), "macro_persist_accuracy": float(pmacc),
+                "n_macro_states": int(n_macro),
+                "true_transition_rate": float(np.mean(changed)) if changed else float("nan"),
+                "n_eval": int(len(yt)),
+            }
+        if msm_model.msm is not None:
             dynamics["true_msm_timescales"] = implied_timescales(msm_model.msm, 5).tolist()
             dynamics["true_msm_n_states"] = int(msm_model.n_states)
 

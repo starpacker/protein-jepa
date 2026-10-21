@@ -41,6 +41,8 @@ class MSMStateModel:
     n_states: int
     feature_mean: np.ndarray | None = None
     feature_std: np.ndarray | None = None
+    macro_map: np.ndarray | None = None      # microstate -> macrostate (PCCA)
+    n_macro: int = 0
 
     def transform(self, feats: np.ndarray) -> np.ndarray:
         """Project raw internal-distance features -> TICA space."""
@@ -52,6 +54,17 @@ class MSMStateModel:
         """Raw features -> discrete microstate labels."""
         y = self.transform(feats)
         return np.asarray(self.kmeans.transform(y)).reshape(-1)
+
+    def label_macro(self, feats: np.ndarray) -> np.ndarray:
+        """Raw features -> metastable macrostate labels (PCCA coarse-graining).
+
+        Returns microstate labels unchanged when no PCCA map is available.
+        """
+        lab = self.label(feats).astype(int)
+        if self.macro_map is None:
+            return lab
+        lab = np.clip(lab, 0, len(self.macro_map) - 1)
+        return self.macro_map[lab]
 
     def _discretize_sequence(self, labels: np.ndarray) -> np.ndarray:
         """Collapse microstates to MSM coarse states (majority/nearest by pi)."""
@@ -65,14 +78,16 @@ def _standardize(trajs: Sequence[np.ndarray]):
 
 
 def fit_msm(true_feats: Sequence[np.ndarray], *, lag: int = 1, n_micro: int = 50,
-            n_states: int = 5) -> MSMStateModel:
+            n_states: int = 5, seed: int = 0) -> MSMStateModel:
     """Fit TICA + KMeans + MSM on a list of per-trajectory feature arrays.
 
     Args:
         true_feats: list of [T_i, D] internal-distance feature arrays (true MD).
         lag: MSM lag in frames.
-        n_micro: microstate count (KMeans).
+        n_micro: microstate count (KMeans). If n_states == n_micro this is the
+            number of discrete MSM states used for the state-prediction accuracy.
         n_states: reserved (MSM coarse states via spectral clustering if needed).
+        seed: unused placeholder for API stability (deeptime KMeans is deterministic).
     """
     from deeptime.decomposition import TICA
     from deeptime.clustering import KMeans
@@ -88,8 +103,22 @@ def fit_msm(true_feats: Sequence[np.ndarray], *, lag: int = 1, n_micro: int = 50
 
     from deeptime.markov.msm import MaximumLikelihoodMSM
     msm = MaximumLikelihoodMSM(reversible=True, lagtime=lag).fit_fetch(mask_disc)
+
+    # PCCA coarse-graining: microstates -> `n_states` metastable macrostates.
+    macro_map, n_macro = None, 0
+    try:
+        from deeptime.markov import pcca
+        n_k = int(min(n_states, msm.n_states))
+        if n_k >= 2:
+            p = pcca(msm.transition_matrix, n_k)
+            macro_map = np.asarray(p.assignments).astype(int)
+            n_macro = int(macro_map.max()) + 1
+    except Exception:
+        macro_map, n_macro = None, 0
+
     return MSMStateModel(tica=tica, kmeans=km, msm=msm, lag=lag,
-                         n_states=msm.n_states, feature_mean=mu, feature_std=sd)
+                         n_states=msm.n_states, feature_mean=mu, feature_std=sd,
+                         macro_map=macro_map, n_macro=n_macro)
 
 
 def lagged_state_prediction(true_states: np.ndarray, pred_states: np.ndarray,
