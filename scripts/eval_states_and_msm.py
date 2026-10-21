@@ -346,7 +346,7 @@ def main():
             # macrostate at the target: "did the model predict a jump?".
             td = {}
             if len(mac):
-                y_from = np.array([a for a, _ in per_h_pers_macro_anchor.get(int(h), [])])
+                y_from = np.array(per_h_pers_macro_anchor.get(int(h), []))
                 if len(y_from) == len(ytm):
                     from evaluation.msm_metrics import transition_detection
                     td = transition_detection(y_from, ytm, ypm)
