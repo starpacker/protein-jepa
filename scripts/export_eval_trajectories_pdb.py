@@ -707,7 +707,7 @@ def main():
                           "trajectory_id": w.trajectory_id,
                           "anchor_frame": int(w.anchor_frame), "L": int(Lval),
                           "temperature_k": float(w.temperature_k),
-                          "mode": "ensemble"})
+                          "mode": "ensemble", "atoms": args.atoms})
             continue
 
         # ---- ROLLOUT mode (autoregressive self-feedback; NOT the SOTA metric) ----
