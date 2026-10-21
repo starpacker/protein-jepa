@@ -190,6 +190,9 @@ def main():
                    help="held-out-protein manifest (val_not450)")
     p.add_argument("--manifest-unseen-temp", default=None,
                    help="T=450 unseen-temperature manifest (val_t450)")
+    p.add_argument("--manifest-seen", default=None,
+                   help="training-protein manifest (e.g. train_not450) to fill the "
+                        "'seen protein' cells; optional")
     p.add_argument("--device", default="auto")
     p.add_argument("--batch-size", type=int, default=2)
     p.add_argument("--num-workers", type=int, default=4)
@@ -244,55 +247,61 @@ def main():
                               collate_paired_windows(s), args.history_frames))
 
     # ---- datasets ----
-    ds_seen = build_ds(args.manifest)            # held-out proteins, T in {320..413}
-    ds_unseen = build_ds(args.manifest_unseen_temp) if args.manifest_unseen_temp else None
+    # ds_eval      : held-out PROTEINS, T in {320..413} (seen T, unseen protein)
+    # ds_unseen_T  : held-out PROTEINS at T=450   (unseen T, unseen protein)
+    # ds_trainprots: TRAIN proteins at T in {320..413} (seen T, seen protein)
+    ds_eval = build_ds(args.manifest)
+    ds_unseen_T = build_ds(args.manifest_unseen_temp) if args.manifest_unseen_temp else None
+    ds_trainprots = build_ds(args.manifest_seen) if args.manifest_seen else None
 
     results = {"cond_dim": cond_dim, "n_samples": args.n_samples,
                "horizons": args.horizons, "cells": {}}
 
     temps_seen = (320.0, 348.0, 379.0, 413.0)
+    # (protein_set_label, dataset) pairs to populate.
+    sets = [("unseen_protein", ds_eval)]
+    if ds_trainprots is not None:
+        sets.append(("seen_protein", ds_trainprots))
+
     for T in MDCATH_TEMPS:
         unseen_T = (T == 450.0)
-        ds = ds_unseen if unseen_T else ds_seen
-        if ds is None:
-            continue
-        idx = _subset_by_temp(ds, T, args.max_windows_per_temp * args.batch_size, args.seed)
-        if not idx:
-            print(f"[temp-gen] T*={T}: no windows", flush=True)
-            continue
-        dl = loader_for(ds, idx)
-        plist = list(dl)
-        key = f"T{T:.0f}"
-        results["cells"][key] = {"unseen_temperature": unseen_T,
-                                 "protein_set": "unseen",
-                                 "n_trajectories": len({pid for b in plist
-                                                        for pid in b.get("protein_id", [])})}
-        if cond_dim <= 0:
-            # Model cannot be temperature-conditioned at all -> only "none".
-            results["cells"][key]["none"] = _eval_conditions(
-                producer, plist, args, dev, cond_dim, "none", None)
-            results["cells"][key]["note"] = "cond_dim=0: temperature input is inert"
-        else:
-            results["cells"][key]["correct"] = _eval_conditions(
-                producer, plist, args, dev, cond_dim, "correct", None)
-            results["cells"][key]["none"] = _eval_conditions(
-                producer, plist, args, dev, cond_dim, "none", None)
-            # "wrong T": feed the temperature of a DIFFERENT state point.
-            wrong = 320.0 if abs(T - 320.0) > 1e-3 else 450.0
-            results["cells"][key]["wrong"] = _eval_conditions(
-                producer, plist, args, dev, cond_dim, "wrong", wrong)
-            results["cells"][key]["wrong_temp_used"] = wrong
-        print(f"[temp-gen] T*={T:.0f} done: {json.dumps(results['cells'][key], default=str)[:200]}",
-              flush=True)
+        for ps_label, ds_base in sets:
+            # T=450 only exists in the unseen-temperature manifest (proteins there
+            # are held out; use ds_unseen_T for both protein-set labels).
+            if unseen_T:
+                ds = ds_unseen_T
+            else:
+                ds = ds_base
+            if ds is None:
+                continue
+            idx = _subset_by_temp(ds, T, args.max_windows_per_temp * args.batch_size, args.seed)
+            if not idx:
+                continue
+            plist = list(loader_for(ds, idx))
+            key = f"T{T:.0f}__{ps_label}"
+            cell = {"T": T, "unseen_temperature": unseen_T, "protein_set": ps_label,
+                    "n_trajectories": len({pid for b in plist
+                                           for pid in b.get("protein_id", [])})}
+            if cond_dim <= 0:
+                cell["none"] = _eval_conditions(producer, plist, args, dev, cond_dim, "none", None)
+                cell["note"] = "cond_dim=0: temperature input is inert"
+            else:
+                cell["correct"] = _eval_conditions(producer, plist, args, dev, cond_dim, "correct", None)
+                cell["none"] = _eval_conditions(producer, plist, args, dev, cond_dim, "none", None)
+                wrong = 320.0 if abs(T - 320.0) > 1e-3 else 450.0
+                cell["wrong"] = _eval_conditions(producer, plist, args, dev, cond_dim, "wrong", wrong)
+                cell["wrong_temp_used"] = wrong
+            results["cells"][key] = cell
+            print(f"[temp-gen] {key} done", flush=True)
 
     # ---- temperature-response sanity: does rmsf rise with T? (correct cond) ----
     resp = {}
     for T in temps_seen:
-        key = f"T{T:.0f}"
+        key = f"T{T:.0f}__unseen_protein"
         c = results["cells"].get(key, {})
         cell = c.get("correct") or c.get("none")
         if cell:
-            resp[key] = cell["rmsf_model"]
+            resp[f"T{T:.0f}"] = cell["rmsf_model"]
     results["temperature_response_rmsf_model"] = resp
     results["temperature_monotone"] = (
         all(resp.get(f"T{a:.0f}", 0) <= resp.get(f"T{b:.0f}", 1) + 1e-6
