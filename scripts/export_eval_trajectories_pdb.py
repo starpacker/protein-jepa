@@ -89,6 +89,71 @@ def kabsch_align_to_ref(frames_ca, ref_ca):
     return out
 
 
+def kabsch_align_backbone_to_ref(frames_bb, ref_ca):
+    """Superpose each frame's Cα of ``frames_bb`` [T,L,4,3] onto ``ref_ca`` [L,3].
+
+    Returns the rigid-transformed backbone frames (all atoms moved by the same
+    transform that aligns each frame's Cα to ``ref_ca``), so N/CA/C/O stay
+    internally consistent.  Same convention as :func:`kabsch_align_to_ref`.
+    """
+    frames_bb = np.asarray(frames_bb, dtype=np.float64)
+    P = np.asarray(ref_ca, dtype=np.float64)
+    Pc = P - P.mean(0)
+    out = np.empty_like(frames_bb)
+    for t in range(frames_bb.shape[0]):
+        X = frames_bb[t, :, 1, :]                      # Cα column
+        Xc = X - X.mean(0)
+        H = Xc.T @ Pc
+        U, _, Vt = np.linalg.svd(H)
+        d = np.sign(np.linalg.det(Vt.T @ U.T))
+        D = np.diag([1.0, 1.0, d])
+        R = Vt.T @ D @ U.T
+        centered = frames_bb[t] - X.mean(0)            # move centroid to origin
+        out[t] = np.matmul(centered.reshape(-1, 3), R.T).reshape(centered.shape)
+    return out
+
+
+def write_backbone_pdb(path: Path, frames_bb, aatype, residue_index, chain_id,
+                       origin: str):
+    """Write ``frames_bb`` [T, L, 4, 3] as a multi-MODEL N/CA/C/O PDB.
+
+    ``frames_bb[..., 0..3]`` = (N, CA, C, O).  Same residue/chain conventions as
+    :func:`write_ca_pdb`.  Atom placement is the caller's responsibility; this
+    writer only formats OpenFold-ordered backbone atoms.
+    """
+    frames_bb = np.asarray(frames_bb, dtype=np.float64)
+    if frames_bb.ndim != 4 or frames_bb.shape[-2] != 4:
+        raise ValueError("frames_bb must be [T, L, 4, 3]")
+    T, L, _, _ = frames_bb.shape
+    lines = [f"REMARK 100 ORIGIN {origin}",
+             f"REMARK 100 NFRAMES {T}", f"REMARK 100 NRESIDUES {L}",
+             "REMARK 100 ATOMS N,CA,C,O"]
+    serial = 1
+    atom_names = ("N", "CA", "C", "O")
+    elements = ("N", "C", "C", "O")
+    for t in range(T):
+        lines.append(f"MODEL     {t + 1:4d}")
+        for i in range(L):
+            aa = AA_ALPHABET[int(aatype[i])] if 0 <= int(aatype[i]) < len(AA_ALPHABET) else "X"
+            resn = THREE.get(aa, "GLY")
+            ch = "A"
+            if chain_id is not None:
+                c = str(int(chain_id[i]))
+                ch = c if c.isalpha() else "ABCDEFGHIJKLMNOPQRSTUVWXYZ"[:26][int(chain_id[i]) % 26]
+            resi = int(residue_index[i]) if residue_index is not None else i + 1
+            for k, an in enumerate(atom_names):
+                x, y, z = frames_bb[t, i, k]
+                lines.append(
+                    "ATOM  {ser:5d} {an:^4s} {resn:>3s} {ch:1s}{resi:4d}    "
+                    "{x:8.3f}{y:8.3f}{z:8.3f}  1.00  0.00          {el:>2s}".format(
+                        ser=serial, an=an, resn=resn, ch=ch, resi=resi,
+                        x=x, y=y, z=z, el=elements[k]))
+                serial += 1
+        lines.append("ENDMDL")
+    lines.append("END")
+    Path(path).write_text("\n".join(lines) + "\n")
+
+
 def write_ca_pdb(path: Path, frames_ca, aatype, residue_index, chain_id,
                  origin: str):
     """Write ``frames_ca`` [T, L, 3] as a multi-MODEL CA-only PDB.
@@ -267,6 +332,61 @@ def ensemble_ours_stageA(producer, w, args, dev, cond_dim, n_samples):
                                     n_samples=n_samples, cond=cond)
     ca = res["ca_samples"][0].cpu().numpy()              # [n_samples, L_all, 3]
     return ca[:, idx]
+
+
+@torch.no_grad()
+def ensemble_ours_stageA_backbone(producer, w, args, dev, cond_dim, n_samples):
+    """As :func:`ensemble_ours_stageA` but returns OpenFold backbone [n,L,4,3].
+
+    Uses the frozen decoder's own atom37 output surfaced as ``backbone_samples``
+    (N, CA, C, O) — the *same* atoms as the Cα ensemble, plus the OpenFold-placed
+    N/C/O.  This is the authoritative Model-1 mainchain.
+    """
+    from protein_jepa_frame.training.train_stage_ensemble import _extract_backbone_frames
+    rmask, idx, aatype, ri, ci, anchor_ca, _ = window_meta(w, dev)
+    ctx = w.context["coords"][None].to(dev)
+    aat = torch.from_numpy(aatype)[None].to(dev)
+    rit = torch.from_numpy(ri)[None].to(dev)
+    cit = torch.from_numpy(ci)[None].to(dev) if ci is not None else torch.zeros_like(rit)
+    m = torch.from_numpy(rmask.cpu().numpy())[None].to(dev)
+    cond = torch.zeros(1, cond_dim, device=dev) if cond_dim > 0 else None
+    R_a, t_a = _extract_backbone_frames(ctx[:, -1])
+    res = producer.sample_future_ca(ctx, m, aat, rit, cit, R_a, t_a,
+                                    n_samples=n_samples, cond=cond)
+    bb = res["backbone_samples"][0].cpu().numpy()        # [n, L_all, 4, 3]
+    return bb[:, idx]
+
+
+@torch.no_grad()
+def ensemble_ours_hs_backbone(producer, w, args, dev, n_samples):
+    """As :func:`ensemble_ours_hs` but returns OpenFold backbone [n,L,4,3]."""
+    from protein_jepa_frame.training.train_stage_ensemble import _extract_backbone_frames
+    rmask, idx, aatype, ri, ci, anchor_ca, _ = window_meta(w, dev)
+    ctx = w.context["coords"][None].to(dev)
+    aat = torch.from_numpy(aatype)[None].to(dev)
+    rit = torch.from_numpy(ri)[None].to(dev)
+    cit = torch.from_numpy(ci)[None].to(dev) if ci is not None else torch.zeros_like(rit)
+    m = torch.from_numpy(rmask.cpu().numpy())[None].to(dev)
+    tk = float(getattr(producer, "_temperature_k", 320.0))
+    R_a, t_a = _extract_backbone_frames(ctx[:, -1])
+    res = producer.sample_future_ca(ctx, m, aat, rit, cit, R_a, t_a,
+                                    n_samples=n_samples, temperature_k=tk)
+    bb = res["backbone_samples"][0].cpu().numpy()
+    return bb[:, idx]
+
+
+@torch.no_grad()
+def lift_ca_ensemble_to_backbone(ca_members, aatype):
+    """Lift a Cα ensemble [n, L, 3] to backbone [n, L, 4, 3] via OpenFold.
+
+    Used for Model 2 (from-none), which predicts Cα only.  Placement is the
+    OpenFold-consistent Cα lifter; the Cα column is preserved exactly.
+    """
+    from protein_jepa_frame.models.stage_c.openfold_ca_lifter import lift_ca_to_backbone
+    ca = torch.as_tensor(np.asarray(ca_members), dtype=torch.float32)
+    aa = torch.as_tensor(np.asarray(aatype), dtype=torch.long)[None].expand(ca.shape[0], -1)
+    bb, _, _ = lift_ca_to_backbone(ca, aatype=aa)
+    return bb.numpy()
 
 
 @torch.no_grad()
@@ -456,6 +576,10 @@ def main():
     ap.add_argument("--ensemble", action="store_true",
                     help="export the SINGLE-STEP ensemble (what the reported SOTA "
                          "metrics measure) instead of the autoregressive rollout")
+    ap.add_argument("--atoms", choices=["ca", "backbone"], default="ca",
+                    help="write Cα-only (default) or full N/CA/C/O backbone. "
+                         "'backbone' uses the models' OpenFold reconstruction "
+                         "(Model 1) or the OpenFold Cα lifter (Model 2).")
     ap.add_argument("--ensemble-samples", type=int, default=32,
                     help="number of ensemble members per window in --ensemble mode")
     ap.add_argument("--horizon", type=int, default=64,
@@ -521,6 +645,13 @@ def main():
                 origin = origin + " [Kabsch-aligned to anchor]"
             write_ca_pdb(wdir / f"{name}.pdb", arr, aatype, ri, ci, origin)
 
+        def _save_ens_backbone(name, members_bb, origin):
+            arr = np.asarray(members_bb)
+            if getattr(args, "align_to_anchor", False):
+                arr = kabsch_align_backbone_to_ref(arr, anchor_ca)
+                origin = origin + " [Kabsch-aligned to anchor]"
+            write_backbone_pdb(wdir / f"{name}.pdb", arr, aatype, ri, ci, origin)
+
         # ground truth + persistence always cheap
         if "ground_truth" in args.which:
             _save("ground_truth", true_ca, "real MD future frames")
@@ -538,19 +669,40 @@ def main():
         if getattr(args, "ensemble", False):
             N = args.ensemble_samples
             if "ground_truth" in args.which:
-                _save_ens("ground_truth", true_ca,
-                          "real MD future frames (oracle ensemble)")
+                if args.atoms == "backbone":
+                    _save_ens_backbone("ground_truth",
+                                       lift_ca_ensemble_to_backbone(true_ca, aatype),
+                                       "real MD future frames (oracle ensemble, lifted backbone)")
+                else:
+                    _save_ens("ground_truth", true_ca,
+                              "real MD future frames (oracle ensemble)")
             if "persistence" in args.which:
-                _save_ens("persistence", np.repeat(anchor_ca[None], N, axis=0),
-                          "anchor frame repeated (persistence ensemble)")
+                if args.atoms == "backbone":
+                    _save_ens_backbone(
+                        "persistence",
+                        lift_ca_ensemble_to_backbone(np.repeat(anchor_ca[None], N, axis=0), aatype),
+                        "anchor frame repeated (persistence ensemble, lifted backbone)")
+                else:
+                    _save_ens("persistence", np.repeat(anchor_ca[None], N, axis=0),
+                              "anchor frame repeated (persistence ensemble)")
             if oursA is not None:
-                ens = ensemble_ours_stageA(oursA[0], w, args, dev, oursA[1], N)
-                _save_ens("ours_stageA", ens,
-                          "Stage-A ensemble producer (single-step ensemble)")
+                if args.atoms == "backbone":
+                    ens_bb = ensemble_ours_stageA_backbone(oursA[0], w, args, dev, oursA[1], N)
+                    _save_ens_backbone("ours_stageA", ens_bb,
+                                       "Stage-A ensemble producer (single-step ensemble, OpenFold backbone)")
+                else:
+                    ens = ensemble_ours_stageA(oursA[0], w, args, dev, oursA[1], N)
+                    _save_ens("ours_stageA", ens,
+                              "Stage-A ensemble producer (single-step ensemble)")
             if oursHS is not None:
-                ens = ensemble_ours_hs(oursHS, w, args, dev, N)
-                _save_ens("ours_hs", ens,
-                          "Stage-B H+S (GLE) producer (single-step ensemble)")
+                if args.atoms == "backbone":
+                    ens_bb = ensemble_ours_hs_backbone(oursHS, w, args, dev, N)
+                    _save_ens_backbone("ours_hs", ens_bb,
+                                       "Stage-B H+S (GLE) producer (single-step ensemble, OpenFold backbone)")
+                else:
+                    ens = ensemble_ours_hs(oursHS, w, args, dev, N)
+                    _save_ens("ours_hs", ens,
+                              "Stage-B H+S (GLE) producer (single-step ensemble)")
             index.append({"tag": tag, "protein_id": w.protein_id,
                           "trajectory_id": w.trajectory_id,
                           "anchor_frame": int(w.anchor_frame), "L": int(Lval),
