@@ -241,6 +241,10 @@ def backbone_rmsd(pred_bb: torch.Tensor, ref_bb: torch.Tensor,
     p = pred_bb[..., sel, :].reshape(*pred_bb.shape[:-3], -1, 3)
     r = ref_bb[..., sel, :].reshape(*ref_bb.shape[:-3], -1, 3)
     m = mask[..., :, None].expand(*mask.shape, 4)[..., sel].reshape(*mask.shape[:-1], -1)
+    # Broadcast mask over any leading sample dims present in pred/ref.
+    while m.dim() < p.dim() - 1:
+        m = m.unsqueeze(0)
+    m = m.expand(*p.shape[:-2], -1)
     aligned, ref_c = _kabsch_align(p, r, m)
     d = (aligned - ref_c).norm(dim=-1)
     mm = m
@@ -255,15 +259,24 @@ def backbone_per_atom_rmsd(pred_bb: torch.Tensor, ref_bb: torch.Tensor,
     L = pred_bb.shape[-3]
     p = pred_bb.reshape(*pred_bb.shape[:-3], -1, 3)
     r = ref_bb.reshape(*ref_bb.shape[:-3], -1, 3)
+    # Broadcast mask over any leading sample dims: mask [.., L] -> [.., L*4].
     m = mask[..., :, None].expand(*mask.shape, 4).reshape(*mask.shape[:-1], -1)
+    # If pred has extra leading dims vs mask, expand mask to match.
+    while m.dim() < p.dim() - 1:
+        m = m.unsqueeze(0)
+    m = m.expand(*p.shape[:-2], -1)
     aligned, ref_c = _kabsch_align(p, r, m)
-    d = (aligned - ref_c).norm(dim=-1).reshape(*mask.shape, 4)
+    d = (aligned - ref_c).norm(dim=-1).reshape(*p.shape[:-2], L, 4)
     names = ("N", "CA", "C", "O")
     out = {}
     for k, nm in enumerate(names):
+        dk = d[..., k]                       # [.., L]
         mk = mask
+        while mk.dim() < dk.dim():
+            mk = mk.unsqueeze(0)
+        mk = mk.expand_as(dk)
         if mk.any():
-            out[f"rmsd_{nm}"] = float(d[..., k][mk].mean())
+            out[f"rmsd_{nm}"] = float(dk[mk].mean())
         else:
             out[f"rmsd_{nm}"] = None
     return out
