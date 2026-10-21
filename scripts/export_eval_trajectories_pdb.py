@@ -354,6 +354,14 @@ def ensemble_ours_stageA_backbone(producer, w, args, dev, cond_dim, n_samples):
     res = producer.sample_future_ca(ctx, m, aat, rit, cit, R_a, t_a,
                                     n_samples=n_samples, cond=cond)
     bb = res["backbone_samples"][0].cpu().numpy()        # [n, L_all, 4, 3]
+    # T1.4 sanity check: the CA column of the backbone IS the Cα ensemble — the
+    # new path must be a provable superset, not a different model.
+    ca = res["ca_samples"][0].cpu().numpy()
+    import numpy as _np
+    if not _np.allclose(bb[:, :, 1, :], ca, atol=1e-4):
+        raise AssertionError(
+            "backbone CA column diverges from ca_samples "
+            f"(max |diff|={_np.abs(bb[:, :, 1, :] - ca).max():.2e} Å)")
     return bb[:, idx]
 
 
