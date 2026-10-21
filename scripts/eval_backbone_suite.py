@@ -168,13 +168,15 @@ def main():
                                             R_a, t_a, n_samples=args.n_samples, cond=cond)
             model_bb = out["backbone_samples"]                  # [B,n,L,4,3]
 
-            # True backbone (lifted) for the horizon frame.
-            true_bb, _ = _lift_true_backbone(true_ca[:, None], aatype, mask[:, None])
-            true_bb = true_bb.reshape(true_ca.shape[0], 1, true_ca.shape[1], 4, 3)
+            # True backbone for the horizon frame: the REAL MD N/CA/C/O from the
+            # ground-truth future frame (NOT a Cα re-lift — otherwise the
+            # "oracle" would only ever reproduce ideal internal geometry and the
+            # peptide-bond validity check would be meaningless).
+            true_bb = fut[:, -1, :, :, :]                       # [B,L,4,3]
+            true_bb = true_bb[:, None]                          # [B,1,L,4,3]
 
-            # Persistence backbone: anchor backbone lifted from anchor CA, repeated.
-            anchor_ca = ctx[:, -1, :, 1, :]                     # [B,L,3]
-            pers_bb, _, _ = lift_ca_to_backbone(anchor_ca, aatype=aatype)
+            # Persistence backbone: the REAL anchor N/CA/C/O repeated.
+            pers_bb = ctx[:, -1, :, :, :]                       # [B,L,4,3]
             pers_bb = pers_bb[:, None].expand(-1, args.n_samples, -1, -1, -1)
 
             for b in range(ctx.shape[0]):
