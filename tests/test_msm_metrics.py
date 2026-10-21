@@ -11,6 +11,7 @@ import torch
 
 from evaluation.msm_metrics import (
     lagged_state_prediction, transition_matrix_error, fit_msm,
+    transition_detection,
 )
 
 
@@ -77,3 +78,35 @@ def test_fit_msm_on_two_state_chain():
     from evaluation.msm_metrics import implied_timescales
     ts = implied_timescales(model.msm, 2)
     assert len(ts) >= 1
+
+
+def test_transition_detection_perfect():
+    # 2-state chain; the model predicts the true next state exactly -> it must
+    # detect every genuine transition and never fire a spurious one.
+    s = _two_state_chain(n=2000, p_stay=0.9, seed=5)
+    out = transition_detection(s[:-1], s[1:], s[1:])
+    assert out["n_eval"] == 1999
+    assert out["transition_precision"] == 1.0
+    assert out["transition_recall"] == 1.0
+    assert out["transition_f1"] == 1.0
+    assert out["binary_accuracy"] == 1.0
+    # genuine transitions do occur (so this is not a degenerate all-stay test)
+    assert out["true_transition_rate"] > 0.05
+
+
+def test_transition_detection_persistence_never_fires():
+    # Predicting "no change" always (pred_to == true_from) => recall 0, but a
+    # finite no-transition baseline accuracy equal to the stay rate.
+    s = _two_state_chain(n=2000, p_stay=0.9, seed=6)
+    out = transition_detection(s[:-1], s[1:], s[:-1])
+    assert out["transition_recall"] == 0.0
+    assert out["pred_transition_rate"] == 0.0
+    assert abs(out["binary_accuracy"] - out["persist_binary_accuracy"]) < 1e-9
+
+
+def test_transition_detection_counts_consistent():
+    s = _two_state_chain(n=1000, p_stay=0.8, seed=7)
+    pred = np.roll(s[1:], 1)                     # scrambled predictor
+    out = transition_detection(s[:-1], s[1:], pred)
+    assert out["tp"] + out["tn"] + out["fp"] + out["fn"] == out["n_eval"]
+    assert out["tp"] + out["fn"] == round(out["true_transition_rate"] * out["n_eval"])

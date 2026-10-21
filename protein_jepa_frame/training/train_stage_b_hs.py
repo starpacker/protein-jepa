@@ -84,6 +84,10 @@ def parse_args(argv=None):
 
     p.add_argument("--history-frames", type=int, default=4)
     p.add_argument("--frame-stride", type=int, default=1)
+    p.add_argument("--paired-horizons-frames", type=int, nargs="+", default=None,
+                   help="Future-window offsets (raw frames) to sample.  Plan A alignment: pick "
+                        "a single horizon H and set --rollout-steps = H so the GLE terminal "
+                        "step lands on the scored window instead of a mismatched 1 step.")
     p.add_argument("--max-residues", type=int, default=256)
     p.add_argument("--n-samples", type=int, default=8)
     p.add_argument("--cond-dims", type=int, default=0)
@@ -118,7 +122,21 @@ def parse_args(argv=None):
     p.add_argument("--step-ps", type=float, default=1000.0)
     # rollout length in frames (how far the GLE is iterated before decoding)
     p.add_argument("--rollout-steps", type=int, default=1,
-                   help="GLE steps per sample before decoding the terminal H")
+                   help="GLE steps per sample before decoding the terminal H.  Plan A: set "
+                        "this to the ensemble window length so the multi-step C@S bath "
+                        "feedback is INSIDE the loss -- training a 1-step rollout against a "
+                        "whole-window target is exactly what drove the old kernel into the "
+                        "divergent regime seen at inference.")
+    # --- Plan A: jointly fine-tune the Stage-A encoder with the GLE kernel ---
+    p.add_argument("--train-encoder", action="store_true", default=False,
+                   help="Plan A: unfreeze the Stage-A encoder and fine-tune it jointly with "
+                        "the GLE kernel (decoder stays frozen).  Default off == the old frozen "
+                        "encoder contract.  Rationale: Stage A's H already scores well on the "
+                        "ensemble metrics and is linearly decodable to CA displacement "
+                        "(ridge R^2 ~ +0.29); a low-LR joint fine-tune keeps that signal while "
+                        "letting the rollout shape it, rather than relearning H from scratch.")
+    p.add_argument("--encoder-lr-scale", type=float, default=0.1,
+                   help="LR multiplier for the encoder group when --train-encoder is set.")
     # truncated BPTT: keep only the last k transitions differentiable
     p.add_argument("--rollout-grad-steps", type=int, default=None)
     p.add_argument("--temperature-k", type=float, default=320.0,
@@ -148,20 +166,26 @@ class HSEnsembleProducer(nn.Module):
         X^{(n)}_CA  = Decoder(H^{(n)}_tau, anchor basis)      (frozen)
     """
 
-    def __init__(self, encoder, decoder, kernel: StageB1b):
+    def __init__(self, encoder, decoder, kernel: StageB1b, train_encoder: bool = False):
         super().__init__()
         self.encoder = encoder
         self.decoder = decoder
         self.kernel = kernel
         for p in self.encoder.parameters():
-            p.requires_grad_(False)
+            p.requires_grad_(bool(train_encoder))
         for p in self.decoder.parameters():
             p.requires_grad_(False)
+        # When the encoder is frozen we can (and should) run it under no_grad;
+        # when it is fine-tuned we must keep the graph so the GLE losses reach it.
+        self._encoder_grad = bool(train_encoder)
 
-    @torch.no_grad()
     def encode_frame(self, coords, residue_mask, aatype, residue_index, chain_id):
         c5 = coords.unsqueeze(1)
         m3 = residue_mask.unsqueeze(1)
+        if not self._encoder_grad:
+            with torch.no_grad():
+                H = self.encoder(c5, m3, aatype, residue_index, chain_id, token_mask=m3)
+            return H[:, 0]
         H = self.encoder(c5, m3, aatype, residue_index, chain_id, token_mask=m3)
         return H[:, 0]
 
@@ -311,7 +335,10 @@ def main():
         print(f"[warn] overriding --latent-dim {args.latent_dim} -> frozen dH {dH}")
         args.latent_dim = dH
     kernel = _build_kernel(args, device)
-    producer = HSEnsembleProducer(encoder, decoder, kernel).to(device)
+    producer = HSEnsembleProducer(encoder, decoder, kernel,
+                                  train_encoder=args.train_encoder).to(device)
+    print(f"[planA] train_encoder={args.train_encoder} rollout_steps={args.rollout_steps} "
+          f"encoder_lr_scale={args.encoder_lr_scale}", flush=True)
 
     weights = EnsembleLossWeights(
         rmsf_weight=args.rmsf_weight, contact_weight=args.contact_weight,
@@ -326,6 +353,16 @@ def main():
     )
     protocol = protocol_from_args(args)
     apply_protocol(data_cfg, protocol)
+    # Plan A alignment guard: the terminal GLE step should land on the scored
+    # window, so warn when the rollout length is inconsistent with the horizon.
+    _h = min(args.paired_horizons_frames or protocol.horizons_frames)
+    if args.rollout_steps > _h:
+        print(f"[warn] --rollout-steps {args.rollout_steps} exceeds the shortest future "
+              f"horizon {_h}; the rollout is scored against a window it overruns.")
+    elif args.rollout_steps < _h:
+        print(f"[note] --rollout-steps {args.rollout_steps} < future horizon {_h}; the "
+              f"ensemble target spans a longer window than the rollout (set them equal "
+              f"for a matched objective).")
     dataset = build_dataset(data_cfg)
     if args.max_train_samples:
         n_sub = min(len(dataset), args.max_train_samples)
@@ -350,13 +387,30 @@ def main():
         val_loader = DataLoader(Subset(vd, vidx), batch_size=args.batch_size,
                                 num_workers=0, shuffle=False, collate_fn=collate_fn)
 
-    opt = torch.optim.AdamW(kernel.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    for pg in opt.param_groups:
-        pg["base_lr"] = pg["lr"]
+    # Plan A: optionally fine-tune the (otherwise frozen) Stage-A encoder jointly
+    # with the GLE kernel.  The decoder stays frozen either way.
+    if args.train_encoder:
+        groups = [
+            {"params": [p for p in producer.encoder.parameters() if p.requires_grad],
+             "lr": args.lr * args.encoder_lr_scale, "name": "encoder"},
+            {"params": list(kernel.parameters()), "lr": args.lr, "name": "kernel"},
+        ]
+        groups = [g for g in groups if g["params"]]
+        opt = torch.optim.AdamW(groups, lr=args.lr, weight_decay=args.weight_decay)
+        for pg in opt.param_groups:
+            pg["base_lr"] = pg["lr"]
+        clip_params = [p for g in groups for p in g["params"]]
+    else:
+        opt = torch.optim.AdamW(kernel.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+        for pg in opt.param_groups:
+            pg["base_lr"] = pg["lr"]
+        clip_params = list(kernel.parameters())
     start_step, best_val = 0, float("inf")
     if args.resume:
         rck = torch.load(args.resume, map_location=device, weights_only=False)
         kernel.load_state_dict(rck["kernel"])
+        if "encoder" in rck:
+            producer.encoder.load_state_dict(rck["encoder"])
         try:
             opt.load_state_dict(rck["optimizer"])
         except Exception:  # noqa: BLE001
@@ -371,6 +425,9 @@ def main():
             "stage_a_ckpt": args.stage_a_ckpt, "b1a_ckpt": args.b1a_ckpt,
             "kernel_config": kernel.cfg.__dict__,
             "ensemble_weights": vars(weights),
+            "train_encoder": bool(getattr(args, "train_encoder", False)),
+            "encoder": (producer.encoder.state_dict()
+                        if getattr(args, "train_encoder", False) else None),
         }, out_dir / f"checkpoint_{tag}.pt")
 
     t0 = time.time()
@@ -386,7 +443,7 @@ def main():
                 comp, _, out = _run_batch(producer, paired, args, weights, device, generator=gen)
             opt.zero_grad(set_to_none=True)
             comp.total.backward()
-            torch.nn.utils.clip_grad_norm_(kernel.parameters(), args.grad_clip)
+            torch.nn.utils.clip_grad_norm_(clip_params, args.grad_clip)
             lr_scale = min(1.0, (step + 1) / max(args.warmup_steps, 1))
             for pg in opt.param_groups:
                 pg["lr"] = pg["base_lr"] * lr_scale

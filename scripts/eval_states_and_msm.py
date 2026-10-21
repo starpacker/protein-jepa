@@ -282,6 +282,7 @@ def main():
         per_h_macro: dict[int, list] = defaultdict(list)  # macro
         per_h_pers: dict[int, list] = defaultdict(list)   # micro persistence
         per_h_pers_macro: dict[int, list] = defaultdict(list)
+        per_h_pers_macro_anchor: dict[int, list] = defaultdict(list)  # true macrostate at anchor
         per_h_change: dict[int, list] = defaultdict(list)  # true state change flag
         n_macro = int(msm_model.n_macro or msm_model.n_states)
         macro_lab = {p: (msm_model.macro_map[np.clip(v, 0, len(msm_model.macro_map) - 1)]
@@ -314,6 +315,9 @@ def main():
             y_pers_m = int(lab_m[t_anc]) if 0 <= t_anc < len(lab_m) else y_true_m
             per_h_pers[h].extend([(y_true, y_pers) for _ in pred])
             per_h_pers_macro[h].extend([(y_true_m, y_pers_m) for _ in pred])
+            # true macrostate at the anchor (t), expanded to one entry per model
+            # sample, so it aligns with the per-sample predicted labels.
+            per_h_pers_macro_anchor[h].extend([y_pers_m for _ in pred])
             per_h_change[h].append(int(y_true_m != y_pers_m))
 
         for h in args.horizons:
@@ -337,6 +341,16 @@ def main():
             # changed between anchor and target (model-independent reference).
             changed = per_h_change.get(int(h), [])
 
+            # ---- binary transition-vs-non-transition detection (key ask) ----
+            # macrostate at anchor (t) and at target (t+tau), model's predicted
+            # macrostate at the target: "did the model predict a jump?".
+            td = {}
+            if len(mac):
+                y_from = np.array([a for a, _ in per_h_pers_macro_anchor.get(int(h), [])])
+                if len(y_from) == len(ytm):
+                    from evaluation.msm_metrics import transition_detection
+                    td = transition_detection(y_from, ytm, ypm)
+
             dynamics[str(h)] = {
                 "micro_accuracy": acc, "micro_macro_f1": mf1,
                 "micro_balanced_accuracy": bacc, "micro_persist_accuracy": pacc,
@@ -344,6 +358,7 @@ def main():
                 "macro_balanced_accuracy": float(mbacc), "macro_persist_accuracy": float(pmacc),
                 "n_macro_states": int(n_macro),
                 "true_transition_rate": float(np.mean(changed)) if changed else float("nan"),
+                "transition_detection": td,
                 "n_eval": int(len(yt)),
             }
         if msm_model.msm is not None:

@@ -152,6 +152,55 @@ def lagged_state_prediction(true_states: np.ndarray, pred_states: np.ndarray,
     return res
 
 
+def transition_detection(true_from: np.ndarray, true_to: np.ndarray,
+                         pred_to: np.ndarray) -> dict:
+    """Binary "did the state change?" prediction quality (the user's key ask).
+
+    Given the true state at ``t`` (``true_from``), the true state at ``t+τ``
+    (``true_to``) and the model's predicted state at ``t+τ`` (``pred_to``), each
+    window is labelled:
+
+        true_change  = (true_to  != true_from)     -- did the MD actually jump?
+        pred_change  = (pred_to  != true_from)     -- did the model predict a jump?
+
+    A "transition" is the positive class.  We report the confusion counts and
+    precision / recall / F1 **for the transition class specifically**, plus the
+    overall binary accuracy and both class rates.  This isolates the question
+    "can the model tell when a transition is about to happen (and when it is
+    not)?" from the multi-class label accuracy, which is dominated by the
+    (often majority) no-transition class.
+    """
+    true_from = np.asarray(true_from).astype(int)
+    true_to = np.asarray(true_to).astype(int)
+    pred_to = np.asarray(pred_to).astype(int)
+    n = len(true_from)
+    if n == 0:
+        return {"n_eval": 0}
+    true_change = (true_to != true_from).astype(int)
+    pred_change = (pred_to != true_from).astype(int)
+    tp = int(((true_change == 1) & (pred_change == 1)).sum())
+    tn = int(((true_change == 0) & (pred_change == 0)).sum())
+    fp = int(((true_change == 0) & (pred_change == 1)).sum())
+    fn = int(((true_change == 1) & (pred_change == 0)).sum())
+    prec = tp / (tp + fp) if (tp + fp) else 0.0
+    rec = tp / (tp + fn) if (tp + fn) else 0.0
+    f1 = 2 * prec * rec / (prec + rec) if (prec + rec) else 0.0
+    # persistence-in-state baseline can never predict a transition (recall 0).
+    persist_acc = float((true_change == 0).mean())
+    return {
+        "n_eval": int(n),
+        "true_transition_rate": float(true_change.mean()),
+        "pred_transition_rate": float(pred_change.mean()),
+        "binary_accuracy": float((true_change == pred_change).mean()),
+        "transition_precision": float(prec),
+        "transition_recall": float(rec),
+        "transition_f1": float(f1),
+        "tp": tp, "tn": tn, "fp": fp, "fn": fn,
+        "persist_binary_accuracy": persist_acc,
+        "binary_skill_vs_persist": float((true_change == pred_change).mean() - persist_acc),
+    }
+
+
 def transition_matrix_error(T_pred: np.ndarray, T_true: np.ndarray) -> dict:
     """Per-row TV / JSD + Frobenius norm between two transition matrices.
 
@@ -205,7 +254,7 @@ def mfpt_matrix(msm) -> np.ndarray:
 
 
 __all__ = [
-    "MSMStateModel", "fit_msm", "lagged_state_prediction",
+    "MSMStateModel", "fit_msm", "lagged_state_prediction", "transition_detection",
     "transition_matrix_error", "implied_timescales", "implied_timescale_error",
     "mfpt_matrix",
 ]
