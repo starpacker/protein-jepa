@@ -1,0 +1,531 @@
+{
+ "model": "from-none (GLE)",
+ "ckpt": "artifacts/fromnone/stage_cb1b_v4g/checkpoint_latest.pt",
+ "n_rollout_reps": 3,
+ "horizons": [
+  1,
+  4,
+  16
+ ],
+ "wrong_temp": 320.0,
+ "cells": {
+  "T320__unseen_protein": {
+   "correct": {
+    "1": {
+     "horizon_ns": 1.0,
+     "n_proteins": 12,
+     "n_windows": 120,
+     "rmsd": 2.545859728256861,
+     "persist_rmsd": 2.599884308377902,
+     "skill": 0.054024580121041055,
+     "contact_jaccard": 0.88716132779218,
+     "persist_contact_jaccard": 0.8960127349432593
+    },
+    "4": {
+     "horizon_ns": 4.0,
+     "n_proteins": 12,
+     "n_windows": 120,
+     "rmsd": 3.593750452498595,
+     "persist_rmsd": 3.6789563412467636,
+     "skill": 0.08520588874816859,
+     "contact_jaccard": 0.8275994524821818,
+     "persist_contact_jaccard": 0.8718491273400489
+    },
+    "16": {
+     "horizon_ns": 16.0,
+     "n_proteins": 12,
+     "n_windows": 120,
+     "rmsd": 4.561435270806153,
+     "persist_rmsd": 4.768744357923667,
+     "skill": 0.2073090871175136,
+     "contact_jaccard": 0.7999385977204417,
+     "persist_contact_jaccard": 0.8381829817642665
+    }
+   },
+   "wrong": {
+    "1": {
+     "horizon_ns": 1.0,
+     "n_proteins": 12,
+     "n_windows": 120,
+     "rmsd": 2.545859728256861,
+     "persist_rmsd": 2.599884308377902,
+     "skill": 0.054024580121041055,
+     "contact_jaccard": 0.88716132779218,
+     "persist_contact_jaccard": 0.8960127349432593
+    },
+    "4": {
+     "horizon_ns": 4.0,
+     "n_proteins": 12,
+     "n_windows": 120,
+     "rmsd": 3.593750452498595,
+     "persist_rmsd": 3.6789563412467636,
+     "skill": 0.08520588874816859,
+     "contact_jaccard": 0.8275994524821818,
+     "persist_contact_jaccard": 0.8718491273400489
+    },
+    "16": {
+     "horizon_ns": 16.0,
+     "n_proteins": 12,
+     "n_windows": 120,
+     "rmsd": 4.561435270806153,
+     "persist_rmsd": 4.768744357923667,
+     "skill": 0.2073090871175136,
+     "contact_jaccard": 0.7999385977204417,
+     "persist_contact_jaccard": 0.8381829817642665
+    }
+   },
+   "none": {
+    "1": {
+     "horizon_ns": 1.0,
+     "n_proteins": 12,
+     "n_windows": 120,
+     "rmsd": 2.5453982690970105,
+     "persist_rmsd": 2.599884308377902,
+     "skill": 0.054486039280891685,
+     "contact_jaccard": 0.8868854417928217,
+     "persist_contact_jaccard": 0.8960127349432593
+    },
+    "4": {
+     "horizon_ns": 4.0,
+     "n_proteins": 12,
+     "n_windows": 120,
+     "rmsd": 3.593842696150144,
+     "persist_rmsd": 3.6789563412467636,
+     "skill": 0.08511364509661945,
+     "contact_jaccard": 0.825808284104743,
+     "persist_contact_jaccard": 0.8718491273400489
+    },
+    "16": {
+     "horizon_ns": 16.0,
+     "n_proteins": 12,
+     "n_windows": 120,
+     "rmsd": 4.561759353180727,
+     "persist_rmsd": 4.768744357923667,
+     "skill": 0.2069850047429398,
+     "contact_jaccard": 0.7988955174799356,
+     "persist_contact_jaccard": 0.8381829817642665
+    }
+   },
+   "wrong_temp_used": 320.0,
+   "T": 320.0,
+   "unseen_temperature": false,
+   "protein_set": "unseen_protein"
+  },
+  "T348__unseen_protein": {
+   "correct": {
+    "1": {
+     "horizon_ns": 1.0,
+     "n_proteins": 12,
+     "n_windows": 120,
+     "rmsd": 2.750652001798153,
+     "persist_rmsd": 2.8266750251253447,
+     "skill": 0.07602302332719191,
+     "contact_jaccard": 0.8683819635799211,
+     "persist_contact_jaccard": 0.880428712045238
+    },
+    "4": {
+     "horizon_ns": 4.0,
+     "n_proteins": 12,
+     "n_windows": 120,
+     "rmsd": 3.801240599155426,
+     "persist_rmsd": 3.941510170698166,
+     "skill": 0.14026957154273978,
+     "contact_jaccard": 0.7985245781394951,
+     "persist_contact_jaccard": 0.8514379832380858
+    },
+    "16": {
+     "horizon_ns": 16.0,
+     "n_proteins": 12,
+     "n_windows": 120,
+     "rmsd": 4.981597045063973,
+     "persist_rmsd": 5.274585894743601,
+     "skill": 0.29298884967962824,
+     "contact_jaccard": 0.7723934772386846,
+     "persist_contact_jaccard": 0.813677540582662
+    }
+   },
+   "wrong": {
+    "1": {
+     "horizon_ns": 1.0,
+     "n_proteins": 12,
+     "n_windows": 120,
+     "rmsd": 2.7514790371060376,
+     "persist_rmsd": 2.8266750251253447,
+     "skill": 0.07519598801930716,
+     "contact_jaccard": 0.8689512142046212,
+     "persist_contact_jaccard": 0.880428712045238
+    },
+    "4": {
+     "horizon_ns": 4.0,
+     "n_proteins": 12,
+     "n_windows": 120,
+     "rmsd": 3.802155071496964,
+     "persist_rmsd": 3.941510170698166,
+     "skill": 0.13935509920120204,
+     "contact_jaccard": 0.7998202500416993,
+     "persist_contact_jaccard": 0.8514379832380858
+    },
+    "16": {
+     "horizon_ns": 16.0,
+     "n_proteins": 12,
+     "n_windows": 120,
+     "rmsd": 4.982695038119952,
+     "persist_rmsd": 5.274585894743601,
+     "skill": 0.2918908566236489,
+     "contact_jaccard": 0.7732586903561313,
+     "persist_contact_jaccard": 0.813677540582662
+    }
+   },
+   "none": {
+    "1": {
+     "horizon_ns": 1.0,
+     "n_proteins": 12,
+     "n_windows": 120,
+     "rmsd": 2.750652001798153,
+     "persist_rmsd": 2.8266750251253447,
+     "skill": 0.07602302332719191,
+     "contact_jaccard": 0.8683819635799211,
+     "persist_contact_jaccard": 0.880428712045238
+    },
+    "4": {
+     "horizon_ns": 4.0,
+     "n_proteins": 12,
+     "n_windows": 120,
+     "rmsd": 3.801240599155426,
+     "persist_rmsd": 3.941510170698166,
+     "skill": 0.14026957154273978,
+     "contact_jaccard": 0.7985245781394951,
+     "persist_contact_jaccard": 0.8514379832380858
+    },
+    "16": {
+     "horizon_ns": 16.0,
+     "n_proteins": 12,
+     "n_windows": 120,
+     "rmsd": 4.981597045063973,
+     "persist_rmsd": 5.274585894743601,
+     "skill": 0.29298884967962824,
+     "contact_jaccard": 0.7723934772386846,
+     "persist_contact_jaccard": 0.813677540582662
+    }
+   },
+   "wrong_temp_used": 320.0,
+   "T": 348.0,
+   "unseen_temperature": false,
+   "protein_set": "unseen_protein"
+  },
+  "T379__unseen_protein": {
+   "correct": {
+    "1": {
+     "horizon_ns": 1.0,
+     "n_proteins": 12,
+     "n_windows": 120,
+     "rmsd": 3.2083850368857383,
+     "persist_rmsd": 3.3135457744201027,
+     "skill": 0.10516073753436439,
+     "contact_jaccard": 0.84177994051138,
+     "persist_contact_jaccard": 0.8568558600027497
+    },
+    "4": {
+     "horizon_ns": 4.0,
+     "n_proteins": 12,
+     "n_windows": 120,
+     "rmsd": 4.196757330497106,
+     "persist_rmsd": 4.361461779475212,
+     "skill": 0.16470444897810577,
+     "contact_jaccard": 0.7702336228461754,
+     "persist_contact_jaccard": 0.8242112529544157
+    },
+    "16": {
+     "horizon_ns": 16.0,
+     "n_proteins": 12,
+     "n_windows": 120,
+     "rmsd": 5.119661369919777,
+     "persist_rmsd": 5.437325442830722,
+     "skill": 0.31766407291094456,
+     "contact_jaccard": 0.7410270457120082,
+     "persist_contact_jaccard": 0.7871314543800286
+    }
+   },
+   "wrong": {
+    "1": {
+     "horizon_ns": 1.0,
+     "n_proteins": 12,
+     "n_windows": 120,
+     "rmsd": 3.212943864365419,
+     "persist_rmsd": 3.3135457744201027,
+     "skill": 0.10060191005468377,
+     "contact_jaccard": 0.8435327865922612,
+     "persist_contact_jaccard": 0.8568558600027497
+    },
+    "4": {
+     "horizon_ns": 4.0,
+     "n_proteins": 12,
+     "n_windows": 120,
+     "rmsd": 4.200787398219108,
+     "persist_rmsd": 4.361461779475212,
+     "skill": 0.16067438125610334,
+     "contact_jaccard": 0.7744380371114797,
+     "persist_contact_jaccard": 0.8242112529544157
+    },
+    "16": {
+     "horizon_ns": 16.0,
+     "n_proteins": 12,
+     "n_windows": 120,
+     "rmsd": 5.136314613620441,
+     "persist_rmsd": 5.437325442830722,
+     "skill": 0.30101082921028066,
+     "contact_jaccard": 0.74408668538344,
+     "persist_contact_jaccard": 0.7871314543800286
+    }
+   },
+   "none": {
+    "1": {
+     "horizon_ns": 1.0,
+     "n_proteins": 12,
+     "n_windows": 120,
+     "rmsd": 3.210858544210593,
+     "persist_rmsd": 3.3135457744201027,
+     "skill": 0.10268723020950965,
+     "contact_jaccard": 0.8428757660598891,
+     "persist_contact_jaccard": 0.8568558600027497
+    },
+    "4": {
+     "horizon_ns": 4.0,
+     "n_proteins": 12,
+     "n_windows": 120,
+     "rmsd": 4.197850041588148,
+     "persist_rmsd": 4.361461779475212,
+     "skill": 0.16361173788706385,
+     "contact_jaccard": 0.772803643425792,
+     "persist_contact_jaccard": 0.8242112529544157
+    },
+    "16": {
+     "horizon_ns": 16.0,
+     "n_proteins": 12,
+     "n_windows": 120,
+     "rmsd": 5.128084706266721,
+     "persist_rmsd": 5.437325442830722,
+     "skill": 0.30924073656400086,
+     "contact_jaccard": 0.7436631377168533,
+     "persist_contact_jaccard": 0.7871314543800286
+    }
+   },
+   "wrong_temp_used": 320.0,
+   "T": 379.0,
+   "unseen_temperature": false,
+   "protein_set": "unseen_protein"
+  },
+  "T413__unseen_protein": {
+   "correct": {
+    "1": {
+     "horizon_ns": 1.0,
+     "n_proteins": 12,
+     "n_windows": 120,
+     "rmsd": 3.6630202849706013,
+     "persist_rmsd": 3.8216431826353072,
+     "skill": 0.15862289766470594,
+     "contact_jaccard": 0.8048334085586677,
+     "persist_contact_jaccard": 0.8263790034834616
+    },
+    "4": {
+     "horizon_ns": 4.0,
+     "n_proteins": 12,
+     "n_windows": 120,
+     "rmsd": 4.960638894637426,
+     "persist_rmsd": 5.242197919885317,
+     "skill": 0.28155902524789145,
+     "contact_jaccard": 0.7194565910977243,
+     "persist_contact_jaccard": 0.7803881658113289
+    },
+    "16": {
+     "horizon_ns": 16.0,
+     "n_proteins": 12,
+     "n_windows": 120,
+     "rmsd": 5.803781000773111,
+     "persist_rmsd": 6.25703343351682,
+     "skill": 0.4532524327437084,
+     "contact_jaccard": 0.6729261147162883,
+     "persist_contact_jaccard": 0.733332538779598
+    }
+   },
+   "wrong": {
+    "1": {
+     "horizon_ns": 1.0,
+     "n_proteins": 12,
+     "n_windows": 120,
+     "rmsd": 3.675113688906034,
+     "persist_rmsd": 3.8216431826353072,
+     "skill": 0.14652949372927315,
+     "contact_jaccard": 0.8095526275251853,
+     "persist_contact_jaccard": 0.8263790034834616
+    },
+    "4": {
+     "horizon_ns": 4.0,
+     "n_proteins": 12,
+     "n_windows": 120,
+     "rmsd": 4.977537697553635,
+     "persist_rmsd": 5.242197919885317,
+     "skill": 0.26466022233168207,
+     "contact_jaccard": 0.72753591800658,
+     "persist_contact_jaccard": 0.7803881658113289
+    },
+    "16": {
+     "horizon_ns": 16.0,
+     "n_proteins": 12,
+     "n_windows": 120,
+     "rmsd": 5.83325594762961,
+     "persist_rmsd": 6.25703343351682,
+     "skill": 0.42377748588720987,
+     "contact_jaccard": 0.6849448942399724,
+     "persist_contact_jaccard": 0.733332538779598
+    }
+   },
+   "none": {
+    "1": {
+     "horizon_ns": 1.0,
+     "n_proteins": 12,
+     "n_windows": 120,
+     "rmsd": 3.671577581763268,
+     "persist_rmsd": 3.8216431826353072,
+     "skill": 0.15006560087203935,
+     "contact_jaccard": 0.8084062965485338,
+     "persist_contact_jaccard": 0.8263790034834616
+    },
+    "4": {
+     "horizon_ns": 4.0,
+     "n_proteins": 12,
+     "n_windows": 120,
+     "rmsd": 4.9696757912635805,
+     "persist_rmsd": 5.242197919885317,
+     "skill": 0.27252212862173675,
+     "contact_jaccard": 0.7249854282725688,
+     "persist_contact_jaccard": 0.7803881658113289
+    },
+    "16": {
+     "horizon_ns": 16.0,
+     "n_proteins": 12,
+     "n_windows": 120,
+     "rmsd": 5.818263233701388,
+     "persist_rmsd": 6.25703343351682,
+     "skill": 0.43877019981543164,
+     "contact_jaccard": 0.6816962362935436,
+     "persist_contact_jaccard": 0.733332538779598
+    }
+   },
+   "wrong_temp_used": 320.0,
+   "T": 413.0,
+   "unseen_temperature": false,
+   "protein_set": "unseen_protein"
+  },
+  "T450__unseen_protein": {
+   "correct": {
+    "1": {
+     "horizon_ns": 1.0,
+     "n_proteins": 12,
+     "n_windows": 120,
+     "rmsd": 4.386907063921292,
+     "persist_rmsd": 4.609184459845225,
+     "skill": 0.2222773959239328,
+     "contact_jaccard": 0.7675128231014942,
+     "persist_contact_jaccard": 0.789895392084473
+    },
+    "4": {
+     "horizon_ns": 4.0,
+     "n_proteins": 12,
+     "n_windows": 120,
+     "rmsd": 5.804344979921976,
+     "persist_rmsd": 6.133691636721294,
+     "skill": 0.3293466567993182,
+     "contact_jaccard": 0.6832672203327599,
+     "persist_contact_jaccard": 0.745476955660572
+    },
+    "16": {
+     "horizon_ns": 16.0,
+     "n_proteins": 12,
+     "n_windows": 120,
+     "rmsd": 6.908044256766638,
+     "persist_rmsd": 7.413599601387976,
+     "skill": 0.5055553446213388,
+     "contact_jaccard": 0.6294404109980473,
+     "persist_contact_jaccard": 0.6998810327533276
+    }
+   },
+   "wrong": {
+    "1": {
+     "horizon_ns": 1.0,
+     "n_proteins": 12,
+     "n_windows": 120,
+     "rmsd": 4.409884509444236,
+     "persist_rmsd": 4.609184459845225,
+     "skill": 0.1992999504009889,
+     "contact_jaccard": 0.7745789074420592,
+     "persist_contact_jaccard": 0.789895392084473
+    },
+    "4": {
+     "horizon_ns": 4.0,
+     "n_proteins": 12,
+     "n_windows": 120,
+     "rmsd": 5.823384330670039,
+     "persist_rmsd": 6.133691636721294,
+     "skill": 0.31030730605125534,
+     "contact_jaccard": 0.6909416276891248,
+     "persist_contact_jaccard": 0.745476955660572
+    },
+    "16": {
+     "horizon_ns": 16.0,
+     "n_proteins": 12,
+     "n_windows": 120,
+     "rmsd": 6.944137356678644,
+     "persist_rmsd": 7.413599601387976,
+     "skill": 0.46946224470933196,
+     "contact_jaccard": 0.6443936629883867,
+     "persist_contact_jaccard": 0.6998810327533276
+    }
+   },
+   "none": {
+    "1": {
+     "horizon_ns": 1.0,
+     "n_proteins": 12,
+     "n_windows": 120,
+     "rmsd": 4.405107567707698,
+     "persist_rmsd": 4.609184459845225,
+     "skill": 0.2040768921375271,
+     "contact_jaccard": 0.7732508448411287,
+     "persist_contact_jaccard": 0.789895392084473
+    },
+    "4": {
+     "horizon_ns": 4.0,
+     "n_proteins": 12,
+     "n_windows": 120,
+     "rmsd": 5.812719685832659,
+     "persist_rmsd": 6.133691636721294,
+     "skill": 0.3209719508886355,
+     "contact_jaccard": 0.6910265781381947,
+     "persist_contact_jaccard": 0.745476955660572
+    },
+    "16": {
+     "horizon_ns": 16.0,
+     "n_proteins": 12,
+     "n_windows": 120,
+     "rmsd": 6.932718916734061,
+     "persist_rmsd": 7.413599601387976,
+     "skill": 0.48088068465391576,
+     "contact_jaccard": 0.6422392265350428,
+     "persist_contact_jaccard": 0.6998810327533276
+    }
+   },
+   "wrong_temp_used": 320.0,
+   "T": 450.0,
+   "unseen_temperature": true,
+   "protein_set": "unseen_protein"
+  }
+ },
+ "temperature_response_rmsd_correct": {
+  "T320": 4.561435270806153,
+  "T348": 4.981597045063973,
+  "T379": 5.119661369919777,
+  "T413": 5.803781000773111,
+  "T450": 6.908044256766638
+ },
+ "temperature_monotone": true
+}
