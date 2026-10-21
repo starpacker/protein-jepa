@@ -91,6 +91,12 @@ class StageB1bConfig:
     # is the legacy value; a larger init (e.g. 1.0) makes an untrained from-none
     # rollout mean-reverting.
     tail_init: float = 1.0e-3
+    # Truncated BPTT window (in rollout steps).  None keeps the full graph.
+    # Long physical horizons need many steps: 64 ns is 64 steps at 1 ns/frame but
+    # 640 at 100 ps/frame, and retaining the graph for all of them costs tens of
+    # GB.  Only the last `rollout_grad_steps` transitions stay differentiable;
+    # the forward pass and every horizon's value are unchanged.
+    rollout_grad_steps: int | None = None
 
     def __post_init__(self):
         if self.latent_dim < 1 or self.bath_dim < 0:
@@ -604,6 +610,7 @@ class StageB1b(nn.Module):
         H_hist=None, dt_hist=None, seq_feature=None, generator=None,
         S0=None, detach: bool = True,
         return_bath: bool = False,
+        grad_steps: int | None = None,
     ):
         """Rollout from H0 for n_steps.
 
@@ -613,6 +620,14 @@ class StageB1b(nn.Module):
         Training path (detach=False): gradients flow through the history
         posterior and the dynamics, so the energy score in (2.5) can train
         both r_psi and the kernel.
+
+        ``grad_steps`` truncates backprop-through-time: the FORWARD pass still
+        runs all ``n_steps`` (so long-horizon targets and the energy score are
+        genuinely evaluated at e.g. 64 ns), but once the rollout is more than
+        ``grad_steps`` steps old the recurrent state is detached from the graph.
+        Autograd therefore retains only a sliding window of activations instead
+        of the whole trajectory, which is what makes a 640-step rollout at
+        100 ps/frame fit in memory.  None keeps the full graph.
 
         Returns stacked H trajectory [B, n_steps+1, L, dH].
         """
@@ -637,11 +652,21 @@ class StageB1b(nn.Module):
         traj = [H0]
         bath_traj = [S] if S is not None else None
         H = H0
-        for _ in range(n_steps):
+        for i in range(n_steps):
             H, S = self.sample_step(
                 H, S, residue_mask, temperature_k, seq_feature, generator,
                 create_graph=not detach,
             )
+            # Truncated BPTT aimed at the scored horizon: the losses of interest
+            # live at the END of the rollout, so we keep the last `grad_steps`
+            # transitions differentiable and detach everything before them.
+            # Forward values are untouched, so every horizon is still evaluated
+            # exactly; autograd just stops accumulating the early trajectory.
+            if (not detach and grad_steps is not None
+                    and i < n_steps - grad_steps):
+                H = H.detach()
+                if S is not None:
+                    S = S.detach()
             traj.append(H)
             if bath_traj is not None:
                 bath_traj.append(S)

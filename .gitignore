@@ -40,6 +40,10 @@ docs/
 # jepa_anything reference copy (external repo)
 jepa_anything/
 
+# third-party model clones / vendored checkpoints (not our code)
+baselines/bioemu2/
+mdgen_baseline/*.ckpt
+
 tmp_claude/
 .tmp_eval/
 archive/

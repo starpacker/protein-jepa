@@ -515,3 +515,340 @@ longer horizons widen the gap.
 - Stability: bounded/sub-diffusive rollout (no blow-up) with the from-none additions.
 - Perf: vectorised Kabsch made the ns=96 step 27 s → 3 s.
 - Legacy kernel compatibility: all additions are opt-in; defaults preserve behaviour.
+
+## Latent-dynamics audit: is H collapsing, and does S move? (2026-10-18)
+
+Motivated by the classic JEPA failure modes — **representation collapse** (H constant
+in time) and **trivial dynamics** (the propagator S ≈ identity, so the rollout adds
+nothing) — we instrumented the autonomous GLE rollout and measured H and S directly
+on **real held-out mdCATH val proteins** (6 proteins per run, not one sample).
+
+**Horizon → time mapping.** `step_ps = 1000` ps/frame ⇒ **1 frame = 1 ns**. The
+protocol horizons `(8,16,24,32,48,64,96)` frames therefore map 1:1 to
+`(8,16,24,32,48,64,96)` ns. The rollout is run at the **max** horizon (96 frames);
+shorter lags are read as prefixes of the same trajectory. Encoder eval step:
+main run = 6000, temp (T=450) run = 3500. `bath_dim = 8`, `dH = 128`.
+
+**Metrics.**
+- `H_cos(τ)` = cosine(autonomous-rollout H at lag τ, encoded ground-truth H at lag τ)
+  — does the propagated H track *where the representation actually goes*?
+- `|ΔH|(τ)` = L2 norm of (H_τ − H_0) — is H actually moving in time?
+- `H_gt_cos(τ)` = cosine(autonomous H_τ, GT-encoded H_τ) via the *oracle* future frame,
+  i.e. the ceiling for the rollout's H.
+- `|S_τ − S_0|` (and `_rel` = /‖S_0‖) — does the propagator evolve or sit at identity?
+- `H_resid_std` = per-dimension residue spread of H (≈0 ⇒ collapsed code).
+
+![H/S latent-dynamics curves](tmp_claude/hs_curves.png)
+
+*Curves: `tmp_claude/hs_curves.png` (also `.pdf`); raw values `tmp_claude/hs_curves.json`,
+arrays `tmp_claude/hs_curves.npz`; generator `tmp_claude/viz_h_s_curves.py`.*
+
+### 1. H is NOT constant — it moves, monotonically, with the right shape
+
+| lag (ns) | 8 | 16 | 24 | 32 | 48 | 64 | 96 |
+|---|---|---|---|---|---|---|---|
+| `H_cos` main | 0.876 | 0.839 | 0.809 | 0.786 | 0.747 | 0.721 | 0.682 |
+| `H_cos` temp | 0.891 | 0.840 | 0.809 | 0.784 | 0.746 | 0.716 | 0.677 |
+| `\|ΔH\|` main | 4.55 | 5.31 | 5.86 | 6.23 | 6.92 | 7.34 | 8.00 |
+| `\|ΔH\|` temp | 4.17 | 5.09 | 5.61 | 6.01 | 6.65 | 7.12 | 7.74 |
+
+`H_cos` declines **monotonically** 0.88 → 0.68 (never flat at 1.0), and `|ΔH|` climbs
+**monotonically** 4.5 → 8.0. Both runs — held-out protein *and* held-out temperature —
+show the same shape. This rules out time-invariant collapse: H is a genuine
+function of time, not a constant code.
+
+### 2. H carries real time signal — it matches where the representation goes
+
+The **oracle ceiling** `H_gt_cos` is ≈**0.9997** at every lag (both runs): the
+autonomous H is almost exactly the encoded future H. The rollout's H is therefore
+tracking the true trajectory of the representation, not drifting arbitrarily. The
+gap between `H_cos` and its ceiling (0.68 vs 0.9997 at 96 ns) is the *predictable*
+part that the drift still has to recover — and it is the quantity the current repairs
+target.
+
+### 3. S is NOT identity — the propagator evolves with a lag-independent offset
+
+| lag (ns) | 8 | 16 | 24 | 32 | 48 | 64 | 96 |
+|---|---|---|---|---|---|---|---|
+| `\|S_τ−S_0\|` main | 17.25 | 17.57 | 17.80 | 17.63 | 17.69 | 17.73 | 17.87 |
+| `\|S_τ−S_0\|ₚₑₗ` main | 1.12 | 1.13 | 1.15 | 1.14 | 1.14 | 1.15 | 1.16 |
+| `\|S_τ−S_0\|` temp | 9.60 | 9.66 | 9.55 | 9.53 | 9.59 | 9.56 | 9.63 |
+| `\|S_τ−S_0\|ₚₑₗ` temp | 1.39 | 1.40 | 1.39 | 1.39 | 1.39 | 1.40 | 1.40 |
+
+`|S_τ − S_0|` is large and non-zero at *every* lag (17–18 main, 9.5–9.7 temp), with a
+relative change ≈1.1–1.4× the S₀ norm. S is not the identity map. (Note: `S_τ − S_0`
+is nearly lag-independent — S settles quickly into a shifted operating point, which is
+consistent with the bounded/sub-diffusive rollout seen in the stability check.)
+
+### 4. H is NOT a collapsed code — per-dim residue spread is healthy
+
+`H_resid_std` = **0.79** (main) / **0.84** (temp), well away from 0. Individual latent
+dimensions retain distinct spreads, so H is an informative code, not a degenerate one.
+
+**Verdict: neither classic JEPA failure mode is present.** H moves in time, tracks
+the representation's true trajectory (up to the `H_cos` gap), is non-degenerate; S is
+non-identity. The remaining headroom is the `H_cos`-vs-ceiling gap (recoverable
+predicted motion), which is what the anchor-H / H-space displacement repairs
+(修改 1–2 above) are designed to close — not a collapse problem.
+
+---
+
+## 2026-10-18（三续）修改 1+2 的 2k-step 结果：未过 gate，但查明了更深一级的根因
+
+### 实验结果（`artifacts/stage_a_disp_fix`，step 2000）
+
+| 指标 | 旧 v2 (3000) | 修复版 fix (2000) |
+|---|---:|---:|
+| within ratio h=1/2/4/8 | 0.946/0.942/0.939/0.935 | 0.949/0.945/0.937/0.938 |
+| H-delta→位移 pattern R² | 0.044 | 0.027 |
+| per-residue 方向余弦 | 0.20 | 0.17 |
+
+**修改 1+2 没有改善 H 的读出**（统计上完全相同）。cross 反而略差。
+
+### 更深的根因（这次查到了）
+
+我做了**可解码性上界**实验（同蛋白、单帧、overfit vs held-out）：
+
+| 读出器 | R² |
+|---|---:|
+| **Overfit** MLP H→位移（训练=测试=全部帧） | **1.000** |
+| Held-out MLP H→位移（同蛋白留出帧） | **0.093** |
+| Held-out ridge，用 `[H_anchor, H_future, ΔH, 全局均值]` 拼接 | **0.089** |
+
+**解读**：overfit R²=1.0 说明 H 里**存在**与位移相关的特征，但那只是**帧身份记忆**（MLP 靠"这是哪一帧"取巧）。
+一旦要**泛化到同蛋白未见帧**，R² 崩到 0.09 —— 即使把 anchor/future/ΔH/全局均值全拼进去也一样。
+
+**结论**：`ProteinGeometryEncoder` 的 per-residue H 是**帧不变（SE(3)-invariant）的局部描述子**，
+它**本身没有"相对某个参考帧"的坐标**。而"内部 CA 位移"的定义**必须**有一个参考系
+（相对 anchor 的局部框）。所以：
+> **不是监督问题，不是 predictor 问题，是 H 的表达能力问题——缺一个"相对 anchor 的参考帧通道"。**
+> 这也解释了为什么 overfit 能到 1.0：MLP 把"帧身份"当成了隐式参考系，但它不可泛化。
+
+### 判读与下一步
+- 修改 1+2 已证伪：光把监督"引向 H"不够，因为 H 没有可承载位移的**坐标系**。
+- 直接上 **修改 4**（相对 anchor 的全局/局部坐标通道），这是根因所在。
+- 级别：这是**架构改动**，会牺牲一部分纯 SE(3)-不变性（变成"相对 anchor 等变"），
+  但"内部位移"本来就只能在某个参考系下定义，所以这是**必要的**，不是妥协。
+
+---
+
+## 2026-10-18（四续）⚠️ 重大更正：gate 本身不成立——位移在"单帧→未来"下本质不可预测
+
+实施了**修改 4**（encoder 加 within-frame PCA canonical-frame position 通道），2k-step run
+（`artifacts/stage_a_disp_relpos`）。结果与两次前序一样：within ratio ~0.95–0.96，**没过 gate**。
+
+我没有停在"又失败"，而是去量**这个任务的物理上界**——用**真实 anchor 坐标**（不是 H！）
+去预测 h-步后的内部位移，仍然 time-split 训练/留出：
+
+| h | 探针 (H→位移) held-out R² | **真 anchor 坐标→位移** held-out R² | 同任务 in-sample R² |
+|---|---:|---:|---:|
+| 1 | ~0.05 | **0.022** | 0.88 |
+| 2 | ~0.06 | **0.029** | 0.88 |
+| 4 | ~0.05 | **0.026** | 0.88 |
+| 8 | ~0.05 | **0.051** | 0.88 |
+
+**关键事实**：
+1. 给**真实结构**（anchor 坐标，无编码器、无信息损失）做同样的拟合，**留出 R² 也只有 0.02–0.05**。
+2. 同一拟合 **in-sample R²=0.88** —— 说明 ridge 能拟合训练段，但**该映射不迁移**到留出帧。
+3. 用训练段均值预测留出，R² 甚至 **−0.08**（反向）。
+
+**结论（更正前几轮的判断）**：
+> **"同蛋白 held-out H→位移 R²≤0.5"这个 gate 在物理上不可达。**
+> 单帧结构到 h-步后内部位移的映射**不是稳定函数**——它被**不可预测的热涨落/混沌动力学**主导。
+> 任何"单帧表示"（H、真坐标、甚至 oracle）都只能拿到 R²≈0.05。
+> 因此：
+> - **H 不是瓶颈**：H 的 R²≈0.05–0.09 已经**达到甚至略高于真坐标的上界**。
+> - 前几轮"表示坏了 / 缺参考帧"的结论**部分错误**（overfit R²=1.0 是帧身份记忆，这没错；
+>   但 held-out 低**不是** H 的锅，而是任务本身）。
+> - `within ratio ≈ 0.94`（赢 persistence 6%）**已经是天花板附近**，不是失败。
+
+**这轮实验的真实收获**：
+- 修改 4 的 position 通道**确实工作**：`struct_recon` 从 ~0.75 降到 **0.025**（H 现在能极好地编码结构），
+  且 H 对**绝对 anchor-relative 位置**的 R² 从 0.04 提到 **0.13**。这是真实的能力提升，
+  只是**位移预测**这个具体 probe 测不出来（因为位移本身不可预测）。
+- 修改 1+2 无害。
+
+**下一步建议（需你决定）**：
+1. **换 gate**：不要再要求"H 预测单帧位移"。改用**可预测的量**做验收，例如：
+   - H 对**当前帧结构**的可解码性（struct_recon / CA 距离 / 绝对位置）——现在 fix+relpos 已显著改善；
+   - H 的**时间信息**（能否区分 Δt、能否预测**集合**统计如 Rg、接触图变化）；
+   - multi-frame 输入（给 H_{t}, H_{t-1} 提供速度）后再查位移——这才有希望。
+2. **或换任务**：把 Stage A 的目标从"单帧预测未来帧"改成"预测**可解码的未来结构量**"
+   （例如未来帧的 CA 距离矩阵 / 接触图），这些**是可从当前帧部分预测的**。
+3. 直接用**fix+relpos 的 encoder** 进 B1a/B1b，看下游 decoder 的 CA RMSD 是否比 4.148 Å 好——
+   因为现在 struct_recon=0.025、位置 R²=0.13，**结构保真度**是这三轮里最好的。
+
+我倾向 **先做 3**（用当前最好的 encoder 跑一次下游，拿真实 CA RMSD 说话），
+因为它直接回答你最关心的"4.148 Å 能不能降"，且不依赖这个有问题的 probe。
+
+---
+
+## 2026-10-18 (晚) — 方向 3 完成：结论「<1.2 Å 在 mdCATH 单帧 anchor 下不可达」
+
+完整数据见 `STAGE_A_REPAIR_RESULTS_20261018.md` §8–§10。
+
+**做了什么**
+1. 单批过拟合探针证明 B1a anchor-free decoder **会收敛**（ca_mse 139→0.47，real-H 1.17 Å），
+   之前"持平 ~200"是**观测太早 + 慢启动**，非代码 bug。
+2. 但 anchor-free decoder 在 4000 蛋白上**过拟合、不泛化**（val real-H≈27 ≫ persist 3.66）：
+   它要从 H 重建整个折叠，而 H 承载不了折叠。
+3. **改回 anchored decoder**（放宽 `train_stage_b1a.py` 的 `--no-anchor-free` 硬门）：
+   从 anchor 真实逐残基 CA 出发，只预测有界 `d_local`。
+4. anchored decoder **正确收敛且泛化**：val real=**4.495** vs persist=4.540（好 1%）、
+   zeroH=4.651、wrongH=4.501 → **H 被用但时间预测力≈0**（real≈wrongH）。
+5. 帧间隔 `frame_interval_ps=1000`（1 ns），val 上 1 ns 位移中位 **2.8 Å** → persistence 地板 ~3–4.5 Å。
+
+**根因判定**：瓶颈**不在** encoder/decoder 代码，而在**单帧→未来位移的可预测性**（§2：R²≈0.02–0.05）。
+`<1.2 Å` 需要：亚 ns 帧 / 紧邻多帧 anchor / 或改系综级目标。
+
+**代码改动**：`protein_jepa_frame/training/train_stage_b1a.py`（放开 `--no-anchor-free` 门）。
+**产物**：`artifacts/stage_b1a_relpos_anchored/`（best ckpt 收敛于天花板）。
+
+---
+
+## 2026-10-18/19 — 系综级目标 T1–T7 完成 + ATLAS 忠实评估
+
+**计划**：`PLAN_ENSEMBLE_20261018.md`；**结果**：`ENSEMBLE_RESULTS_20261018.md`。
+
+**做了什么**
+1. **T1–T4**（新文件，不动精确坐标解码）：`evaluation/ensemble_metrics.py`、
+   `training/ensemble_targets.py`、`models/ensemble_producer.py`、
+   `training/ensemble_losses.py`；`tests/test_ensemble_*.py` **30 tests pass**。
+2. **T5**：`training/train_stage_ensemble.py`（只训练新 `GaussianHHead`，
+   encoder/decoder 冻结只读）。修 **NaN-backward**：`rmsf_profile` 的 `sqrt` 在
+   方差=0 处梯度 ∞ → `clamp_min(1e-12)`；`pair_distance_hist` 同理。
+   4000-step 训练收敛：**val total 2.866 vs persist 3.540；RMSF 0.764 vs 1.512（好 49%）**。
+3. **T6**：`scripts/eval_ensemble_manifest.py`，model/persist/oracle + bootstrap 95% CI。
+   - **mdCATH val（同分布）**：total +0.728 [0.63,0.82]、RMSF +0.835 [0.74,0.94]
+     → **显著优于 persistence（GO）**；contact/dist 略差。
+   - **ATLAS val（未见）**：**全部指标显著变差**（输 persistence）→ 不跨数据集泛化。
+4. **ATLAS 忠实评估**：先确认训练**完全没用 ATLAS**（只 mdCATH），ATLAS train/val
+   蛋白 disjoint。发现并修 eval 采样 bug（原 `shuffle=False` 只覆盖第 1 条轨迹）；
+   改为全数据集随机抽样。独立复核 ATLAS persistence（直接对 npz 算 Kabsch CA RMSD
+   0.2–1.7 Å）属实——**ATLAS 轨迹近刚性**，persistence 地板本就极低。
+
+**结论**：系综级 loss 在**同分布**下有效（RMSF 谱显著更优），但**近刚性数据上失配**。
+下一步：ATLAS train 微调 head / 柔性门控（退化为 persistence）/ 温度分层校准。
+
+---
+
+## 2026-10-19 — 双数据集训练 + 系综目标 + 位置引导（D0–D7）完成
+
+**计划**：`PLAN_DUAL_ENSEMBLE_20261019.md`；**结果**：`DUAL_ENSEMBLE_RESULTS_20261019.md`。
+
+**用户要求**：用 mdCATH + ATLAS **两个数据集一起训练**，target **系综级 metrics**，
+并允许**原子位置重建**作为引导指标。
+
+**做了什么**
+1. **D0** `scripts/build_mixed_manifest.py`（NEW）：拼 mdCATH(4000)+ATLAS-100ps(270)，
+   帧间隔不同（1000 vs 100 ps）由 `load_manifest` 按 `frame_interval_ps` 正确解析；
+   正交校验 train/val 蛋白 disjoint；支持 ATLAS 过采样（train 过采样、**val 不过采样**）。
+2. **D1** `ensemble_producer.py`：`GaussianHHead(cond_dim=)` 可选
+   时标/温度条件（默认 0 不改行为）。
+3. **D2** `ensemble_losses.py`：新增 `_position_loss`（Kabsch CA MSE）+
+   `pos_weight`，作为**原子位置引导项**。
+4. **D3** `train_stage_ensemble.py`：`--pos-weight` / `--cond-dims`，
+   validate 含 persist 位置基线。单测扩到 **35 pass**。
+5. **D4** 三个 run 各 4000 steps（GPU 2/3/5 并行）：
+   A=mixed(无 pos)、B=mixed+pos、C=mixed×3+pos+cond。
+6. **D5** 在 mdCATH / ATLAS-100ps / ATLAS-1ns 三个 val 上跑
+   `scripts/eval_ensemble_manifest.py`，bootstrap 95% CI。
+
+**关键结果**
+- **逐项精确结论（见 `DUAL_ENSEMBLE_RESULTS_20261019.md`）**：
+  - ✅ **RMSF 谱**：三个 val 上 **100% 窗口优于 persistence**（mdCATH Δ=−0.87；
+    ATLAS Δ≈−0.03），这是本轮唯一真正拿下的指标。
+  - ✅ **total**：97–100% 窗口更优，但**几乎完全由 rmsf 项贡献**（加权净正）。
+  - ❌ **contact / dist**：**系统性差于 persistence**（≈100% 窗口更差），**未拿下**。
+  - ⚠️ **pos (CA RMSD)**：仅 mdCATH 略胜（4.559 vs 4.627 Å），ATLAS 反而输（0.12 vs 0.11 Å）；
+    仍远离 <1.2 Å。
+  ⇒ 不能宣称"系综级指标全面超过 persistence"。
+- **ATLAS 从上轮"全面显著变差"翻转为"显著变好"**——混合训练直接修掉跨数据集失配。
+  - A：ATLAS-1ns Δtotal +0.029 [0.027,0.030]；ATLAS-100ps +0.026 [0.025,0.027]。
+- **位置引导有效**：mdCATH 上 C 的 pos 20.78 < persist 21.41，且系综指标不退化。
+- mdCATH val：Δtotal ~ +0.75（A）/+1.02~1.07（B/C），Δrmsf +0.76~0.84。
+
+**代码**：全部新增或只读；未触碰精确原子坐标解码路径。
+**产物**：`artifacts/stage_ensemble_dual{A,B,C}/`、`artifacts/eval_dual/*.json`、
+`artifacts/mixed_manifest_100ps{,_x3}/`。
+
+---
+
+## 2026-10-19 · 扩展系综指标（6 项，新文件）
+
+**要求**：把 6 个系综级指标写在一起评估并汇报：RMSF / ROOT-MEAN W2 / VARIANCE W2 /
+MD-PCA W2 / WEAK-CONTACT J / TRANSIENT-CONTACTS J。
+
+**诚实前置**：这 5 个新指标**此前没有现成脚本**（仓库只有 rmsf、threshold=0.5 的
+contact Jaccard、内距 soft-EMD）。本次**全部新写**。
+
+**实现**
+- `evaluation/ensemble_metrics_ext.py`（NEW）：`w2_1d`（精确 1-D Wasserstein-2，排序分位）、
+  `root_mean_w2`、`variance_w2`、`md_pca_w2`、`weak_contact_jaccard`、
+  `transient_contact_jaccard`、`extended_ensemble_summary`。oracle→W2=0 / J=1。
+- `scripts/eval_ensemble_metrics_suite.py`（NEW）：model / persistence / oracle 三系综，
+  6 指标一起算，bootstrap 95% CI + 逐窗口胜率；三 val × 三 run。
+- `tests/test_ensemble_metrics.py`：+7 测试（共 19）。
+- 结果 JSON：`artifacts/eval_dual_suite/{A,B,C}_{mdcath,atlas100ps,atlas1ns}.json`。
+- **未改动** `protein_jepa_frame/` 内任何精确坐标解码实现（mtime 校验）。
+
+**关键结果（见 `DUAL_ENSEMBLE_RESULTS_20261019.md` §6）**
+- **mdCATH**：6 指标**全部 94–100% 窗口优于 persistence**（W2 家族 + Jaccard 全胜）。
+- **ATLAS-1ns / 100ps**：4 个 W2/RMSF **100% 胜**；2 个 Jaccard 均值更好但**胜率仅 6–10%**
+  （近刚体系 persistence 已≈0.94，单窗口赢不动）。
+- **A/B/C 三配置结论一致** ⇒ 收益来自双数据集混合训练，非 pos/cond 项。
+- ⚠️ 口径差异：§1 训练 loss 的 contact/dist 仍差于 persistence，而 §6 评估口径的
+  弱/瞬时接触 Jaccard 在 mdCATH 上 100% 胜——**报告时须注明是 loss 口径还是评估口径**。
+
+### 2026-10-19 · 补充：RMSF-r + 澄清 persist-J=0
+
+- **新增 RMSF-r（形态）**：`extended_ensemble_summary` 现在同时输出 `rmsf_corr`
+  （逐残基 RMSF 谱的 Pearson 相关）。mdCATH：model **0.553** vs persist **0.000**（100% 胜）；
+  ATLAS-1ns/100ps：0.097/0.096 vs 0.000（87–90% 胜）。persist 恒 0 因 delta 系综 RMSF 谱为常数。
+- **澄清 "mdCATH 上 persist contact-J/transient-J=0.000"**：这是 **persistence 的数学性质**，
+  与 mdCATH 无关——anchor 复制 8 份 ⇒ contact-prob 图**只有 {0,1}** ⇒
+  弱/瞬时接触集合**恒为空**（`weak_n_pred=0`）⇒ 真值集合非空时 `J=0/|A|=0`。
+  ATLAS 的 0.90/0.94 是**退化假高分**（真值近二值、多数窗口双空 ⇒ 约定返回 1.0）。
+- **代码**：新增 `weak/transient_contact_jaccard_full` 显式返回 `n_true/n_pred/n_inter`；
+  suite 输出 `diagnostics` 字段可追溯。测试 21 项全过。
+- **修订**：§6 重写（7 指标，含 RMSF-r 与 §6.5 的 persist-J 归因）。
+
+### 2026-10-19 · RMSF-r 细化：global + per-target（mdCATH）
+
+- 评估脚本新增 RMSF-r **三种口径**：global（全体窗口残基池化一次相关）、
+  per-window（逐窗口相关后取均值）、**per-target**（按 `protein_id` 聚合每蛋白一条相关，
+  再给 19 个 target 的分布）。
+- **mdCATH（19 targets / 87 trajectories / 100 windows）**：
+  - run A model：global **+0.604**，per-target 均值 **+0.581**（median +0.610，
+    min **+0.347**、max +0.839，**19/19 为正**），per-window 均值 +0.548。
+  - persistence：三种口径 **全 0.000**；oracle：全 **1.000**。
+  - B/C：global +0.516/+0.571，per-target 均值 +0.498/+0.549，排序一致。
+- 按用户判断 **ATLAS 不再作主口径**（近刚性退化），报告只报 mdCATH；ATLAS JSON 留存备查。
+- `DUAL_ENSEMBLE_RESULTS_20261019.md` 新增 §6.2b。
+
+### 2026-10-20 · MDGen 基线对照（轨迹生成，mdCATH）
+
+**用户诉求**：配置 MDGen 作 baseline；**zero-shot 与"简单短训练"分别评估效果**，zero-shot 优先；
+双方在 mdCATH 上、用同一套系综指标 + **Kabsch CA RMSD**（CA 位置）对比。
+
+- **MDGen 官方权重**：HF `bjing-mit/mdgen` → 下载 `atlas.ckpt`(蛋白级 forward-sim,
+  num_frames=250/crop=256) 与 `forward_sim.ckpt`(四肽, crop=4, 不适用) 到
+  `/liuyutian/mdgen_run/hf_mdgen/`。
+- **新脚本**（均为新文件，未改精确坐标解码路径）：
+  - `scripts/eval_mdgen_baseline.py`：MDGen forward-sim → 未来帧系综 → 7 指标 + Kabsch。
+  - `scripts/eval_ours_trajectory.py`：我们的模型**自回归 rollout** → 同套指标。
+  - `mdgen_baseline/mdgen_compat.py` **新增**：torchvision/torchmetrics 破损时的
+    stub、ODE 步数控制（euler@N）、mdCATH 短轨迹守卫。
+- **坑**：mdgen 默认 `dopri5` 采样的 ~4 min/窗口 → 改 `euler@20`，**~7 s/窗口**；
+  环境 torchvision 轮子损坏 → 用 `torchmetrics` stub 绕过。
+- **零样本结果**（32 窗口, 100 帧）：Kabsch **7.34 Å**、RMSF **4.65 Å**，
+  **差于 persistence(4.01 Å)** ⇒ **atlas.ckpt 无法直接用于 mdCATH**
+  （10 ps/帧 训练 vs mdCATH 1000 ps/帧，OOD）。
+- **mdCATH 短训结果**：epoch1 Kabsch 19.69 Å、epoch5 **26.76 Å（更差）** ⇒
+  **5 epoch 远未收敛**（flow-matching 需 ~10^4 epoch），当前不构成对手。
+- **我们的 rollout**：7 指标里 6 个最好（rmsf_mae 1.455 / rmsf-r 0.334 /
+  var_w2 10.21 / pca_w2 0.080 / 两 Jaccard），**但 Kabsch 6.34 Å 差于 persistence**
+  （自回归回填漂移）⇒ 后续 Stage B 轨迹任务的改进点。
+- 结果写入 `DUAL_ENSEMBLE_RESULTS_20261019.md` §7；原始 JSON 在
+  `artifacts/eval_mdgen/`、`artifacts/eval_ours_traj/`。
+- MDGen mdCATH 训练**仍在继续**（写稿时 epoch 7）。

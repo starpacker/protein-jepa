@@ -61,6 +61,7 @@ class StageBOracleConfig:
     decoder_n_ipa_blocks: int = 4
     decoder_n_heads: int = 4
     decoder_torsion_bins: int = 36
+    decoder_dropout: float = 0.1
 
     # Anchor-local displacement budget for the oracle decoder.  B1a is an
     # *oracle*: it is handed the TRUE future H, so it must be able to reach the
@@ -135,8 +136,10 @@ class HNormalizer(nn.Module):
     def fit(self, h_samples: torch.Tensor) -> None:
         """Fit from a representative H tensor [..., dH] collected over the training set."""
         flat = h_samples.reshape(-1, self.latent_dim).float()
+        if flat.shape[0] == 0 or not torch.isfinite(flat).all():
+            raise ValueError("normalizer requires finite, nonempty training H")
         self.mean_.copy_(flat.mean(dim=0))
-        self.std_.copy_(flat.std(dim=0).clamp(min=self.MIN_STD))
+        self.std_.copy_(flat.std(dim=0, correction=0).clamp(min=self.MIN_STD))
         self.fitted_.fill_(True)
 
     def forward(self, h: torch.Tensor) -> torch.Tensor:
@@ -254,6 +257,7 @@ class StageBOracleDecoder(nn.Module):
             n_ipa_blocks=config.decoder_n_ipa_blocks,
             n_heads=config.decoder_n_heads,
             torsion_bins=config.decoder_torsion_bins,
+            dropout=config.decoder_dropout,
             max_local_position_update=config.decoder_max_local_position_update,
             freeze_ab=True,
             global_h_context=getattr(config, "decoder_global_h_context", True),
@@ -273,7 +277,7 @@ class StageBOracleDecoder(nn.Module):
 
     def decode_structure(
         self,
-        H: torch.Tensor,          # [B, L, dH]  H at target time (normalised or raw)
+        H: torch.Tensor,          # [B, L, dH] raw encoder H only
         aatype: torch.Tensor,     # [B, L]
         R_anchor: torch.Tensor,   # [B, L, 3, 3]  last observed frame rotations
         t_anchor: torch.Tensor,   # [B, L, 3]     last observed frame translations
@@ -285,6 +289,8 @@ class StageBOracleDecoder(nn.Module):
         they fix absolute placement only.  The internal conformation
         ``d_local`` is predicted from ``H`` alone.
         """
+        if H.shape[-1] != self.config.latent_dim:
+            raise ValueError("decoder expects raw H with the bundle latent dimension")
         return self.decoder(
             aatype=aatype,
             q_dynamics=H,      # single state pathway: Q := H_t
@@ -303,6 +309,28 @@ class StageBOracleDecoder(nn.Module):
         H_norm = self.h_normalizer(H_future)
         return self.probe(H_norm, pair_idx, valid_mask)
 
+    @torch.no_grad()
+    def refit_normalizer(self, raw_h_samples: torch.Tensor, preserve_probe: bool = True) -> None:
+        """Refit train statistics, preserving the probe's raw-H mapping exactly.
+
+        A changed encoder needs new dynamics coordinates. The decoder consumes
+        raw H and is unaffected; adjust each probe input affine map to avoid
+        invalidating a calibrated probe when its normalization changes.
+        """
+        old_mean = self.h_normalizer.mean_.clone()
+        old_std = self.h_normalizer.std_.clone()
+        fitted = bool(self.h_normalizer.fitted_)
+        self.h_normalizer.fit(raw_h_samples)
+        if preserve_probe and fitted:
+            ratio = self.h_normalizer.std_ / old_std
+            offset = (self.h_normalizer.mean_ - old_mean) / old_std
+            for layer, repeats in ((self.probe.torsion_head[0], 1),
+                                   (self.probe.dist_head[0], 2),
+                                   (self.probe.contact_head[0], 2)):
+                original = layer.weight.clone()
+                layer.bias.add_(original @ offset.repeat(repeats))
+                layer.weight.mul_(ratio.repeat(repeats)[None])
+
     def freeze_for_b1b(self) -> None:
         """Permanently freeze the H normalizer and decoder after B1a.
 
@@ -315,6 +343,7 @@ class StageBOracleDecoder(nn.Module):
         for p in self.probe.parameters():
             p.requires_grad_(False)
         self.h_normalizer.requires_grad_(False)
+        self.eval()
 
 
 # ─────────────────────────────────────────────────────────────────────────────

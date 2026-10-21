@@ -1,0 +1,348 @@
+{
+  "baseline": "bioemu2",
+  "checkpoint": "/liuyutian/protein_jepa_frame/baselines/bioemu2/checkpoints/bioemu2-preview/checkpoint.ckpt",
+  "manifest": "artifacts/mdcath_manifest_1000dom/val.jsonl",
+  "n_samples": 12,
+  "n_windows": 200,
+  "horizons_ns": [
+    1.0,
+    4.0,
+    16.0,
+    64.0
+  ],
+  "sampler": "edm",
+  "by_horizon": {
+    "1": {
+      "horizon_ns": 1.0,
+      "n_windows": 50,
+      "metrics": {
+        "rmsf_corr": {
+          "model": 0.4469868645071983,
+          "persistence": 0.0,
+          "improvement": 0.4469868645071983,
+          "ci95": [
+            0.39643325306475163,
+            0.4966768816411494
+          ],
+          "model_better": true,
+          "win_rate": 0.98
+        },
+        "rmsf_mae": {
+          "model": 2.166402574777603,
+          "persistence": 1.8983577215671539,
+          "improvement": -0.26804485321044924,
+          "ci95": [
+            -0.5987101987898349,
+            0.09000728487968432
+          ],
+          "model_better": false,
+          "win_rate": 0.3
+        },
+        "root_mean_w2": {
+          "model": 5.602123109475269,
+          "persistence": 1.683353351212924,
+          "improvement": -3.9187697582623446,
+          "ci95": [
+            -4.703879743650979,
+            -3.196116927888986
+          ],
+          "model_better": false,
+          "win_rate": 0.04
+        },
+        "variance_w2": {
+          "model": 15.256413614105078,
+          "persistence": 7.253093671472386,
+          "improvement": -8.003319942632691,
+          "ci95": [
+            -11.20168617075651,
+            -4.866456708141668
+          ],
+          "model_better": false,
+          "win_rate": 0.18
+        },
+        "md_pca_w2": {
+          "model": 0.08161044642415206,
+          "persistence": 0.18388030416750592,
+          "improvement": 0.10226985774335384,
+          "ci95": [
+            0.0820790805858111,
+            0.122793234651082
+          ],
+          "model_better": true,
+          "win_rate": 0.9
+        },
+        "weak_contact_j": {
+          "model": 0.0,
+          "persistence": 1.0,
+          "improvement": -1.0,
+          "ci95": [
+            -1.0,
+            -1.0
+          ],
+          "model_better": false,
+          "win_rate": 0.0
+        },
+        "transient_contacts_j": {
+          "model": 0.1744313030456429,
+          "persistence": 0.0,
+          "improvement": 0.1744313030456429,
+          "ci95": [
+            0.16484014391364038,
+            0.18387509440271285
+          ],
+          "model_better": true,
+          "win_rate": 1.0
+        }
+      }
+    },
+    "4": {
+      "horizon_ns": 4.0,
+      "n_windows": 50,
+      "metrics": {
+        "rmsf_corr": {
+          "model": 0.5845511609315872,
+          "persistence": 0.01473787542199716,
+          "improvement": 0.5698132855095901,
+          "ci95": [
+            0.5138029063285212,
+            0.6294724571579137
+          ],
+          "model_better": true,
+          "win_rate": 1.0
+        },
+        "rmsf_mae": {
+          "model": 1.9020433843135833,
+          "persistence": 3.019843738079071,
+          "improvement": 1.1178003537654877,
+          "ci95": [
+            0.7856705603301525,
+            1.4761093629896633
+          ],
+          "model_better": true,
+          "win_rate": 0.86
+        },
+        "root_mean_w2": {
+          "model": 3.6775036859626726,
+          "persistence": 2.5917461228143237,
+          "improvement": -1.085757563148349,
+          "ci95": [
+            -1.4583688700226678,
+            -0.7287709021825411
+          ],
+          "model_better": false,
+          "win_rate": 0.2
+        },
+        "variance_w2": {
+          "model": 18.81195966095051,
+          "persistence": 14.366090674304132,
+          "improvement": -4.445868986646379,
+          "ci95": [
+            -7.671849240744767,
+            -0.9668653132200677
+          ],
+          "model_better": false,
+          "win_rate": 0.24
+        },
+        "md_pca_w2": {
+          "model": 0.08433951582708729,
+          "persistence": 0.1894795272088875,
+          "improvement": 0.10514001138180021,
+          "ci95": [
+            0.08832035935922278,
+            0.12159514050283655
+          ],
+          "model_better": true,
+          "win_rate": 0.98
+        },
+        "weak_contact_j": {
+          "model": 0.1765619561819509,
+          "persistence": 0.0,
+          "improvement": 0.1765619561819509,
+          "ci95": [
+            0.16726492405054583,
+            0.1865310869353577
+          ],
+          "model_better": true,
+          "win_rate": 1.0
+        },
+        "transient_contacts_j": {
+          "model": 0.2991961119428525,
+          "persistence": 0.0,
+          "improvement": 0.2991961119428525,
+          "ci95": [
+            0.28550745112767006,
+            0.3134853619523103
+          ],
+          "model_better": true,
+          "win_rate": 1.0
+        }
+      }
+    },
+    "16": {
+      "horizon_ns": 16.0,
+      "n_windows": 50,
+      "metrics": {
+        "rmsf_corr": {
+          "model": 0.5987234795093537,
+          "persistence": 0.0016637619026005268,
+          "improvement": 0.5970597176067531,
+          "ci95": [
+            0.5336118764583954,
+            0.6589732594005763
+          ],
+          "model_better": true,
+          "win_rate": 1.0
+        },
+        "rmsf_mae": {
+          "model": 1.5027844941616058,
+          "persistence": 4.41255615234375,
+          "improvement": 2.909771658182144,
+          "ci95": [
+            2.4299835961461067,
+            3.399945330917835
+          ],
+          "model_better": true,
+          "win_rate": 0.94
+        },
+        "root_mean_w2": {
+          "model": 3.2453837453835477,
+          "persistence": 3.6100459701827994,
+          "improvement": 0.36466222479925164,
+          "ci95": [
+            0.15678505474087748,
+            0.5881758961922758
+          ],
+          "model_better": true,
+          "win_rate": 0.62
+        },
+        "variance_w2": {
+          "model": 13.416656097580043,
+          "persistence": 28.099826587333574,
+          "improvement": 14.683170489753525,
+          "ci95": [
+            9.513623950247716,
+            20.105747434865123
+          ],
+          "model_better": true,
+          "win_rate": 0.7
+        },
+        "md_pca_w2": {
+          "model": 0.07736517636544758,
+          "persistence": 0.26512932454646976,
+          "improvement": 0.18776414818102213,
+          "ci95": [
+            0.16290810999527106,
+            0.21141071943823087
+          ],
+          "model_better": true,
+          "win_rate": 0.98
+        },
+        "weak_contact_j": {
+          "model": 0.2442333842488943,
+          "persistence": 0.0,
+          "improvement": 0.2442333842488943,
+          "ci95": [
+            0.23251397794316925,
+            0.2558866694970769
+          ],
+          "model_better": true,
+          "win_rate": 1.0
+        },
+        "transient_contacts_j": {
+          "model": 0.36196851484835135,
+          "persistence": 0.0,
+          "improvement": 0.36196851484835135,
+          "ci95": [
+            0.34796044396434067,
+            0.3762646684442981
+          ],
+          "model_better": true,
+          "win_rate": 1.0
+        }
+      }
+    },
+    "64": {
+      "horizon_ns": 64.0,
+      "n_windows": 50,
+      "metrics": {
+        "rmsf_corr": {
+          "model": 0.630285382270813,
+          "persistence": 0.03058446815237403,
+          "improvement": 0.599700914118439,
+          "ci95": [
+            0.5432255891072564,
+            0.6558627064381726
+          ],
+          "model_better": true,
+          "win_rate": 0.98
+        },
+        "rmsf_mae": {
+          "model": 1.5796961534023284,
+          "persistence": 5.564366731643677,
+          "improvement": 3.984670578241348,
+          "ci95": [
+            3.439138498365879,
+            4.5218100211620325
+          ],
+          "model_better": true,
+          "win_rate": 1.0
+        },
+        "root_mean_w2": {
+          "model": 4.021983742574744,
+          "persistence": 4.702131644485749,
+          "improvement": 0.6801479019110047,
+          "ci95": [
+            0.36008436003922417,
+            1.005569995418729
+          ],
+          "model_better": true,
+          "win_rate": 0.7
+        },
+        "variance_w2": {
+          "model": 17.717180985356137,
+          "persistence": 41.10920605885626,
+          "improvement": 23.392025073500125,
+          "ci95": [
+            17.265008515163206,
+            29.539347515040447
+          ],
+          "model_better": true,
+          "win_rate": 0.82
+        },
+        "md_pca_w2": {
+          "model": 0.08776347112211681,
+          "persistence": 0.31603101660174604,
+          "improvement": 0.22826754547962927,
+          "ci95": [
+            0.20600633456627576,
+            0.24984527803765813
+          ],
+          "model_better": true,
+          "win_rate": 1.0
+        },
+        "weak_contact_j": {
+          "model": 0.21206522908006242,
+          "persistence": 0.0,
+          "improvement": 0.21206522908006242,
+          "ci95": [
+            0.19963700373025886,
+            0.22446834444493494
+          ],
+          "model_better": true,
+          "win_rate": 1.0
+        },
+        "transient_contacts_j": {
+          "model": 0.3851431522278329,
+          "persistence": 0.0,
+          "improvement": 0.3851431522278329,
+          "ci95": [
+            0.37316540177686214,
+            0.3977563591014877
+          ],
+          "model_better": true,
+          "win_rate": 1.0
+        }
+      }
+    }
+  }
+}

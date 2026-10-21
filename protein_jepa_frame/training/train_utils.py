@@ -28,7 +28,12 @@ def _set_reproducibility(seed: int, deterministic: bool) -> None:
     os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
     torch.backends.cudnn.benchmark = not deterministic
     torch.backends.cudnn.deterministic = deterministic
-    torch.use_deterministic_algorithms(deterministic)
+    # warn_only=True: keep deterministic algorithms where the backend provides
+    # them, but do not hard-crash on ops that lack a deterministic CUDA kernel
+    # (e.g. cumsum in the ensemble-RMSF surrogate).  A plain True aborts the run
+    # mid-step; warn_only degrades gracefully while preserving reproducibility
+    # for every op that does support it.
+    torch.use_deterministic_algorithms(deterministic, warn_only=True)
 
 
 def _move_batch(batch: dict, device: torch.device) -> dict:

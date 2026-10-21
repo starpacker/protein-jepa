@@ -1,24 +1,32 @@
+# Schema-v2 example paths; override checkpoint locations explicitly after training.
 name: smoke
-# Fast end-to-end harness check.  2 proteins, 2 horizons, all variants.
-# NOTE: h_only/h_ft require the B1a oracle decoder; h_plus_s requires the B1b ckpt.
 manifest: artifacts/mdcath_manifest_200dom/val.jsonl
-horizons_frames: [1, 4]
+horizons_frames:
+- 1
+- 4
 context_frames: 8
 context_stride: 1
 frame_stride: 1
-temperatures: null        # all
+temperatures: null
 max_proteins: 2
 n_rollout_reps: 2
 seed: 0
-# Multi-lag alignment with Stage-A training: the predictor was trained on
-# several future offsets per context window, so evaluation must ask for the
-# same offsets.  base horizon H x lag l -> physical gap H-l frames after the
-# anchor (l counted back from the future-clip END, exactly as in training).
-temporal_lags: [0, 4, 6, 7]
-emit_multi_lag: true
-variants: [h_only, h_ft, h_plus_s, persist]
+temporal_lags: []
+emit_multi_lag: false
+variants:
+- h_only
+- h_ft
+- h_plus_s
+- persist
 models:
-  stage_a_ckpt: artifacts/abc_v3/stage_a_unified/checkpoint_latest.pt   # h_only encoder + predictor source
-  stage_a_predictor_ckpt: artifacts/abc_v3/stage_a_unified/checkpoint_latest.pt
-  b1a_ckpt: artifacts/abc_v3/stage_b1a_unified/checkpoint_latest.pt
-  b1b_ckpt: artifacts/abc_v3/stage_b1b_unified/checkpoint_latest.pt
+  stage_a_ckpt: artifacts/repaired_v2/pilot_20261017/stage_a/checkpoint_latest.pt
+  stage_a_predictor_ckpt: artifacts/repaired_v2/pilot_20261017/stage_a/checkpoint_latest.pt
+  b1a_ckpt: artifacts/repaired_v2/pilot_20261017/stage_b1a/checkpoint_latest.pt
+  b1b_ckpt: artifacts/repaired_v2/pilot_20261017/stage_b1b/checkpoint_latest.pt
+split: protein_holdout
+train_manifests:
+- artifacts/mdcath_manifest_200dom/train.jsonl
+allow_legacy: false
+deterministic: true
+max_trajectories_per_protein: 1
+max_anchors_per_trajectory: 2

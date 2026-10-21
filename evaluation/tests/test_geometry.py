@@ -124,3 +124,56 @@ def test_contact_jaccard_identity():
     mask = torch.ones(10, dtype=torch.bool)
     assert abs(contact_jaccard(ca, ca, mask) - 1.0) < 1e-9
     assert contact_map(ca, mask).diagonal().sum().item() == 0
+
+
+def test_common_anchor_alignment_does_not_refit_prediction():
+    from evaluation.geometry import common_anchor_rmsd
+    torch.manual_seed(19)
+    anchor = torch.randn(20, 3, dtype=torch.float64)
+    mask = torch.ones(20, dtype=torch.bool)
+    pred = anchor + torch.tensor([5., 0., 0.])
+    assert aligned_rmsd(pred, anchor, mask) < 1e-9
+    assert abs(common_anchor_rmsd(pred, anchor, anchor, mask)-5.) < 1e-9
+
+
+def test_physical_energy_score_matches_empirical_distribution():
+    from evaluation.geometry import physical_distance_energy_score, displacement_msd
+    target = torch.arange(18, dtype=torch.float64).reshape(6,3)
+    mask = torch.ones(6, dtype=torch.bool)
+    assert physical_distance_energy_score(target[None].repeat(3,1,1), target, mask) == 0.
+    distorted = target.clone(); distorted[3] += 3.
+    assert physical_distance_energy_score(distorted[None], target, mask) > 0.
+    mask[0] = False
+    pred = target.clone(); pred[0] += 1000.
+    assert displacement_msd(pred, target, mask) == 0.
+
+
+def test_history_pose_calibration_removes_canonical_gauge_and_preserves_gradients():
+    from evaluation.geometry import calibrate_observed_anchor_pose
+    torch.manual_seed(23)
+    current = torch.randn(1,12,3,dtype=torch.float64)
+    forecast = (current + .2*torch.randn_like(current)).requires_grad_()
+    observed = current + torch.tensor([[[4.,5.,6.]]])
+    mask = torch.ones(1,12,dtype=torch.bool)
+    expected = calibrate_observed_anchor_pose(forecast,current,observed,mask)
+    q,_ = torch.linalg.qr(torch.randn(3,3,dtype=torch.float64))
+    if torch.det(q)<0: q[:,0]*=-1
+    offset = torch.tensor([2.,-3.,8.],dtype=torch.float64)
+    changed = calibrate_observed_anchor_pose(forecast@q+offset,current@q+offset,observed,mask)
+    assert torch.allclose(changed,expected,atol=1e-9)
+    expected.square().sum().backward()
+    assert forecast.grad is not None and forecast.grad.norm()>0
+
+
+def test_history_pose_calibration_follows_observed_rigid_motion():
+    from evaluation.geometry import calibrate_observed_anchor_pose
+    torch.manual_seed(24)
+    current = torch.randn(1,10,3,dtype=torch.float64)
+    forecast = current+.1*torch.randn_like(current)
+    observed = current+4
+    mask = torch.ones(1,10,dtype=torch.bool)
+    q,_=torch.linalg.qr(torch.randn(3,3,dtype=torch.float64))
+    if torch.det(q)<0:q[:,0]*=-1
+    first=calibrate_observed_anchor_pose(forecast,current,observed,mask)
+    second=calibrate_observed_anchor_pose(forecast,current,observed@q+7,mask)
+    assert torch.allclose(second,first@q+7,atol=1e-9)

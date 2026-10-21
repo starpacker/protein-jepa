@@ -177,7 +177,7 @@ def test_kalman_matches_joint_gaussian():
     model.history_posterior = FixedPosterior()
 
     # Kalman NLL (our recursion)
-    H_hist_dummy = H_seq[:, :2]        # 2 history frames; only used by the posterior above
+    H_hist_dummy = H_seq[:, :1].expand(B, 2, L, dH)  # history ends at the known anchor
     dt_dummy = torch.ones(B, 2) * h
     nll_kalman = model.kalman_nll(H_hist_dummy, dt_dummy, H_seq, mask, temperature_k=None)
 
@@ -287,6 +287,7 @@ def test_kernel_consistency():
     H_seq = torch.randn(1, 5, L, dH)
     mask = torch.ones(1, L, dtype=torch.bool)
     H_hist = torch.randn(1, 2, L, dH)
+    H_hist[:, -1] = H_seq[:, 0]
     dt_hist = torch.ones(1, 2) * h
 
     # Extract parameters from bath for the same seq_feature

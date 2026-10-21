@@ -174,6 +174,13 @@ class TrajectoryClipDataset(Dataset):
         time_ps: np.ndarray,
         forces: np.ndarray | None = None,
     ) -> dict:
+        if not np.isfinite(time_ps).all() or (len(time_ps) > 1 and not (np.diff(time_ps) > 0).all()):
+            raise ValueError(f'{record.trajectory_id}: physical timestamps must be finite and strictly increasing')
+        if record.temperature_k is None or not np.isfinite(record.temperature_k) or record.temperature_k <= 0:
+            raise ValueError(f'{record.trajectory_id}: a finite positive temperature_k is required')
+        atom_mask = atom_mask & np.isfinite(coords).all(axis=-1)
+        residue_mask = residue_mask & atom_mask.all(axis=-1)
+        coords = np.where(atom_mask[..., None], coords, 0.0).astype(np.float32, copy=False)
         sample = {
             "coords": torch.from_numpy(coords * self.config.coordinate_scale),
             "atom_mask": torch.from_numpy(atom_mask),
@@ -218,9 +225,9 @@ class TrajectoryClipDataset(Dataset):
             if "time_ps" in data:
                 time_ps = np.asarray(data["time_ps"][frames], dtype=np.float32)
             elif record.frame_interval_ps is not None:
-                time_ps = frames.astype(np.float32) * float(record.frame_interval_ps)
+                time_ps = record.first_frame_time_ps + frames.astype(np.float32) * float(record.frame_interval_ps)
             else:
-                time_ps = frames.astype(np.float32)
+                raise ValueError(f'{record.trajectory_id}: time_ps or frame_interval_ps is required; frame indices are not picoseconds')
         return self._finalize(record, frames, coords, atom_mask, residue_mask, aatype, residue_index, chain_id, time_ps)
 
     def _read_normalized_h5(self, record: TrajectoryRecord, frames: np.ndarray) -> dict:
@@ -280,7 +287,7 @@ class TrajectoryClipDataset(Dataset):
         if record.frame_interval_ps is not None:
             time_ps = record.first_frame_time_ps + frames.astype(np.float32) * float(record.frame_interval_ps)
         else:
-            time_ps = frames.astype(np.float32)
+            raise ValueError(f'{record.trajectory_id}: mdCATH requires explicit frame_interval_ps')
         return self._finalize(
             record, frames, coords, atom_mask, residue_mask, aatype,
             residue_index, chain_id, time_ps, forces=forces,

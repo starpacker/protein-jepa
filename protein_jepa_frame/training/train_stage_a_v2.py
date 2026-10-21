@@ -4,28 +4,29 @@ Trains the `StageAV2` model described in STAGE_ABC_REDESIGN_PLAN.md §1:
 
   - online encoder f_θ        (gradient)
   - EMA teacher f_θ̄           (never gradient; updated after every step)
-  - learnable OPF projectors  (soft-Gram orthogonality)
+  - fixed orthogonal OPF coordinates (explicit learnable ablations)
   - causal Transformer predictor over K history frames
 
 Each step samples BOTH objectives from the same batches:
   - temporal: paired context/future windows  → L_future
   - spatial:  within-frame contiguous mask   → L_masked
 
-EMA momentum follows the cosine schedule in training/train_utils._momentum,
-honouring the model's own ema_start/ema_end config so the two stay in sync.
+EMA follows the model's configured warmup and linear increase schedule.
 
 Usage:
     python -m protein_jepa_frame.training.train_stage_a_v2 \
-        --manifest artifacts/mdcath_manifest_200dom/train.jsonl \
+        --manifest artifacts/mdcath_manifest_1000dom/train.jsonl \
         --output   artifacts/stage_a_v2_run
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import sys
 import time
+from dataclasses import replace
 from pathlib import Path
 
 import torch
@@ -36,6 +37,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from protein_jepa_frame.config import DataConfig
 from protein_jepa_frame.data.collate import collate_paired_windows
 from protein_jepa_frame.data.dataset import build_dataset
+from protein_jepa_frame.data.protocol import apply_protocol, protocol_from_args, validate_manifest_split
 from protein_jepa_frame.models.stage_a_v2 import (
     StageAV2,
     StageAV2Config,
@@ -45,7 +47,6 @@ from protein_jepa_frame.models.stage_a_v2 import (
 from protein_jepa_frame.training.train_utils import (
     _device,
     _lr_scale,
-    _momentum,
     _move_batch,
     _set_reproducibility,
 )
@@ -55,14 +56,21 @@ from protein_jepa_frame.training.train_utils import (
 # Args
 # ─────────────────────────────────────────────────────────────────────────────
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv=None) -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Train Stage A V2")
     p.add_argument("--manifest", type=str, default="artifacts/mdcath_manifest/train.jsonl",
                    help="Path to training manifest JSONL.  Default is the full mdCATH dataset "
                         "(5398 domains / 107947 trajectories).  Use "
-                        "artifacts/mdcath_manifest_200dom/train.jsonl for quick smoke tests.")
+                        "artifacts/mdcath_manifest_1000dom/train.jsonl for quick smoke tests.")
     p.add_argument("--output", type=str, default="artifacts/stage_a_v2_run")
     p.add_argument("--resume", type=str, default=None)
+    p.add_argument("--val-manifest", type=str)
+    p.add_argument("--val-every", type=int, default=100)
+    p.add_argument("--val-batches", type=int, default=4)
+    p.add_argument("--synthetic", action="store_true", help="Explicit synthetic implementation smoke only.")
+    p.add_argument("--device", default="auto")
+    p.add_argument("--torch-threads", type=int, default=1)
+    p.add_argument("--max-train-samples", type=int, default=0)
 
     # Schedule
     p.add_argument("--steps", type=int, default=20000)
@@ -105,6 +113,10 @@ def parse_args() -> argparse.Namespace:
     # Model
     p.add_argument("--latent-dim", type=int, default=128)
     p.add_argument("--num-factors", type=int, default=4)
+    p.add_argument("--num-heads", type=int, default=4)
+    p.add_argument("--dropout", type=float, default=0.1)
+    p.add_argument("--opf-mode", choices=["fixed_orthogonal", "soft_gram", "qr_retraction"], default="fixed_orthogonal")
+    p.add_argument("--lag-balanced", action="store_true")
     p.add_argument("--encoder-depth", type=int, default=4)
     p.add_argument("--predictor-depth", type=int, default=4)
     p.add_argument("--predictor-spatial-depth", type=int, default=2,
@@ -172,15 +184,42 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--struct-recon-dim", type=int, default=256,
                    help="Hidden width of the distance reconstruction head.")
     p.add_argument(
+        "--displacement-weight",
+        type=float,
+        default=0.5,
+        help="Weight on the structural-displacement readout loss (P0-A, "
+             "2026-10-18).  A small head reads ONLY the predicted H change "
+             "synth_delta_H and is supervised by the true future frame's "
+             "Kabsch-aligned internal CA displacement, so the temporal JEPA "
+             "objective is forced to carry real structural change rather than a "
+             "self-referential latent delta.  This is the minimal added "
+             "supervision (one head, discarded after Stage A).  0 disables it.",
+    )
+    p.add_argument(
+        "--displacement-direction-weight",
+        type=float,
+        default=1.0,
+        help="λ_dir on the per-residue direction (cosine) term inside the "
+             "displacement readout loss.  Supervises 'which residue moves "
+             "where' directly, since the pattern-MSE alone tolerates correct "
+             "magnitude with wrong direction.",
+    )
+    p.add_argument(
         "--delta-target",
         action="store_true",
-        default=False,
-        help="Use the teacher-space displacement target for the temporal "
-             "objective.  Antagonistic to struct_recon (rewards discarding the "
-             "static fold); leave OFF when struct_recon is enabled so H stays "
-             "structurally faithful for the downstream decoder.",
+        default=True,
+        help="Compatibility spelling: Stage A always predicts teacher delta_factors.",
     )
     p.add_argument("--identity-embed-scale", type=float, default=0.1)
+    p.add_argument(
+        "--relative-position-features",
+        type=lambda s: str(s).lower() in ("1", "true", "yes", "y", "t"),
+        default=True,
+        help="Enable the within-frame canonical-frame position channel in the "
+             "encoder (2026-10-18).  Gives H a reference frame so the anchor->"
+             "future displacement is expressible; without it H is position-blind "
+             "and the readout cannot generalise (R2 0.09 held-out).",
+    )
     p.add_argument("--ema-start", type=float, default=0.998)
     p.add_argument("--ema-end", type=float, default=0.9999)
     p.add_argument("--ema-warmup-steps", type=int, default=2500)
@@ -190,7 +229,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--save-every", type=int, default=500)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--dry-run", action="store_true")
-    return p.parse_args()
+    return p.parse_args(argv)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -209,6 +248,7 @@ def build_optimizer_groups(model: StageAV2, lr: float, encoder_lr_scale: float,
         [p for p in model.predictor.parameters() if p.requires_grad]
         + [p for p in model.opf.parameters() if p.requires_grad]
         + [p for p in model.struct_recon_head.parameters() if p.requires_grad]
+        + [p for p in model.displacement_head.parameters() if p.requires_grad]
     )
     if not encoder_params:
         raise RuntimeError("online encoder has no trainable parameters")
@@ -227,11 +267,8 @@ def build_optimizer_groups(model: StageAV2, lr: float, encoder_lr_scale: float,
 def _truncate_history(batch: dict, K: int) -> dict:
     """Keep only the last K context frames so the predictor sees a fixed window.
 
-    Keeps *chronological* order (oldest first).  An earlier revision used the
-    paired dataset's multiscale offsets [0,1,2,3] which, at 1 ns spacing, span
-    only 3 ns and sit adjacent to the target — the masked-history fix in the
-    multi-lag objective now removes the trivial-copy path, so a dense recent
-    window is both safe and maximally informative.
+    Keeps chronological order (oldest first); selected targets are validated
+    separately against the last real context timestamp.
     """
     out = dict(batch)
     for key in list(out.keys()):
@@ -257,11 +294,16 @@ def build_paired_batch(samples: list[dict], K: int) -> dict:
 
 def main() -> None:
     args = parse_args()
+    args.train_manifest_sha256 = (hashlib.sha256(Path(args.manifest).read_bytes()).hexdigest()
+                                  if not args.synthetic else None)
+    args.split_audit = (validate_manifest_split(args.manifest, args.val_manifest)
+                        if args.val_manifest and not args.synthetic else None)
     if args.latent_dim % args.num_factors != 0:
         raise SystemExit("--latent-dim must be divisible by --num-factors")
 
     _set_reproducibility(args.seed, False)
-    device = _device("cuda" if torch.cuda.is_available() else "cpu")
+    torch.set_num_threads(args.torch_threads)
+    device = _device(args.device)
 
     out_dir = Path(args.output)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -273,8 +315,14 @@ def main() -> None:
         encoder_depth=args.encoder_depth,
         predictor_depth=args.predictor_depth,
         predictor_spatial_depth=args.predictor_spatial_depth,
+        num_heads=args.num_heads,
+        predictor_heads=args.num_heads,
+        dropout=args.dropout,
+        opf_mode=args.opf_mode,
+        opf_learnable=args.opf_mode != "fixed_orthogonal",
         spatial_mask_ratio=args.spatial_mask_ratio,
         identity_embed_scale=args.identity_embed_scale,
+        relative_position_features=args.relative_position_features,
         ema_start=args.ema_start,
         ema_end=args.ema_end,
         ema_warmup_steps=args.ema_warmup_steps,
@@ -294,6 +342,7 @@ def main() -> None:
         temporal_min_std=args.temporal_min_std,
         temporal_contrast_weight=args.temporal_contrast_weight,
         temporal_contrast_rmsd_scale=args.temporal_contrast_rmsd_scale,
+        lag_balanced=args.lag_balanced,
     )
     weights.validate()
 
@@ -303,11 +352,7 @@ def main() -> None:
     # temporal objective only reads `context_*`, but the dataset builder sizes
     # its windows by max(horizon) so we keep the horizon list for window sizing.
     num_frames = args.history_frames
-    if any(h < num_frames for h in horizons):
-        raise SystemExit(
-            f"All --paired-horizons-frames must be >= --history-frames ({num_frames}). "
-            f"Got horizons {horizons}. Minimum non-leaking horizon = {num_frames}."
-        )
+    protocol = protocol_from_args(args)
 
     lags = tuple(sorted(set(int(l) for l in args.temporal_lags)))
     # lags are future-clip offsets counted back from the end; valid range is
@@ -318,7 +363,7 @@ def main() -> None:
             f"--temporal-lags must be in [0, future_frames-1]={0, num_frames - 1}; got {lags}"
         )
     data_cfg = DataConfig(
-        manifest_path=args.manifest,
+        manifest_path=None if args.synthetic else args.manifest,
         batch_size=args.batch_size,
         num_workers=args.num_workers,
         training_mode="paired_window",
@@ -342,7 +387,12 @@ def main() -> None:
         # an 80 GB GPU.
         max_residues=args.max_residues,
     )
+    apply_protocol(data_cfg, protocol)
     dataset = build_dataset(data_cfg)
+    if args.max_train_samples:
+        from torch.utils.data import Subset
+        indices = torch.linspace(0, len(dataset) - 1, min(len(dataset), args.max_train_samples)).long().tolist()
+        dataset = Subset(dataset, indices)
     collate_fn = lambda s: build_paired_batch(s, args.history_frames)  # noqa: E731
     loader = DataLoader(
         dataset,
@@ -353,6 +403,18 @@ def main() -> None:
         drop_last=True,
         pin_memory=(device.type == "cuda"),
     )
+    if not len(loader):
+        raise ValueError("training loader is empty; lower batch size or increase samples")
+    val_loader = None
+    if args.val_manifest or args.synthetic:
+        val_cfg = replace(data_cfg, manifest_path=args.val_manifest if not args.synthetic else None,
+                          synthetic_size=8)
+        from torch.utils.data import Subset
+        val_dataset = build_dataset(val_cfg)
+        n_val = min(len(val_dataset), args.val_batches * args.batch_size)
+        val_indices = torch.linspace(0, len(val_dataset) - 1, n_val).long().tolist()
+        val_loader = DataLoader(Subset(val_dataset, val_indices), batch_size=args.batch_size,
+                                shuffle=False, num_workers=0, collate_fn=collate_fn)
 
     # ── Optimizer / schedule ─────────────────────────────────────────────────
     groups = build_optimizer_groups(model, args.lr, args.encoder_lr_scale, args.weight_decay)
@@ -361,11 +423,17 @@ def main() -> None:
         pg["base_lr"] = pg["lr"]
 
     start_step = 0
+    best_val = float("inf")
     if args.resume:
-        ckpt = torch.load(args.resume, map_location=device)
+        ckpt = torch.load(args.resume, map_location=device, weights_only=False)
+        if ckpt.get("stage_a_v2_config") != cfg.__dict__:
+            raise ValueError("resume model configuration differs from checkpoint")
         model.load_state_dict(ckpt["model"])
         optimizer.load_state_dict(ckpt["optimizer"])
         start_step = int(ckpt.get("step", 0))
+        best_val = float(ckpt.get("best_validation_loss", float("inf")))
+        if "rng_state" in ckpt:
+            torch.set_rng_state(ckpt["rng_state"])
         print(f"resumed from {args.resume} at step {start_step}", flush=True)
 
     # ── Save config ──────────────────────────────────────────────────────────
@@ -437,9 +505,28 @@ def main() -> None:
                 total = total + args.struct_recon_weight * recon
                 recon_val = float(recon.detach())
 
+            # P0-A structural-displacement readout: the head reads ONLY the
+            # predicted H change synth_delta_H (no anchor/H_mean side-channel) so
+            # the real internal CA displacement of the target frame must be
+            # carried by the predicted H change itself.  One small head,
+            # discarded after Stage A.
+            disp_val = 0.0
+            if args.displacement_weight > 0.0:
+                disp = model.displacement_readout_loss(
+                    pred_factors=temporal_out["pred_factors"],
+                    target_delta_local=temporal_out["target_delta_local"],
+                    residue_mask=temporal_out["valid_mask"],
+                    synth_delta_H=temporal_out["synth_delta_H"],
+                    direction_weight=args.displacement_direction_weight,
+                )
+                total = total + args.displacement_weight * disp
+                disp_val = float(disp.detach())
+
             # Gradient accumulation: divide each micro-batch loss so the summed
             # gradient equals the mean over the effective batch.  The optimizer
             # step (and EMA update) fires only on the last micro-batch.
+            if not torch.isfinite(total):
+                raise FloatingPointError("nonfinite Stage A total loss")
             (total / args.grad_accum).backward()
 
             micro += 1
@@ -447,20 +534,23 @@ def main() -> None:
             for k, v in comp.as_loggable_dict().items():
                 running[k] = running.get(k, 0.0) + v
             running["loss/struct_recon"] = running.get("loss/struct_recon", 0.0) + recon_val
+            running["loss/displacement"] = running.get("loss/displacement", 0.0) + disp_val
+            running["loss/total"] += float(total.detach()) - float(comp.total.detach())
 
             if micro % args.grad_accum == 0:
                 if args.grad_clip > 0:
                     torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
                 optimizer.step()
+                model.after_optimizer_step()
                 optimizer.zero_grad(set_to_none=True)
 
-                momentum = _momentum(step, args.steps, cfg.ema_start, cfg.ema_end)
-                model.update_ema(momentum)
+                momentum = model.update_ema()
                 step += 1
 
                 # Logging (one line per optimizer step)
                 if step % args.log_every == 0:
                     avg = {k: v / seen for k, v in running.items()}
+                    avg.update(model.opf_diagnostics())
                     elapsed = time.time() - t0
                     print(
                         f"step {step:6d} | lr {optimizer.param_groups[0]['lr']:.2e} "
@@ -468,18 +558,37 @@ def main() -> None:
                         + " ".join(f"{k.replace('loss/','')}={v:.4f}" for k, v in avg.items()),
                         flush=True,
                     )
+                    with (out_dir / "metrics.jsonl").open("a") as stream:
+                        stream.write(json.dumps({"step": step, "split": "train", **avg}) + "\n")
                     running = {}
                     seen = 0
                     t0 = time.time()
 
                 if step > 0 and step % args.save_every == 0:
-                    _save(out_dir, model, optimizer, step, cfg, weights)
+                    _save(out_dir, model, optimizer, step, cfg, weights, args, best_validation_loss=best_val)
+                if val_loader is not None and step % args.val_every == 0:
+                    val = _validate(model, val_loader, device, lags, weights, args)
+                    print(f"validation step {step}: total={val:.6f}", flush=True)
+                    with (out_dir / "metrics.jsonl").open("a") as stream:
+                        stream.write(json.dumps({"step": step, "split": "validation", "loss/total": val}) + "\n")
+                    if val < best_val:
+                        best_val = val
+                        _save(out_dir, model, optimizer, step, cfg, weights, args,
+                              filename="checkpoint_best.pt", validation_loss=val, best_validation_loss=best_val)
+                    _save(out_dir, model, optimizer, step, cfg, weights, args, best_validation_loss=best_val)
 
                 if args.dry_run and step >= 3:
+                    _save(out_dir, model, optimizer, step, cfg, weights, args)
                     print("dry-run complete", flush=True)
                     return
 
-    _save(out_dir, model, optimizer, step, cfg, weights)
+    if val_loader is not None:
+        val = _validate(model, val_loader, device, lags, weights, args)
+        if val < best_val:
+            best_val = val
+            _save(out_dir, model, optimizer, step, cfg, weights, args,
+                  filename="checkpoint_best.pt", validation_loss=val, best_validation_loss=best_val)
+    _save(out_dir, model, optimizer, step, cfg, weights, args, best_validation_loss=best_val)
     print(f"training complete at step {step}", flush=True)
 
 
@@ -503,16 +612,67 @@ def build_clip_batch_from_pair(paired: dict, device: torch.device) -> dict:
     return clip
 
 
+@torch.no_grad()
+def _validate(model, loader, device, lags, weights, args):
+    # Validation sampling does not perturb the training RNG stream.
+    cuda_devices = [device.index if device.index is not None else torch.cuda.current_device()] if device.type == "cuda" else []
+    with torch.random.fork_rng(devices=cuda_devices):
+        torch.manual_seed(args.seed + 10000)
+        model.eval()
+        values = []
+        for i, paired in enumerate(loader):
+            if i >= args.val_batches:
+                break
+            paired = _move_batch(paired, device)
+            temporal = model.forward_temporal_multilag(paired, lags, recent_frac=args.recent_frac)
+            temporal["context_coords"] = paired["context_coords"]
+            spatial = model.forward_spatial(build_clip_batch_from_pair(paired, device))
+            comp = compute_stage_a_v2_loss(temporal, spatial, model.opf.analysis_basis(), weights,
+                                          dH=model.config.latent_dim)
+            total = comp.total
+            if args.struct_recon_weight:
+                total = total + args.struct_recon_weight * model.struct_recon_loss(
+                    temporal["context_H_full"], paired["context_coords"], paired["context_residue_mask"])
+            if getattr(args, "displacement_weight", 0.0):
+                total = total + args.displacement_weight * model.displacement_readout_loss(
+                    pred_factors=temporal["pred_factors"],
+                    target_delta_local=temporal["target_delta_local"],
+                    residue_mask=temporal["valid_mask"],
+                    synth_delta_H=temporal["synth_delta_H"],
+                    direction_weight=getattr(args, "displacement_direction_weight", 1.0),
+                )
+            values.append(float(total))
+        model.train()
+    if not values:
+        raise ValueError("validation loader is empty")
+    return sum(values) / len(values)
+
+
 def _save(out_dir: Path, model: StageAV2, optimizer, step: int,
-          cfg: StageAV2Config, weights: StageAV2LossWeights) -> None:
+          cfg: StageAV2Config, weights: StageAV2LossWeights, args=None,
+          filename="checkpoint_latest.pt", validation_loss=None, best_validation_loss=float("inf")) -> None:
+    from protein_jepa_frame.utils.contracts import build_prediction_contract
+    protocol = protocol_from_args(args).to_dict() if args else None
     payload = {
         "model": model.state_dict(),
         "optimizer": optimizer.state_dict(),
         "step": step,
         "stage_a_v2_config": cfg.__dict__,
         "loss_weights": weights.__dict__,
+        "train_args": vars(args) if args else {},
+        "split_audit": getattr(args, "split_audit", None),
+        "train_manifest_sha256": getattr(args, "train_manifest_sha256", None),
+        "synthetic": bool(getattr(args, "synthetic", False)),
+        "rng_state": torch.get_rng_state(),
+        "output_contract": "delta_factors",
+        "prediction_contract": build_prediction_contract(
+            model.context_encoder.state_dict(), cfg.__dict__, predictor_output="delta_factors",
+            window_protocol=protocol),
+        "validation_loss": validation_loss,
+        "best_validation_loss": best_validation_loss,
+        "resume_reproducibility": "RNG restored; loader shuffle cursor is not restored; resume is not byte-exact",
     }
-    torch.save(payload, out_dir / "checkpoint_latest.pt")
+    torch.save(payload, out_dir / filename)
     print(f"checkpoint saved at step {step}", flush=True)
 
 

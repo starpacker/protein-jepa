@@ -1,10 +1,46 @@
-# Canonical checkpoints for evaluation (locked 2026-10-17)
+# Model and checkpoint contracts
 
-Every evaluation run records these paths + SHA256 in `meta.json`. If a file's hash
-changes, results are **not** comparable across runs.
+New evaluation uses content-verified **schema-v2** bundles; a path or tensor shape
+match is insufficient. Existing legacy numbers are diagnostic artifacts and cannot
+establish H+S, JEPA or temperature-generalization gains.
 
-## SHA256 (full)
-| checkpoint | sha256 |
+A B1a bundle contains `encoder`, `stage_a_v2_config`, `oracle`,
+`stage_b1a_config`, `representation_contract`, and saved training provenance. Its
+normalizer must be fitted on training H; the decoder input is raw H. A B1b bundle
+copies the complete frozen representation and adds `model`, `stage_b1b_config`,
+its autonomous training contract, run scope and oracle-gate report. Its dynamics
+input is normalized H, with inverse normalization before the **same** oracle.
+
+Direct prediction requires a Stage-A `prediction_contract` declaring
+`raw_H_history → delta_factors`. Actual predictor encoder state/config must match
+the calibrated representation. Fine-tuning the encoder therefore requires
+adapting/retraining the predictor; matching `latent_dim=128` is insufficient.
+
+Formal autonomous results require `run_scope=oracle_gate_passed`, a schema-v2
+passed held-out-protein oracle gate for that exact representation, and hash-locked
+real-data lineage. Contract-smoke checkpoints always produce diagnostics.
+
+The loader checks actual encoder/normalizer/decoder/config hashes and upstream
+checkpoint/manifest snapshots. The runner records effective config/source/manifest
+hashes and requires every actual training manifest to be declared for holdout
+verification. Do not overwrite a source `checkpoint_latest.pt` referenced by a
+calibrated bundle; archive the locked snapshot first.
+
+The repaired pilot example paths in `configs/` are under
+`artifacts/repaired_v2/pilot_20261017/`. They must be created by the repaired
+training sequence; they are not claims of completed experiments. CLI checkpoint
+overrides allow explicit immutable snapshots.
+
+Legacy files are rejected by default. Explicit `--allow-legacy` enables diagnostic
+adapters only. A legacy direct model additionally needs an explicit
+`absolute_factors|delta_factors` output declaration; a legacy H+S model needs its
+explicit training encoder source. Architecture compatibility does not certify
+old target semantics, normalizer lineage or scientific comparability.
+
+The earlier SHA table below identifies archived files only; these are **not**
+headline checkpoint mappings for the repaired evaluator:
+
+| archived checkpoint | SHA256 |
 |---|---|
 | `artifacts/abc_v3/stage_a_fix4/checkpoint_latest.pt` | `144fe92a1656a97b73186dfc284f4d764d982d9b026784d28856561f9bddeb6b` |
 | `artifacts/abc_v3/stage_a_mixed/checkpoint_latest.pt` | `fa78d675a8d94da6aeace1e48cd25d9e838f36579de1cee9704fc64530fa1a56` |
@@ -13,49 +49,3 @@ changes, results are **not** comparable across runs.
 | `artifacts/abc_v3/stage_b1a_frozen/checkpoint_latest.pt` | `08e78ff7401b186b629961b3ccb66e1ffe24197c65cf924399ce2cf45fd37e08` |
 | `artifacts/abc_v3/stage_b1b_mdcath/checkpoint_latest.pt` | `2651ad98c3c8acefd55bc7b417c89d23d05b41076898728149d48f0faa63019c` |
 | `artifacts/abc_v3/stage_b1b_mixed/checkpoint_latest.pt` | `e7662bd8f40cb9d1d302f1ec5aa384efff317c6e51ab271de56bff618c843851` |
-
-## Variant → module mapping
-
-| Variant | encoder source | predictor/OPF | decoder | dynamics |
-|---|---|---|---|---|
-| `h_only` | `stage_a_fix4/...pt` key `model` (step 14000) | predictor + OPF from explicit `stage_a_predictor_ckpt` | B1a oracle decoder trained on this H | direct predictor |
-| `h_ft` | `stage_b1a_fix4_unfrozen/...pt` key `encoder` (step 3000, top-2 blocks unfrozen) | predictor + OPF from explicit Stage-A source checkpoint | B1a oracle decoder | direct predictor |
-| `h_plus_s` | same as `h_ft` (frozen after B1a) | not used for transition; history initializes `S0` | `ResidualCADecoder` from B1b ckpt key `decoder` | `StageB1b` key `model`, GLE rollout |
-| `persist` | — | — | identity | — |
-
-For `h_only` and `h_ft`, the predictor receives the complete
-`H_context [B,K,L,dH]`.  Its checkpoint output is
-`pred_factors [B,L,J,r]`; evaluation constructs
-`H_future = OPF.compose(OPF.decompose(H_anchor) + pred_factors)` before calling
-the decoder.  The factor output is not itself treated as an absolute `H_future`.
-
-## ⚠️ Lineage inconsistency found (2026-10-17) — DECIDE BEFORE TRUSTING CROSS-VARIANT NUMBERS
-
-The H lineage is **not a single chain**. Concretely:
-
-1. `stage_b1a_fix4_unfrozen` was trained with `stage_a_ckpt =
-   artifacts/abc_v3/stage_a_fix4_frozen/checkpoint_step6450.pt`
-   (recorded `step=6000` inside; config says 6450) — i.e. its fine-tuned `encoder`
-   descends from **`stage_a_fix4_frozen`**.
-2. Both B1b runs (`stage_b1b_mdcath`, `stage_b1b_mixed`) were trained with
-   `stage_a_ckpt = artifacts/abc_v3/stage_a_mixed/checkpoint_latest.pt`
-   and `b1a_ckpt = null` — i.e. the GLE dynamics were **never** trained on the
-   fine-tuned encoder. They sit on `stage_a_mixed`.
-
-Consequences for a fair 4-way comparison:
-- `h_only` (fix4) vs `h_ft` (fix4_frozen→unfrozen) vs `h_plus_s` (mixed) mixes **three**
-  different Stage-A bases. Any conclusion like "H+S helps" would be confounded by the
-  encoder swap, not by the dynamics equation.
-- All Stage-A checkpoints in this lineage have `delta_target=False` (the known-bad target;
-  see `H_quality_step5000.md` §3 and `B1B_DIAGNOSIS_AND_PLAN.md`).
-
-**Resolution (T0.2 decision, to be honoured by the runner):**
-- The runner takes an explicit `--encoder-base` and `--b1b-ckpt`; it does **not** silently
-  mix. Two headline configurations are supported and both are reported:
-  - **CONFIG-A ("as-trained", for diagnosing current artifacts):** encoders exactly as each
-    run trained them. Reported with a loud caveat that the base differs.
-  - **CONFIG-B ("aligned base", the scientifically valid comparison):** one shared Stage-A
-    encoder for all four variants; the B1b/H-ft projections must be **retrained on that same
-    base** before this config is meaningful. Until such a retrain exists, CONFIG-B is a
-    placeholder and the runner refuses to emit skill numbers for it (fails fast).
-- `meta.json` always records which config was used and the encoder hash per variant.

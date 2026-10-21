@@ -64,12 +64,27 @@ def encode_history(encoder, normalizer, ctx, device):
     coords = ctx["coords"].to(device)                      # [B,K,L,4,3]
     B, K, L = coords.shape[:3]
     rmask = ctx["residue_mask"].to(device)                 # [B,K,L]
+
+    # anchor-conditioned encoder: express every frame in the anchor's PCA basis
+    # so that H_future - H_anchor encodes displacement rather than per-frame shape.
+    # Requires _canonical_frame from the encoder module.
+    anc_centroid = anc_basis = None
+    if getattr(encoder, "anchor_conditioned", False):
+        from protein_jepa_frame.models.encoder import _canonical_frame
+        anchor_coords = coords[:, -1]                      # [B,L,4,3]
+        anchor_mask   = rmask[:, -1].bool()                # [B,L]
+        cent, basis   = _canonical_frame(anchor_coords, anchor_mask)  # [B,3],[B,3,3]
+        anc_centroid  = cent[:, None].expand(B, K, 3).reshape(B * K, 3)
+        anc_basis     = basis[:, None].expand(B, K, 3, 3).reshape(B * K, 3, 3)
+
     H = encoder(
         coords.reshape(B * K, 1, L, 4, 3), rmask.reshape(B * K, 1, L),
         ctx["aatype"].to(device)[:, None].expand(B, K, L).reshape(B * K, L),
         ctx["residue_index"].to(device)[:, None].expand(B, K, L).reshape(B * K, L),
         ctx["chain_id"].to(device)[:, None].expand(B, K, L).reshape(B * K, L),
         token_mask=rmask.reshape(B * K, 1, L),
+        anchor_centroid=anc_centroid,
+        anchor_basis=anc_basis,
     )[:, 0].reshape(B, K, L, -1)
     if normalizer is not None:
         H = normalizer(H)

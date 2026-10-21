@@ -11,11 +11,23 @@ information (ridge R^2 < 0).
 Modules:
   FromNoneConfig      : sizing for the decoder head.
   SimpleCADecoder     : lightweight per-residue MLP displacement head.
-  ResidualCADecoder   : re-exported invariant-local residual head (heavier).
+  MessagePassingCADecoder : residue-graph self-attention head (H only).
+  CRIDecoder          : cross-residue + H<->S interactive head (recommended).
 """
 from protein_jepa_frame.models.stage_b1b_fromnone.decoder import (
     FromNoneConfig,
     SimpleCADecoder,
 )
+from protein_jepa_frame.models.stage_b1b_fromnone.mp_decoder import (
+    CRIDecoder,
+    MessagePassingCADecoder,
+    MessagePassingConfig,
+)
 
-__all__ = ["FromNoneConfig", "SimpleCADecoder"]
+__all__ = [
+    "FromNoneConfig",
+    "SimpleCADecoder",
+    "MessagePassingConfig",
+    "MessagePassingCADecoder",
+    "CRIDecoder",
+]

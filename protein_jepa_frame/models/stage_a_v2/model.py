@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import copy
 import math
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 
 import torch
@@ -54,6 +55,7 @@ if str(_ja_path) not in sys.path:
 from jepa_anything_core.opf import OrthogonalFactorProjection  # noqa: E402
 
 from protein_jepa_frame.models.encoder import ProteinGeometryEncoder
+from protein_jepa_frame.data.protocol import validate_endpoint_times
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -69,6 +71,13 @@ class StageAV2Config:
     dropout: float = 0.1
     max_residues: int = 4096
     orientation_features: bool = True
+    # Within-frame canonical-frame position channel (2026-10-18).  Adds a
+    # per-residue CA position in the frame's own PCA frame, giving H a reference
+    # in which "how residue i moved relative to the anchor" is expressible.
+    # Without it H is a purely local, position-blind invariant descriptor and a
+    # probe cannot generalise the displacement to unseen frames (measured
+    # R2=0.09 held-out vs 1.0 overfit).
+    relative_position_features: bool = True
     # Scale on the time-invariant identity embeddings (aa / residue-index /
     # chain).  Kept small so the geometry signal drives H rather than a static
     # identity code (see encoder.py note on time-invariant collapse).
@@ -76,7 +85,10 @@ class StageAV2Config:
 
     # OPF
     num_factors: int = 4          # J; factor_dim r = latent_dim // num_factors
-    opf_learnable: bool = True
+    opf_learnable: bool = False
+    opf_mode: str = "fixed_orthogonal"
+    deterministic_temporal: bool = True
+    masked_identity_queries: bool = True
 
     # Predictor
     predictor_depth: int = 4
@@ -85,7 +97,7 @@ class StageAV2Config:
     max_frames: int = 256         # for positional encoding
 
     # EMA schedule: m stays at ema_start for ema_warmup_steps, then increases
-    # linearly to ema_end over the *remaining* training.  Two properties matter
+    # linearly to ema_end over the next 2*ema_warmup_steps. Two properties matter
     # for avoiding the trivial-copy shortcut (predictor copies the last frame
     # instead of reasoning about dynamics):
     #   * a fast-moving teacher stays close to the online encoder, so
@@ -114,16 +126,9 @@ class StageAV2Config:
     struct_recon_dim: int = 256        # hidden width of the distance head
     struct_recon_pairs: int = 256      # CA-CA pairs sampled per frame per step
 
-    # Delta-target toggle.  When True the temporal objective predicts the
-    # NOTE (redesign): forward_temporal_multilag now ALWAYS uses the
-    # anchor-calibrated delta target, because the target frame is drawn from the
-    # future window (outside the context) rather than from within the context.
-    # Predicting an out-of-window future from a copy of the anchor is no longer
-    # trivial, so the delta parameterisation (predict the displacement toward
-    # the future, add the anchor factors back for synthesis) is both correct and
-    # the right inductive bias.  This flag is retained only for checkpoint
-    # compatibility and no longer gates the temporal objective.
-    delta_target: bool = False
+    # Explicit output contract. All temporal APIs predict teacher-space changes;
+    # synthesize H_future = compose(decompose(H_anchor) + delta_factors).
+    delta_target: bool = True
 
     @property
     def factor_dim(self) -> int:
@@ -135,10 +140,30 @@ class StageAV2Config:
                 f"latent_dim ({self.latent_dim}) must be divisible by "
                 f"num_factors ({self.num_factors})"
             )
+        if self.opf_mode not in {"fixed_orthogonal", "soft_gram", "qr_retraction"}:
+            raise ValueError(f"unknown opf_mode: {self.opf_mode}")
+        if self.opf_learnable and self.opf_mode == "fixed_orthogonal":
+            self.opf_mode = "soft_gram"
+        elif self.opf_mode != "fixed_orthogonal":
+            self.opf_learnable = True
+        if not self.delta_target:
+            raise ValueError("Stage A v3 predictor emits delta_factors; delta_target must be True")
+
+
+@contextmanager
+def deterministic_module(module: nn.Module):
+    """Disable stochastic layers while preserving autograd and prior modes."""
+    modes = [(child, child.training) for child in module.modules()]
+    module.eval()
+    try:
+        yield module
+    finally:
+        for child, mode in modes:
+            child.training = mode
 
 
 def _context_to_target_lag_ps(batch: dict, K: int) -> torch.Tensor:
-    """Physical interval from the last context frame to the target frame.
+    """Deprecated legacy first-future helper; new endpoint APIs do not call it.
 
     The paired dataset reports `horizon_time_ps` as
     (first future frame) - (first context frame).  After the context is
@@ -250,6 +275,12 @@ class CausalTransformerPredictor(nn.Module):
         #   1 = temporal (cross-frame causal prediction)
         self.task_embed = nn.Embedding(2, latent_dim)
         nn.init.normal_(self.task_embed.weight, std=latent_dim ** -0.5)
+        # Queries retain known sequence identity without reading hidden geometry.
+        self.query_aatype = nn.Embedding(21, latent_dim)
+        self.query_residue = nn.Embedding(4096, latent_dim)
+        self.query_chain = nn.Embedding(128, latent_dim)
+        self.mask_query = nn.Parameter(torch.zeros(latent_dim))
+        nn.init.normal_(self.mask_query, std=latent_dim ** -0.5)
 
         # Stage 1: causal temporal attention — per-residue over K frames
         # Input shape to transformer: [B*L, K, dH]
@@ -303,8 +334,16 @@ class CausalTransformerPredictor(nn.Module):
         target_frame: torch.Tensor | None = None,
         valid_mask: torch.Tensor | None = None,
         task_id: int = 1,
+        query_identity: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
+        query_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         B, K, L, D = H_ctx.shape
+        if lag_ps.shape != (B,) or temperature_k.shape != (B,):
+            raise ValueError("lag_ps and temperature_k must each have shape [B]")
+        if not torch.isfinite(lag_ps).all() or not torch.isfinite(temperature_k).all():
+            raise ValueError("physical lag and temperature must be finite")
+        if (temperature_k <= 0).any() or (lag_ps < 0).any() or (task_id == 1 and (lag_ps <= 0).any()):
+            raise ValueError("temperature must be positive and future lag must be strictly positive")
 
         # Optional masked-frame input: replace the last context slot with a
         # zeroed/masked token so the predictor cannot trivially copy anchor geometry.
@@ -312,6 +351,15 @@ class CausalTransformerPredictor(nn.Module):
             x_hist = torch.cat([H_ctx[:, :-1], target_frame], dim=1)   # [B,K,L,D]
         else:
             x_hist = H_ctx
+        if query_identity is not None:
+            aa, position, chain = query_identity
+            identity = (self.query_aatype(aa.clamp(0, 20))
+                        + self.query_residue(position.clamp(0, self.query_residue.num_embeddings - 1))
+                        + self.query_chain(chain.clamp(0, self.query_chain.num_embeddings - 1))
+                        + self.mask_query)
+            if query_mask is not None:
+                identity = identity * query_mask.unsqueeze(-1)
+            x_hist = x_hist + identity[:, None]
 
         # Time conditioning injected into the last frame token only.
         # task_id selects the regime: 0 = spatial (within-frame reconstruction),
@@ -385,6 +433,7 @@ class StageAV2(nn.Module):
             max_residues=config.max_residues,
             orientation_features=config.orientation_features,
             identity_embed_scale=config.identity_embed_scale,
+            relative_position_features=config.relative_position_features,
         )
 
         # EMA teacher (deep copy, no grad)
@@ -398,7 +447,7 @@ class StageAV2(nn.Module):
             num_factors=config.num_factors,
             factor_dim=config.factor_dim,
             learnable=config.opf_learnable,
-            orthogonality_mode="soft_gram",
+            orthogonality_mode=("soft_gram" if config.opf_mode == "fixed_orthogonal" else config.opf_mode),
         )
 
         # Causal predictor
@@ -438,6 +487,38 @@ class StageAV2(nn.Module):
             nn.GELU(),
             nn.Linear(config.struct_recon_dim, 1),
         )
+
+        # Structural-displacement readout head (P0-A, 2026-10-18).
+        #
+        # Reads the PREDICTED factor delta (+ anchor H + global mean H) and emits
+        # a per-residue CA displacement expressed in the anchor residue-local
+        # frame.  It is supervised by the TRUE future frame's Kabsch-aligned
+        # internal CA displacement.  This is the minimal structure supervision
+        # consistent with JEPA-Anything: the encoder is still trained by the
+        # temporal factor-prediction loss, but that loss now also has to carry
+        # enough information for this head to recover the real displacement.
+        # The head is trained jointly and discarded after Stage A.
+        #
+        # Input: the predicted H change alone (dH-wide).  No anchor_H / H_mean
+        # side-channel: those let the head recover the target's global structure
+        # from static context and ignore the predicted change, so the displacement
+        # signal never reached H (measured: within-protein probe ratio unchanged
+        # at 0.946 when the aux was added).  Reading only the change forces the
+        # gradient onto H itself.
+        self.displacement_head = nn.Sequential(
+            nn.Linear(dH, config.struct_recon_dim),
+            nn.GELU(),
+            nn.Linear(config.struct_recon_dim, config.struct_recon_dim),
+            nn.GELU(),
+            nn.Linear(config.struct_recon_dim, 3),
+        )
+        # Small-norm output init (NOT zero): a zero last layer would block all
+        # gradient to its input at step 0 (dL/d_in = W_out^T @ ... = 0), so the
+        # encoder/predictor would receive no displacement signal at init.  A
+        # tiny nonzero init keeps the head near "no displacement" (= persistence)
+        # while letting gradients flow through from the first step.
+        nn.init.normal_(self.displacement_head[-1].weight, std=1e-2)
+        nn.init.zeros_(self.displacement_head[-1].bias)
 
     # ── train() override: keep teacher always in eval ────────────────────────
 
@@ -486,6 +567,23 @@ class StageAV2(nn.Module):
     def sync_teacher(self) -> None:
         """Hard-copy online weights to teacher (use at initialization)."""
         self.teacher_encoder.load_state_dict(self.context_encoder.state_dict())
+
+    def encode_temporal(self, **kwargs) -> torch.Tensor:
+        """Deterministic, differentiable structural H for dynamic objectives."""
+        if self.config.deterministic_temporal:
+            with deterministic_module(self.context_encoder):
+                return self.context_encoder(**kwargs)
+        return self.context_encoder(**kwargs)
+
+    @torch.no_grad()
+    def opf_diagnostics(self) -> dict[str, float]:
+        basis = self.opf.analysis_basis().reshape(self.config.latent_dim, -1)
+        singular = torch.linalg.svdvals(basis.float())
+        return {"opf/sv_min": singular.min().item(), "opf/sv_max": singular.max().item(),
+                "opf/condition": (singular.max() / singular.min().clamp_min(1e-12)).item()}
+
+    def after_optimizer_step(self) -> None:
+        self.opf.after_optimizer_step(int(self._ema_step.item()) + 1)
 
     # ── Structure reconstruction auxiliary ───────────────────────────────────
 
@@ -588,7 +686,8 @@ class StageAV2(nn.Module):
 
         # Per-frame normalisation by the target variance, so the loss is O(1)
         # and comparable to the JEPA terms.  Mean-prediction ⇒ loss ≈ 1.
-        tgt_dev = (tgt - tgt.mean(dim=1, keepdim=True)) ** 2
+        tgt_mean = (tgt * valid_f).sum(dim=1, keepdim=True) / valid_f.sum(dim=1, keepdim=True).clamp(min=1.0)
+        tgt_dev = (tgt - tgt_mean) ** 2
         var = (tgt_dev * valid_f).sum(dim=1) / valid_f.sum(dim=1).clamp(min=1.0)
         var = var.clamp(min=1e-3)                            # [BK]
         se = (pred - tgt) ** 2 * valid_f                     # [BK, n_pairs]
@@ -679,9 +778,15 @@ class StageAV2(nn.Module):
         # Predictor input: use context as a 1-frame "history"
         H_ctx = context_H.unsqueeze(1)  # [B, 1, L, dH]
         lag_ps = torch.zeros(B, device=coords.device)
-        temp_k = batch.get("temperature_k", torch.full((B,), 348.0, device=coords.device))
+        if batch.get("temperature_k") is None:
+            raise ValueError("spatial JEPA requires an explicit temperature_k")
+        temp_k = batch["temperature_k"]
 
-        pred_full = self.predictor(H_ctx, lag_ps, temp_k, valid_mask=valid, task_id=0)   # [B, L, J, r]
+        pred_full = self.predictor(
+            H_ctx, lag_ps, temp_k, valid_mask=valid, task_id=0,
+            query_identity=(aatype, residue_index, chain_id) if self.config.masked_identity_queries else None,
+            query_mask=spatial_mask,
+        )
 
         # Compute factors only on masked (target) residues
         mask_idx = spatial_mask & valid   # [B, L]
@@ -709,72 +814,11 @@ class StageAV2(nn.Module):
         self,
         batch: dict,
     ) -> dict:
-        """Temporal mask: K context frames → predict target frame H at lag τ.
+        """Single endpoint API with the same delta contract as multi-lag training.
 
-        Expects a *paired* batch from collate_paired_windows, with keys:
-          context_coords [B,K,L,4,3], future_coords [B,Tf,L,4,3],
-          horizon_time_ps [B], temperature_k [B].
-
-        Returns dict with keys:
-            pred_factors:   [B, L, J, r]
-            target_factors: [B, L, J, r]
-            context_H:      [B, K, L, dH]
-            valid_mask:     [B, L]
+        The last future frame lies one declared horizon after the anchor.
         """
-        ctx_coords = batch["context_coords"]       # [B, K, L, 4, 3]
-        ctx_rmask = batch["context_residue_mask"]  # [B, K, L]
-        aatype = batch["context_aatype"]
-        residue_index = batch["context_residue_index"]
-        chain_id = batch["context_chain_id"]
-
-        fut_coords = batch["future_coords"]
-        fut_rmask = batch["future_residue_mask"]
-
-        B, K, L = ctx_coords.shape[:3]
-        valid = ctx_rmask[:, 0]   # [B, L] — residue existence fixed across frames
-
-        # τ must be measured from the LAST context frame to the target frame.
-        # The predictor's causal summary is formed at the last context frame, so
-        # the interval it has to bridge is (t_target - t_last_context).  The raw
-        # `horizon_time_ps` is (first future frame - first context frame), which
-        # equals this only when the context is a single frame.  With K > 1 it
-        # overstates τ by the context span (e.g. 8 ns instead of 1 ns for an
-        # 8-frame context), which makes the time conditioning unlearnable.
-        lag_ps = _context_to_target_lag_ps(batch, K)   # [B]
-        temp_k = batch.get("temperature_k", torch.full((lag_ps.shape[0],), 348.0, device=lag_ps.device))
-
-        # Online encoder: all K context frames
-        context_H = self.context_encoder(
-            coords=ctx_coords,
-            residue_mask=ctx_rmask,
-            aatype=aatype,
-            residue_index=residue_index,
-            chain_id=chain_id,
-        )   # [B, K, L, dH]
-
-        # Teacher encodes first frame of future window (the target frame)
-        target_frame = {
-            "coords": fut_coords[:, :1],
-            "residue_mask": fut_rmask[:, :1],
-            "aatype": batch["future_aatype"],
-            "residue_index": batch["future_residue_index"],
-            "chain_id": batch["future_chain_id"],
-        }
-        h_teacher = self._teacher_encode_clip(target_frame)   # [B, L, dH]
-
-        # Predictor
-        pred = self.predictor(context_H, lag_ps, temp_k, valid_mask=valid, task_id=1)   # [B, L, J, r]
-
-        # target factors: P_j · stop_grad(h̄)
-        target_factors = self._project_to_factors(h_teacher.detach())  # [B, L, J, r]
-
-        return {
-            "pred_factors": pred,
-            "target_factors": target_factors,
-            "context_H": context_H,
-            "valid_mask": valid,
-            "h_teacher_full": h_teacher.detach(),
-        }
+        return self.forward_temporal_multilag(batch, (0,), recent_frac=1.0)
 
     # ── Multi-lag temporal forward ────────────────────────────────────────────
 
@@ -786,25 +830,23 @@ class StageAV2(nn.Module):
     ) -> dict:
         """Causal prediction: full context window → target frame OUTSIDE the window.
 
-        The target is drawn from ``future_*`` keys of the paired-window batch,
-        which are guaranteed non-overlapping with context by the dataset builder
-        (``paired_nonoverlap_only=True``).  This closes the core training/eval
-        mismatch: Stage A trains exactly as Stage B1a/eval evaluates.
+        The selected target comes from ``future_*`` and its physical timestamp
+        must lie strictly after the last context frame. Unselected frames in a
+        mirrored future clip can overlap context and never enter the teacher
+        or predictor. No whole-window nonoverlap assumption is needed.
 
         ``lags`` controls which future offset is used for each sample.  When the
         batch supplies multiple horizons (``paired_all_horizons=True``), each
         sample already carries its own horizon via ``horizon_time_ps``; ``lags``
-        then selects which index inside the future clip to target (default: use
-        the first future frame, i.e., index 0 = the closest future frame).
+        then selects an index counted backward from the future clip's end.
 
         Args:
             batch: paired-window batch with ``context_*`` AND ``future_*`` keys.
             lags: future frame offsets within the future clip to supervise.
-                  Each must be < T_fut (number of future frames).  The first
-                  offset (lag=0) is the frame immediately after the context
-                  window.  Ratio-based sampling still applies.
+                  Each must be < T_fut. lag=0 selects its last frame, exactly
+                  one declared horizon after the anchor for mirrored clips.
             recent_frac: fraction of each batch (by sample index) restricted to
-                the two *shortest* lags (smallest future offsets).
+                the two smallest backward offsets (closest to full horizon).
 
         Returns dict with the same keys as before so all downstream code is
         unchanged:
@@ -828,6 +870,8 @@ class StageAV2(nn.Module):
         ctx_t    = batch.get("context_time_ps")
         fut_t    = batch.get("future_time_ps")
         temp_all = batch.get("temperature_k")
+        if ctx_t is None or fut_t is None or temp_all is None:
+            raise ValueError("temporal JEPA requires context_time_ps, future_time_ps, and temperature_k")
 
         B, K, L = ctx_coords.shape[:3]
         T_fut = fut_coords.shape[1]
@@ -842,14 +886,16 @@ class StageAV2(nn.Module):
         # closer in absolute time to the anchor.  lag=0 selects the last future
         # frame (full horizon); larger lags step backward toward the anchor.
         lags = tuple(sorted({int(l) for l in lags}))
+        if not lags or not 0 <= recent_frac <= 1:
+            raise ValueError("lags must be nonempty and recent_frac must be in [0,1]")
         for l in lags:
             if l < 0 or l >= T_fut:
                 raise ValueError(
                     f"lag {l} out of range for future clip T_fut={T_fut}"
                 )
 
-        # ── Encode full context window with the online encoder ────────────────
-        context_H = self.context_encoder(
+        # ── Encode full context window without stochastic differences ─────────
+        context_H = self.encode_temporal(
             coords=ctx_coords,
             residue_mask=ctx_rmask,
             aatype=aatype,
@@ -894,27 +940,11 @@ class StageAV2(nn.Module):
         tgt_rmask_sel  = fut_rmask[ar, lag_sel][:, None]    # [B,1,L]
 
         # ── Physical lag (ps): anchor → selected future frame ─────────────────
-        if ctx_t is not None and fut_t is not None:
-            anchor_t = ctx_t[:, -1]                          # [B] last context
-            fut_t_sel = fut_t[ar, lag_sel]                   # [B]
-            lag_ps = (fut_t_sel - anchor_t).to(torch.float32)
-            bad = ~torch.isfinite(lag_ps) | (lag_ps <= 0)
-            # Fallback assumes 1 ns/frame; horizon_time_ps is the true gap.
-            hz = batch.get("horizon_time_ps")
-            if hz is not None:
-                fallback = hz.to(torch.float32)
-            else:
-                fallback = torch.full_like(lag_ps, 1000.0)
-            lag_ps = torch.where(bad, fallback, lag_ps)
-        else:
-            hz = batch.get("horizon_time_ps")
-            lag_ps = (hz.to(torch.float32) if hz is not None
-                      else torch.full((B,), 1000.0, device=ctx_coords.device))
-
-        if temp_all is not None:
-            temp_k = temp_all
-        else:
-            temp_k = torch.full((B,), 348.0, device=ctx_coords.device)
+        anchor_t = ctx_t[:, -1]
+        fut_t_sel = fut_t[ar, lag_sel]
+        validate_endpoint_times(ctx_t, fut_t_sel)
+        lag_ps = (fut_t_sel - anchor_t).to(torch.float32)
+        temp_k = temp_all
 
         # ── Predictor: full context window → future ───────────────────────────
         # The predictor receives the complete K-frame context (no zero-fill,
@@ -936,11 +966,10 @@ class StageAV2(nn.Module):
         h_teacher = self._teacher_encode_clip(tgt_frame_dict)   # [B, L, dH]
 
         # Delta-target: predict displacement from anchor in teacher space.
-        # This cancels the ~98% static fold code so 100% of the gradient
-        # comes from the conformational change between anchor and future.
+        # Subtraction removes frame-invariant offsets from the target.
         # target = P_j · (h̄(future) - stop_grad(h̄(anchor)))
-        # Copying the anchor yields target ≈ 0 and large error → predictor
-        # is forced to model where the protein actually moves.
+        # Delta losses still admit a temporally static encoder; structural
+        # calibration and deterministic physical probes must detect that case.
         anchor_frame_dict = {
             "coords": ctx_coords[:, -1:],   # [B,1,L,4,3] last ctx frame
             "residue_mask": ctx_rmask[:, -1:],
@@ -955,7 +984,36 @@ class StageAV2(nn.Module):
         # Anchor factor coordinates for anchor-calibrated reconstruction:
         #   H_hat(t) = compose( decompose(h_anchor) + pred_factors )
         # → pred_factors = 0 exactly reproduces the anchor (persistence fallback).
-        anchor_factors = self._project_to_factors(h_teacher_anchor.detach())
+        #
+        # IMPORTANT (P0-A fix, 2026-10-18): the anchor must come from the ONLINE
+        # encoder and must NOT be detached.  Previously it was the *teacher*
+        # encoding, detached, so the synthesized delta
+        #   compose(anchor_factors + pred) - compose(anchor_factors)
+        # had gradient ONLY through ``pred`` (the predictor) and NEVER through the
+        # encoder's own anchor representation.  That let all displacement signal
+        # live inside the predictor while the encoder's H stayed a purely local,
+        # time-direction-agnostic descriptor (measured: H-delta -> true
+        # displacement pattern R2 = 0.04).  Using the online anchor H
+        # (= context_H[:, -1], already computed above and carrying gradient)
+        # forces the encoder's anchor representation to be a usable origin for
+        # the displacement readout.
+        anchor_H_online = context_H[:, -1]                                # [B,L,dH]
+        anchor_factors  = self._project_to_factors(anchor_H_online)       # [B,L,J,r] (grad)
+
+        # ── P0-A target: TRUE internal CA displacement (anchor-local) ─────────
+        # For each residue, the future CA cloud is Kabsch-aligned onto the anchor
+        # CA cloud, and the displacement of the aligned target from the anchor is
+        # expressed in the anchor's per-residue local frame.  This is exactly the
+        # SE(3)-quotient quantity the decoder must reproduce (same definition as
+        # B1a's target_delta_local), so supervising it here makes H's predicted
+        # delta carry real structural change instead of a self-referential
+        # teacher-latent delta.  Computed with the anchor geometry (no grad); the
+        # selected future frame index is lag_sel per sample.
+        target_delta_local = self._anchor_local_ca_displacement(
+            target_coords=tgt_coords_sel[:, 0],     # [B, L, 4, 3]
+            anchor_coords=ctx_coords[:, -1],        # [B, L, 4, 3]
+            residue_mask=valid,                     # [B, L]
+        )                                           # [B, L, 3]
 
         return {
             "pred_factors":    pred,
@@ -968,12 +1026,140 @@ class StageAV2(nn.Module):
             "h_teacher_full":  h_teacher.detach(),
             "h_teacher_anchor": h_teacher_anchor.detach(),
             "delta_teacher":   delta_teacher,
-            "anchor_factors":  anchor_factors.detach(),   # [B, L, J, r]
-            "anchor_H":        anchor_H.detach(),         # [B, L, dH]
+            # P0-A fix: anchor factors/H carry gradient to the online encoder.
+            "anchor_factors":  anchor_factors,            # [B, L, J, r] (grad)
+            "anchor_H":        anchor_H_online,           # [B, L, dH]  (grad)
+            # Synthesized predicted future H and its factor delta, WITH grad:
+            #   H_hat = compose(anchor_factors + pred_factors)
+            # This is the actual full-magnitude predicted change the decomposition
+            # is meant to encode, and is what the displacement readout reads.
+            "synth_H":         self.opf.compose(anchor_factors + pred),
+            "synth_delta_H":   self.opf.compose(anchor_factors + pred) - self.opf.compose(anchor_factors),
             "lag_ps":          lag_ps,
             "lag_slot":        slot,
             "lag_sel":         lag_sel,
+            # P0-A structural displacement target + label for the readout head.
+            "target_delta_local": target_delta_local,     # [B, L, 3]
+            "anchor_coords":   ctx_coords[:, -1].detach(),  # [B, L, 4, 3]
         }
+
+    @staticmethod
+    def _anchor_local_ca_displacement(
+        target_coords: torch.Tensor,   # [B, L, 4, 3]  target frame backbone (N, CA, C, O)
+        anchor_coords: torch.Tensor,   # [B, L, 4, 3]  anchor frame backbone
+        residue_mask: torch.Tensor,    # [B, L] bool
+    ) -> torch.Tensor:
+        """Kabsch-aligned internal CA displacement in the anchor local frames.
+
+        Returns [B, L, 3]: for each residue, the future CA position after a
+        single global Kabsch alignment of the target CA cloud onto the anchor CA
+        cloud, minus the anchor CA, rotated into the anchor's per-residue local
+        frame (x=C-CA, z=x×n, y=z×x).  A pure global rigid motion gives exactly
+        zero; only internal conformational change is measured.  This is the same
+        SE(3)-quotient target B1a supervises (``_kabsch_target_delta_local``).
+        """
+        B, L = anchor_coords.shape[:2]
+        device = anchor_coords.device
+        dtype = anchor_coords.dtype
+        m = residue_mask.to(dtype).unsqueeze(-1)                # [B, L, 1]
+        denom = m.sum(dim=1, keepdim=True).clamp_min(1.0)       # [B, 1, 1]
+
+        a_ca = anchor_coords[:, :, 1, :]                        # [B, L, 3]
+        t_ca = target_coords[:, :, 1, :]
+        a_c = (a_ca * m).sum(dim=1, keepdim=True) / denom
+        t_c = (t_ca * m).sum(dim=1, keepdim=True) / denom
+        P = (t_ca - t_c) * m                                    # target centred, [B,L,3]
+        Q = (a_ca - a_c) * m                                    # anchor centred
+        cov = P.transpose(1, 2) @ Q                             # [B, 3, 3]
+        # Row-vector convention (see B1a): aligned = centred_target @ R_align ≈ Q,
+        # with R_align = U D Vh.  Use float64 for a stable SVD.
+        U, _, Vh = torch.linalg.svd(cov.to(torch.float64))
+        d = torch.sign(torch.linalg.det(U @ Vh))
+        d = torch.where(d == 0, torch.ones_like(d), d)
+        D = torch.eye(3, device=device, dtype=torch.float64).unsqueeze(0).expand(B, -1, -1).clone()
+        D[:, 2, 2] = d
+        R_align = (U @ D @ Vh).to(dtype)                        # [B, 3, 3]
+        t_aligned = (t_ca - t_c) @ R_align + a_c                # target in anchor frame
+        delta_global = t_aligned - a_ca                         # [B, L, 3]
+
+        # Anchor per-residue local frame (matches encoder._local_backbone_frames).
+        a_N = anchor_coords[:, :, 0, :]
+        a_C = anchor_coords[:, :, 2, :]
+        eps = 1e-8
+        x_axis = F.normalize(a_C - a_ca, dim=-1, eps=eps)
+        n_dir = F.normalize(a_N - a_ca, dim=-1, eps=eps)
+        z_axis = F.normalize(torch.cross(x_axis, n_dir, dim=-1), dim=-1, eps=eps)
+        y_axis = F.normalize(torch.cross(z_axis, x_axis, dim=-1), dim=-1, eps=eps)
+        R_local = torch.stack([x_axis, y_axis, z_axis], dim=-2)  # [B, L, 3, 3] rows=basis
+        delta_local = (R_local @ delta_global.unsqueeze(-1)).squeeze(-1)  # [B, L, 3]
+        return delta_local * m
+
+    def displacement_readout_loss(
+        self,
+        pred_factors: torch.Tensor,      # [B, L, J, r]  predicted factor delta (with grad)
+        target_delta_local: torch.Tensor,  # [B, L, 3]   true internal CA displacement
+        residue_mask: torch.Tensor,      # [B, L] bool
+        synth_delta_H: torch.Tensor,     # [B, L, dH]  predicted H change (with grad)
+        direction_weight: float = 1.0,   # λ_dir on the per-residue direction term
+        anchor_H: torch.Tensor | None = None,  # unused; kept for call-site compat
+    ) -> torch.Tensor:
+        """Supervise the predicted H change through a *structure-only* readout.
+
+        P0-A rewrite (2026-10-18).  Two changes fix the measured failure where
+        the displacement signal bypassed H and settled in the predictor:
+
+        1. **No side-channel.**  The readout head reads ONLY the predicted H
+           change ``synth_delta_H`` (dH-wide).  Previously the head also saw the
+           anchored ``anchor_H`` and the frame-level ``H_mean``; those let the
+           head reconstruct the *target pattern's* global structure from static
+           context and ignore the predicted change (measured: adding the auxiliary
+           left the within-protein probe ratio unchanged at 0.946).  With the
+           change as the sole input, the ONLY way to lower this loss is for the
+           predicted H change itself to carry the displacement information — and,
+           because the anchor factors now come from the online encoder with grad,
+           that gradient reaches H.
+
+        2. **Direction term.**  The pattern MSE alone tolerates a head that gets
+           the *magnitude* right but the *direction* wrong.  We add a per-residue
+           cosine term ``(1 - cos(pred_c, tgt_c))`` so "which residue moves where"
+           is supervised directly (measured H-delta vs displacement direction
+           cosine was only 0.20).
+
+        Both the predicted change and the target are made mean-free per frame and
+        normalised by the target's residual variance, so the loss measures the
+        *pattern* of the change (which residue moves where); a constant prediction
+        scores ≈ 1 on the MSE term rather than 0.  The head is trained jointly and
+        discarded after Stage A.
+        """
+        B, L, J, r = pred_factors.shape
+        dH = J * r
+        pf = synth_delta_H.reshape(B, L, dH)                    # ONLY input to head
+
+        mf = residue_mask.to(pf.dtype).unsqueeze(-1)            # [B, L, 1]
+        n = mf.sum(dim=1).squeeze(-1).clamp(min=1.0)            # [B]  (#valid residues)
+
+        pred = self.displacement_head(pf)                       # [B, L, 3]
+
+        # ── Mean-free (pattern) normalisation ────────────────────────────────
+        # Remove the per-frame mean (common drift / horizon direction) so a head
+        # that predicts only that constant scores ≈ 1 on the MSE term rather
+        # than ~0.  See prior note: the raw form plateaued at 1.02 and never
+        # moved because the constant-mean solution satisfied it.
+        tgt_c = target_delta_local - (
+            (target_delta_local * mf).sum(dim=1, keepdim=True) / n.view(B, 1, 1)
+        )                                                      # [B, L, 3]
+        pred_c = pred - (pred * mf).sum(dim=1, keepdim=True) / n.view(B, 1, 1)
+        var = ((tgt_c ** 2) * mf).sum(dim=(1, 2)) / (n * 3.0)   # [B]
+        var = var.clamp(min=1e-3)
+        se = ((pred_c - tgt_c) ** 2 * mf).sum(dim=(1, 2)) / (n * 3.0)
+        l_pattern = (se / var).mean()
+
+        # ── Direction term: per-residue cosine between predicted and true ────
+        # cosine_similarity over the last (3) axis, masked over valid residues.
+        cos = F.cosine_similarity(pred_c, tgt_c, dim=-1)        # [B, L]
+        l_dir = ((1.0 - cos) * mf.squeeze(-1)).sum() / mf.sum().clamp(min=1.0)
+
+        return l_pattern + direction_weight * l_dir
 
     # ── Internal helpers ─────────────────────────────────────────────────────
 

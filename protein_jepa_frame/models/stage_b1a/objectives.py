@@ -31,11 +31,9 @@ class StageBOracleLossWeights:
     # MAIN positional loss: anchor-local internal displacement (SE(3) quotient).
     # The decoder's only positional path is X_hat = R_anchor @ d_local + t_anchor,
     # so this supervises exactly what the state (H_t) is responsible for.
-    relative_disp_weight: float = 5.0
-    # DIAGNOSTIC only.  Kabsch-aligned absolute CA MSE mixes the anchor's
-    # rigid-body role with H's internal role and rewards memorising the global
-    # pose; it is logged but must NOT drive training (default weight 0).
-    ca_mse_weight: float = 0.0
+    relative_disp_weight: float = 0.0
+    # Main anchor-free positional target: aligned CA MSE removes rigid pose.
+    ca_mse_weight: float = 1.0
 
     # Physical future probe
     phys_future_weight: float = 1.0     # λ_pred
@@ -124,7 +122,10 @@ def _kabsch_rotation(
     t = t * m.unsqueeze(-1)
     # Cross-covariance H = P^T T  -> [B, 3, 3]
     H = torch.einsum("bni,bnj->bij", p, t)
-    U, S, Vh = torch.linalg.svd(H)
+    # The optimal alignment is a nuisance fit. Its detached optimum gives the
+    # exact envelope gradient of squared aligned error, and avoids undefined
+    # SVD-vector derivatives for repeated singular values at initialization.
+    U, S, Vh = torch.linalg.svd(H.detach())
     # Coordinates are row vectors and the loss applies ``p @ R``.  Therefore
     # the Kabsch rotation is U @ D @ Vh (the V @ U^T form is the column-vector
     # convention and leaves a large rigid-body residual here).
@@ -148,10 +149,8 @@ def kabsch_ca_mse_loss(
     contributes a full-magnitude gradient.  This gives the oracle decoder a
     clean, direct H→CA signal instead of the diluted FAPE path.
 
-    DIAGNOSTIC ONLY in B1a.  It mixes the anchor's rigid-body role with H's
-    internal role (the anchor fixes the global pose), so it must not be used as
-    a training objective — see STAGE_AB_REDESIGN_PLAN.md §2.0.0.  The training
-    objective is the anchor-local displacement (`relative_disp`).
+    This is the main positional objective for anchor-free oracle calibration.
+    Detaching the optimal nuisance rotation preserves its envelope gradient.
     """
     if pred_ca.shape != target_ca.shape or pred_ca.shape[-1] != 3:
         raise ValueError("pred_ca and target_ca must both be [B, L, 3]")

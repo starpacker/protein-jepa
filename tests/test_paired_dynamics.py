@@ -2,6 +2,12 @@ import pytest
 import torch
 from torch.utils.data import DataLoader
 
+# These experiments target the retired pre-StageAV2 architecture.  Keep the
+# historical tests available, but do not pretend their removed implementation
+# is exercised by the current suite.  Current causal/data tests live in
+# test_training_contracts.py and the StageAV2/StageB1b regression suites.
+pytest.importorskip('protein_jepa_frame.models.jepa', reason='retired pre-StageAV2 architecture')
+
 from protein_jepa_frame.config import DataConfig, ModelConfig
 from protein_jepa_frame.data.collate import collate_paired_windows
 from protein_jepa_frame.data.dataset import build_dataset

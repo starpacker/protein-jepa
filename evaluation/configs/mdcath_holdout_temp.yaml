@@ -1,25 +1,41 @@
+# Schema-v2 example paths; override checkpoint locations explicitly after training.
 name: mdcath_holdout_temp
-# Held-out-TEMPERATURE axis.  Point `manifest` at a temperature-filtered jsonl
-# (produced by evaluation/build_temp_holdout.py) and/or use `temperatures` to
-# select which temperatures to score.  By default this scores the highest
-# temperature (450 K) on val proteins -- the hardest, most informative split.
 manifest: artifacts/mdcath_manifest_200dom/val.jsonl
-horizons_frames: [1, 2, 4, 8, 16, 24, 32, 48, 64, 96]
+horizons_frames:
+- 1
+- 2
+- 4
+- 8
+- 16
+- 24
+- 32
+- 48
+- 64
+- 96
 context_frames: 8
 context_stride: 1
 frame_stride: 1
-temperatures: [450.0]
+temperatures:
+- 450.0
 max_proteins: null
 n_rollout_reps: 4
 seed: 0
-# Multi-lag alignment with Stage-A training (see smoke.yaml).
-temporal_lags: [0, 4, 6, 7]
-emit_multi_lag: true
-anchor_stride: 80          # ~5 anchors per protein: bounds cost; multi-horizon grid retained
-oracle_max_horizon: 8      # only compute the (expensive) oracle decode for horizons <= 8 ns
-variants: [h_only, h_ft, h_plus_s, persist]
+temporal_lags: []
+emit_multi_lag: false
+anchor_stride: 80
+oracle_max_horizon: 8
+variants:
+- h_only
+- h_ft
+- h_plus_s
+- persist
 models:
-  stage_a_ckpt: artifacts/abc_v3/stage_a_unified/checkpoint_latest.pt   # h_only encoder + predictor source
-  stage_a_predictor_ckpt: artifacts/abc_v3/stage_a_unified/checkpoint_latest.pt
-  b1a_ckpt: artifacts/abc_v3/stage_b1a_unified/checkpoint_latest.pt
-  b1b_ckpt: artifacts/abc_v3/stage_b1b_unified/checkpoint_latest.pt
+  stage_a_ckpt: artifacts/repaired_v2/pilot_20261017/stage_a/checkpoint_latest.pt
+  stage_a_predictor_ckpt: artifacts/repaired_v2/pilot_20261017/stage_a/checkpoint_latest.pt
+  b1a_ckpt: artifacts/repaired_v2/pilot_20261017/stage_b1a/checkpoint_latest.pt
+  b1b_ckpt: artifacts/repaired_v2/pilot_20261017/stage_b1b/checkpoint_latest.pt
+split: temperature_subset
+train_manifests:
+- artifacts/mdcath_manifest_200dom/train.jsonl
+allow_legacy: false
+deterministic: true

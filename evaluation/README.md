@@ -1,123 +1,105 @@
-# `evaluation/` — what each script does and how to run it
+# Protein dynamics evaluation
 
-This package computes **one number** for every model variant: the **anchor-aligned
-CA RMSD** (internal relative displacement) at horizons 1–96 ns, on mdCATH held-out
-protein and held-out temperature splits, always compared against a **persistence**
-baseline.
+The primary endpoint error applies **one real anchor→target Kabsch transform** to
+all predictions. Independent prediction→target Kabsch RMSD is a secondary shape
+metric. The target never enters a forecast producer; real future H is encoded
+separately for oracle controls.
 
-Full spec + rationale: `../EVALUATION_PLAN.md`. Checkpoint mapping: `MODELS.md`.
+Before scoring, a canonical decoder pose is calibrated once using only the
+decoded current H and the observed last history frame. That history-only rigid
+transform is then fixed for all predictions, oracle controls and horizons. It
+removes arbitrary decoder gauge without fitting any prediction to a future target.
 
----
-
-## The pipeline (identical for every variant)
-
-```
-context X_{1..K}  ->  Encoder E  ->  H_context [B,K,L,dH]
-                                      │
-                                      ├─ H_anchor = H_context[:,-1]
-                                      │
-                                      └─> {future-state producer} -> H_future [B,L,dH]
-                                                                           │
-                                                        shared Decoder D ───┘
-                                                                           │
-                                                                     CA_pred
-                                                                                      │
-                                       anchor-aligned CA RMSD  <── X_true  <──────────┘
-```
-
-Only the **future-state producer** differs between variants:
-
-| variant | producer | dynamics |
-|---|---|---|
-| `persist` | X_anchor (identity) | none |
-| `h_only` | `predictor(H_context, τ, T)` from Stage-A encoder, then decode | Stage-A predictor + OPF |
-| `h_ft` | same predictor path with B1a fine-tuned encoder | Stage-A predictor + OPF |
-| `h_plus_s` | decode(GLE rollout of (H,S)) | **iterative equation** (Euler–Maruyama), no predictor |
-
-The direct Stage-A path is not an anchor-only decode:
-
-```text
-H_context = E(X_{1:K})                         [B,K,L,dH]
-pred_factors = predictor(H_context, tau, T)     [B,L,J,r]
-H_future = OPF.compose(OPF.decompose(H_anchor) + pred_factors)
-X_hat = D(H_future, H_anchor)
-```
-
-`H_future` is therefore the complete `[B,L,dH]` latent consumed by the same
-decoder `D`.  `pred_factors` is a delta in OPF factor coordinates, not the
-absolute future latent.  The `sequence`/`aatype` information is already used by
-the encoder; it is not an additional predictor input in the current checkpoint
-contract.  `anchor_decode` (decoding `H_anchor` directly) is an optional
-representation diagnostic, not one of the main predictive variants.
-
----
-
-## Modules
-
-| file | responsibility | depends on |
-|---|---|---|
-| `geometry.py` | **THE** Kabsch / aligned-RMSD / CA extraction. Unit-tested. | torch |
-| `data.py` | manifest → evaluation windows (context + target per horizon); guarantees context/target disjointness. | data.dataset readers |
-| `loaders.py` | checkpoint → frozen `ModelBundle`; version-aware decoder choice. | model packages |
-| `variants.py` | the 4 future-state producers (the only place variants differ). | geometry, models |
-| `metrics.py` | per-protein table → aggregate + paired bootstrap CI + skill. | numpy |
-| `report.py` (in `run_eval.py`) | writes `results.json` / `results.md` / `per_protein.jsonl` / `meta.json`. | — |
-| `run_eval.py` | **entrypoint**; orchestration only. | all of the above |
-| `build_temp_holdout.py` | build held-out-temperature manifests. | — |
-| `compat/` | vendored legacy model code so old checkpoints still load. | — |
-| `tests/test_geometry.py` | Kabsch correctness (ground-truth + optimality + mask). | pytest |
-
-**Rule:** nothing re-implements Kabsch or CA extraction outside `geometry.py`.
-
----
-
-## Running
+New results require a self-contained schema-v2 representation: encoder, raw-H
+oracle decoder, fitted train-only normalizer, encoder/decoder configuration, and
+content hashes. H+S uses normalized H internally and inverts normalization once
+before the shared raw-H decoder. Direct predictors consume raw history H and must
+have a matching encoder hash and a verified `delta_factors` output contract.
+Changing the encoder invalidates an old predictor.
 
 ```bash
-# fast harness check (2 proteins, 2 horizons)
-python -m evaluation.run_eval --config evaluation/configs/smoke.yaml --max-proteins 2
-
-# held-out-protein axis, horizons 1..96 ns, all 5 temperatures
-python -m evaluation.run_eval --config evaluation/configs/mdcath_holdout_protein.yaml
-
-# held-out-temperature axis (450 K)
-python -m evaluation.build_temp_holdout --manifest artifacts/mdcath_manifest_200dom/val.jsonl \
-    --train-manifest artifacts/mdcath_manifest_200dom/train_manifest_200dom/train.jsonl --temperature 450
-python -m evaluation.run_eval --config evaluation/configs/mdcath_holdout_temp.yaml \
-    --manifest-override artifacts/mdcath_manifest_200dom/val_temp450.jsonl   # (see run_eval --help)
-
-# geometry tests
-python -m pytest evaluation/tests/test_geometry.py -q
+CUBLAS_WORKSPACE_CONFIG=:4096:8 python -m evaluation.run_eval \
+  --config evaluation/configs/smoke.yaml \
+  --b1a-ckpt path/to/schema_v2_b1a.pt \
+  --b1b-ckpt path/to/schema_v2_b1b.pt \
+  --stage-a-ckpt path/to/matched_stage_a.pt \
+  --stage-a-predictor-ckpt path/to/matched_stage_a.pt \
+  --train-manifest path/to/train.jsonl \
+  --manifest-override path/to/validation.jsonl \
+  --outdir artifacts/eval/new_smoke
 ```
 
-Useful overrides: `--max-proteins`, `--horizons 1 2 4`, `--variants h_plus_s persist`,
-`--anchor-stride N` (sub-sample anchors), `--name`, `--outdir`.
+Config checkpoint paths are explicit examples for the repaired pilot; these files
+are created by training. Missing or incompatible checkpoints fail. A contract
+smoke checkpoint is always diagnostic, even if its tensor schema is valid. Formal
+autonomous checkpoints must carry their passed oracle gate. Validation remains a
+pilot/model-selection set; a final test set must remain untouched.
 
-Outputs land in `artifacts/eval/<name>/`:
-`results.json` (machine), `results.md` (tables), `per_protein.jsonl` (raw rows), `meta.json` (git + checkpoint hashes).
+Window budgets cap **distinct proteins**, optionally trajectories per protein and
+anchors per trajectory. Raw-frame horizons and physical ps come from the shared
+data protocol. Duplicate physical horizons from lag aliases are scored once.
+Reader errors, invalid masks, incompatible physical dt and nonfinite forecasts
+fail rather than silently removing difficult windows.
 
----
+`--split protein_holdout` checks distinct-protein disjointness against every
+`--train-manifest`. Filtering to 450 K is `temperature_subset`; it is not a
+`temperature_holdout` if any declared training manifest includes 450 K. Actual
+temperature exclusion must hold for every learned module from Stage A onward.
+Declared manifests and checkpoint/source hashes are recorded for audit; declarations
+must represent the actual training lineage.
 
-## Reading the tables
+Outputs:
 
-- **RMSD median / mean±SEM** — the metric (Å, lower better).
-- **persist** — the baseline at the same (split, horizon).
-- **oracle** — decode the TRUE future H with the same decoder (representation ceiling).
-- **Δ vs persist** — paired per-protein difference; **sig?** = 95% bootstrap CI excludes 0.
-- **skill** — `(persist - model)/(persist - oracle)`; 1 = oracle, 0 = persist, <0 = worse.
-  Reported only when the oracle beats persistence (`persist - oracle > 0`).
-- **MSD** — mean squared CA displacement of the prediction from the anchor;
-  ≈0 ⇒ the model is not moving (rollout collapse / pure persistence).
+- `per_window.jsonl`: complete protein/T/trajectory/anchor/target/horizon keys,
+  ensemble-mean primary and shape errors, each variant's own oracle and anchor-H
+  controls, sample scores, latent motion and physical distance energy score.
+- `samples.jsonl`: one row per exact window/variant/model replicate. No best-of-M
+  selection. Ensemble coordinate means are scored separately and are not claimed
+  to be physical conformations.
+- `per_protein.jsonl`: equal-window means within each protein/T/horizon/variant.
+- `results.json` and `results.md`: equal-protein summaries, SEM and paired protein
+  bootstrap. Single-protein runs cannot establish significance. Persistence
+  compared with itself has identically zero paired differences.
+- `meta.json`: effective config, source tree hash and git dirty status, checkpoint
+  hashes/contracts, manifest/split audit, seed, sample count, physical-score scale,
+  library/device versions and metric definition.
 
----
+The physical endpoint score is the energy score of the **empirical nonlocal CA
+pair-distance distribution**, scaled by a fixed Angstrom constant. It includes
+its V-statistic diagonal and does not normalize using target values. This is a
+proper observable-space forecast score, not a proof of full path dynamics. Report
+RMSF, ACF, path distributions and geometry validity separately for long rollouts.
+An oracle-normalized skill is absent/undefined when the oracle does not beat
+persistence; paired errors remain meaningful.
 
-## Known checkpoint caveats (READ `MODELS.md`)
+Legacy checkpoints are rejected by default. `--allow-legacy` is an explicit
+**diagnostic** adapter: legacy H+S additionally requires `--legacy-encoder-ckpt`
+matching its training source, and direct legacy prediction requires an explicit
+`--legacy-predictor-output absolute_factors|delta_factors`. It never infers old
+semantics from a mutable flag. Legacy/mock results use `diagnostic_aggregate`
+instead of `aggregate` and cannot become headline evidence.
 
-1. The B1a oracle decoder (v1) reconstructs a frame at **~5–6 Å**, not the 0.6 Å
-   of the MLP probe (`H_DECODABILITY_REPORT.md` §9). So `oracle` here is a *weak*
-   ceiling; `h_only`/`h_ft` inherit that weakness.
-2. The H lineage is **not one chain**: `h_ft`/`h_plus_s` descend from
-   `stage_a_fix4_frozen`, while the current B1b weights were trained on
-   `stage_a_mixed`. See `MODELS.md` §"Lineage inconsistency". Cross-variant
-   claims must respect this.
-3. Legacy checkpoints need `compat/` (the working tree rewrote `StructureDecoder`).
+Kalman likelihood is a separate diagnostic, not the autonomous training objective
+or a scientific forecast gate:
+
+```bash
+python -m evaluation.run_gate --ckpt path/to/schema_v2_b1b.pt \
+  --manifest path/to/validation.jsonl --train-manifest path/to/train.jsonl \
+  --split protein_holdout --horizon 4 --device cpu \
+  --out artifacts/eval/kalman_diagnostic.json
+```
+
+It scores the observed **continuous** anchor→1→2→3→4 path, checks every real dt
+against the kernel, and normalizes every ablation by actual transitions×valid
+residues×latent dimensions. It explicitly labels its teacher-forced conditional
+likelihood as diagnostic only.
+
+```bash
+OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 CUDA_VISIBLE_DEVICES='' \
+  python -m pytest evaluation/tests -q
+```
+
+The tests include independent geometry controls, deliberate target-leak rejection,
+exact pairing, protein weighting, NaN-pair handling, actual tiny schema bundles,
+legacy rejection, complete-history producer contracts, and byte-identical CPU
+mock end-to-end reruns. Mock output tests the instrument, not model quality.

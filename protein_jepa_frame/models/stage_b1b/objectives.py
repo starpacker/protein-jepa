@@ -1,24 +1,8 @@
-"""Stage B1b objectives: Kalman innovation NLL + multi-step energy score.
+"""Proper energy scores for autonomous forecast paths.
 
-Wiring per STAGE_ABC_REDESIGN_PLAN.md 2.4-2.5:
-
-    L_B1_full = mean_valid_NLL + lambda_ES * ES
-
-  NLL: StageB1b.kalman_nll(...) summed over steps and batch, normalised here by
-       (valid_residues * dH * n_steps) so that it is a per-dimension mean.
-  ES:  autonomous multi-step conditional energy score (2.5)
-
-       ES_hat = (1/M) sum_m ||v^(m) - v*||_2
-                - (1/(2M(M-1))) sum_{m!=m'} ||v^(m) - v^(m')||_2
-
-       v = Phi(H_{1:N}) is a fixed-standardised multi-time path feature vector
-       extracted by the (frozen) B1a decoder/probe.  ES is used only as a small
-       regulariser after an NLL warm-up; lambda_ES ramps from 0.
-
-Forbidden (plan 8.2) and NOT used here:
-  - force floor / force normalisation
-  - softplus(NLL) truncation  (raw continuous NLL may be negative)
-  - per-step detach inside the rollout
+The trainer uses history-initialized H/S rollouts for every optimized loss;
+ground-truth future values appear only as targets. The compatibility reporting
+helper accepts a detached, per-dimension diagnostic NLL, never an NLL objective.
 """
 
 from __future__ import annotations
@@ -37,23 +21,25 @@ from torch import Tensor
 class StageB1bLossWeights:
     """Scalar loss weights for Stage B1b.
 
-    warmup_steps > 0 keeps the run NLL-only (lambda_ES effectively 0) until the
-    Kalman recursion and innovation statistics are stable (2.5).
+    Optimized losses must be computed from autonomous samples. Kalman NLL may
+    be logged as a detached diagnostic, but cannot contribute gradients.
     """
-    nll_weight: float = 1.0
-    es_weight: float = 0.1          # lambda_ES; ramped in after warm-up
-    es_warmup_steps: int = 2000     # steps before ES is enabled
+    nll_weight: float = 0.0        # teacher-forced likelihood is diagnostic only
+    es_weight: float = 1.0
+    es_warmup_steps: int = 0       # no teacher-forced warmup
     es_num_samples: int = 4         # M, independent rollout samples
     es_horizon_steps: int = 8       # N steps scored by ES
 
     def lambda_es_at(self, step: int) -> float:
-        """Ramp lambda_ES linearly over the warm-up, then hold."""
-        if self.es_warmup_steps <= 0:
-            return self.es_weight
-        frac = min(1.0, max(0.0, step / float(self.es_warmup_steps)))
-        return self.es_weight * frac
+        """Autonomous path scoring is active from the first training step."""
+        self.validate()
+        return self.es_weight
 
     def validate(self) -> None:
+        if self.nll_weight != 0:
+            raise ValueError("teacher-forced Kalman NLL cannot be optimized; use autonomous rollout losses")
+        if self.es_warmup_steps != 0:
+            raise ValueError("autonomous training has no teacher-forced NLL warmup")
         for name, val in self.__dict__.items():
             if isinstance(val, float) and not (val >= 0.0 and val < float("inf")):
                 raise ValueError(f"StageB1bLossWeights.{name} must be finite and non-negative, got {val}")
@@ -164,28 +150,27 @@ def compute_stage_b1b_loss(
     step: int,
     es_value: Tensor | None = None,
 ) -> StageB1bLossComponents:
-    """Combine the mean-normalised NLL with the (optional) energy score.
+    """Optimize the autonomous energy score and log detached diagnostic NLL.
 
     Args:
         nll_sum:       scalar NLL summed over steps/batch (from kalman_nll).
         n_valid_dims:  number of valid scalar dimensions the NLL was summed over
                        (valid_residues * dH * n_steps).  NLL is divided by this.
         weights:       StageB1bLossWeights.
-        step:          global step, used for the ES warm-up ramp.
-        es_value:      scalar energy score (None while still in NLL-only mode).
+        step:          global step, retained for the constant ES-weight API.
+        es_value:      required scalar energy score from autonomous predictions.
     """
     weights.validate()
     if n_valid_dims <= 0:
         raise ValueError("n_valid_dims must be positive")
-    nll_mean = nll_sum / float(n_valid_dims)
+    nll_mean = nll_sum.detach() / float(n_valid_dims)
     lam = weights.lambda_es_at(step)
 
     if es_value is None or lam == 0.0:
-        es_used = torch.zeros((), device=nll_sum.device, dtype=nll_sum.dtype)
-        total = weights.nll_weight * nll_mean
+        raise ValueError("autonomous energy score is required for training")
     else:
         es_used = es_value
-        total = weights.nll_weight * nll_mean + lam * es_value
+        total = lam * es_value
 
     return StageB1bLossComponents(
         total=total, nll=nll_mean.detach(), es=es_used.detach(), lambda_es=lam,

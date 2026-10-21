@@ -1,485 +1,589 @@
-"""Stage B1b training: H-space latent dynamics with Kalman innovation NLL.
+"""Autonomous B1b: forecast only from history, then score against future targets.
 
-Implements STAGE_ABC_REDESIGN_PLAN.md §2.4-2.6:
-  - encoder frozen (Stage A V2 context encoder)
-  - H normalisation frozen (Stage B1a HNormalizer)
-  - H is stop_grad'ed; only dynamics params (energy U, static bath D/C/Gamma,
-    causal-GRU history posterior r_psi) train
-  - per-sample objective: Kalman innovation NLL over a continuous trajectory
-    segment [H_0..H_N] conditioned on the K-frame history H_{-K+1:0}
-  - after es_warmup_steps an energy-score term is added from short rollouts
-
-Usage:
-    python -m protein_jepa_frame.training.train_stage_b1b \
-        --manifest artifacts/mdcath_manifest_200dom/train.jsonl \
-        --stage-a-ckpt artifacts/full_abc_v2/stage_a/checkpoint_latest.pt \
-        --b1a-ckpt     artifacts/full_abc_v2/stage_b1a/checkpoint_latest.pt \
-        --output       artifacts/full_abc_v2/stage_b1b
+Teacher-forced Kalman NLL is an optional external diagnostic, never an optimized
+training loss. The complete calibrated B1a representation/readout is frozen.
 """
-
 from __future__ import annotations
 
 import argparse
+from dataclasses import asdict
 import json
 import math
-import sys
-import time
 from pathlib import Path
+import random
 
+import numpy as np
 import torch
-from torch.nn.attention import sdpa_kernel, SDPBackend
-from torch.utils.data import DataLoader
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from torch.nn.attention import SDPBackend, sdpa_kernel
+from torch.utils.data import DataLoader, Sampler, Subset
 
 from protein_jepa_frame.config import DataConfig
-from protein_jepa_frame.data.collate import collate_paired_windows
+from protein_jepa_frame.data.collate import collate_clips
 from protein_jepa_frame.data.dataset import build_dataset
-from protein_jepa_frame.models.stage_a_v2 import StageAV2, StageAV2Config
-from protein_jepa_frame.models.stage_b1a import StageBOracleDecoder, StageBOracleConfig
-from protein_jepa_frame.models.stage_b1b import (
-    StageB1b, StageB1bConfig, StageB1bLossWeights, compute_stage_b1b_loss,
-    ResidualCADecoder, ResidualDecoderConfig,
-)
-from protein_jepa_frame.models.stage_b1b.objectives import energy_score, kabsch_rmsd_loss
-from protein_jepa_frame.training.train_utils import (
-    _device, _lr_scale, _move_batch, _set_reproducibility,
-)
+from protein_jepa_frame.data.protocol import split_contiguous_window, validate_manifest_split
+from protein_jepa_frame.models.encoder import ProteinGeometryEncoder
+from protein_jepa_frame.models.stage_a_v2 import StageAV2Config
+from protein_jepa_frame.models.stage_b1a import StageBOracleConfig, StageBOracleDecoder
+from protein_jepa_frame.models.stage_b1b import StageB1b, StageB1bConfig
+from protein_jepa_frame.models.stage_b1b.objectives import energy_score
+from protein_jepa_frame.models.stage_c.geometry import RigidBodyFrame, fit_history_pose
+from protein_jepa_frame.training.train_utils import _device, _lr_scale, _move_batch, _set_reproducibility
+from protein_jepa_frame.utils.backbone_geometry import backbone_torsion_targets
+from protein_jepa_frame.utils.contracts import assert_same_representation, validate_representation_contract
+
+TRAINING_CONTRACT = "autonomous_history_only_v2"
 
 
-def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Train Stage B1b (H-space dynamics)")
-    p.add_argument("--manifest", type=str, default="artifacts/mdcath_manifest_200dom/train.jsonl")
-    p.add_argument("--stage-a-ckpt", type=str, required=True)
-    p.add_argument("--b1a-ckpt", type=str, default=None,
-                   help="Stage B1a checkpoint providing the frozen HNormalizer")
-    p.add_argument("--output", type=str, default="artifacts/full_abc_v2/stage_b1b")
-    p.add_argument("--resume", type=str, default=None)
-
+def parse_args(argv=None):
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument("--manifest")
+    p.add_argument("--val-manifest")
+    p.add_argument("--b1a-ckpt", required=True)
+    p.add_argument("--oracle-gate-report", help="Held-out oracle gate JSON required outside --dry-run.")
+    p.add_argument("--stage-a-ckpt", help="Provenance only; encoder always comes from B1a.")
+    p.add_argument("--output", default="artifacts/stage_b1b_autonomous")
+    p.add_argument("--resume")
+    p.add_argument("--device", default="auto")
     p.add_argument("--steps", type=int, default=20000)
     p.add_argument("--warmup-steps", type=int, default=500)
     p.add_argument("--lr", type=float, default=1e-4)
     p.add_argument("--weight-decay", type=float, default=0.01)
     p.add_argument("--grad-clip", type=float, default=1.0)
     p.add_argument("--batch-size", type=int, default=8)
-    p.add_argument("--num-workers", type=int, default=8)
-
-    # sequence construction: history K frames for r_psi, then N supervised steps
-    p.add_argument("--history-frames", type=int, default=8,
-                   help="K: frames fed to the history posterior (2.3)")
-    p.add_argument("--horizon-steps", type=int, default=8,
-                   help="N: supervised Kalman steps per sample")
-
-    # Model
-    p.add_argument("--latent-dim", type=int, default=128)
-    p.add_argument("--bath-dim", type=int, default=8,
-                   help="dS; 0 disables the bath (H-only ablation)")
+    p.add_argument("--num-workers", type=int, default=0)
+    p.add_argument("--history-frames", type=int, default=8)
+    p.add_argument("--horizon-steps", type=int, default=8)
+    p.add_argument("--frame-stride", type=int, default=1)
+    p.add_argument("--max-residues", type=int)
+    p.add_argument("--synthetic-size", type=int, default=32)
+    p.add_argument("--synthetic-residues", type=int, default=16)
+    p.add_argument("--latent-dim", type=int)
+    p.add_argument("--bath-dim", type=int, default=8)
     p.add_argument("--energy-depth", type=int, default=3)
-    p.add_argument("--step-ps", type=float, default=1000.0,
-                   help="integration interval h (ps); MDcath = 1 ns/frame")
-    # Bath fix (B1B_DIAGNOSIS_AND_PLAN.md 目标 2): the old defaults left the
-    # bath contribution ~1e6x smaller than the diagonal diffusion R, so S was
-    # numerically dead (rollout MSD ~ 0.009 Å^2).  Raise coupling/diffusion so
-    # B_h P B_h^T is commensurate with R, and give c_net a live init.
-    p.add_argument("--coupling-scale", type=float, default=1.0e-3,
-                   help="Overall scale of the bath coupling C (fix: 1e-3 -> 0.1)")
-    p.add_argument("--diffusion-scale", type=float, default=1.0e-4,
-                   help="Scale of the diagonal diffusion D (fix: 1e-4 -> 1e-2)")
-    p.add_argument("--c-init-std", type=float, default=1.0e-1,
-                   help="Std of c_net output layer init (fix: give C a live start)")
-
-    # Loss
-    p.add_argument("--nll-weight", type=float, default=1.0)
-    p.add_argument("--es-weight", type=float, default=0.1)
-    p.add_argument("--es-warmup-steps", type=int, default=2000)
+    p.add_argument("--energy-heads", type=int, default=4)
+    p.add_argument("--energy-hidden", type=int, default=128)
+    p.add_argument("--history-hidden", type=int, default=128)
+    p.add_argument("--step-ps", type=float, default=1000.0)
+    p.add_argument("--coupling-scale", type=float, default=1e-3)
+    p.add_argument("--diffusion-scale", type=float, default=1e-4)
+    p.add_argument("--c-init-std", type=float, default=0.1)
+    p.add_argument("--gamma-scale", type=float, default=2e-4)
+    p.add_argument("--gamma-floor", type=float, default=2e-5)
+    p.add_argument("--max-gamma-step", type=float, default=1.9)
+    p.add_argument("--nll-weight", type=float, default=0.0,
+                   help="Must be zero: teacher-forced NLL is diagnostic only.")
+    p.add_argument("--es-weight", type=float, default=1.0)
+    p.add_argument("--physical-es-weight", type=float, default=0.1)
     p.add_argument("--es-num-samples", type=int, default=4)
-    p.add_argument("--es-horizon-steps", type=int, default=8)
-
-    # End-to-end RMSD head (residual CA decoder anchored on the context frame).
-    # This decodes rollout H into CA displacements relative to the last context
-    # frame and supervises Kabsch RMSD to the true future.  Zero-output => the
-    # persistence baseline, so it can only improve on persistence.
-    p.add_argument("--rmsd-weight", type=float, default=1.0,
-                   help="weight on the end-to-end Kabsch-RMSD loss (0 disables)")
-    p.add_argument("--rmsd-horizon-steps", type=int, default=4,
-                   help="number of rolled-out steps supervised by RMSD")
-    p.add_argument("--decoder-hidden", type=int, default=256)
-    p.add_argument("--decoder-depth", type=int, default=3)
-    p.add_argument("--decoder-lr", type=float, default=3e-4,
-                   help="separate LR for the residual decoder")
-
+    p.add_argument("--es-horizon-steps", type=int)
+    p.add_argument("--es-warmup-steps", type=int, default=0,
+                   help="CLI migration only; must be zero (no teacher-forced warmup).")
+    p.add_argument("--rmsd-weight", type=float, default=0.0,
+                   help="Optional autonomous ensemble-mean displacement point loss.")
+    p.add_argument("--rmsd-horizon-steps", type=int)
+    p.add_argument("--validation-every", type=int, default=200)
+    p.add_argument("--validation-batches", type=int, default=4)
+    p.add_argument("--validation-horizon-steps", type=int,
+                   help="Autonomous validation horizon (may exceed the training horizon).")
+    p.add_argument("--patience", type=int, default=0)
     p.add_argument("--log-every", type=int, default=20)
     p.add_argument("--save-every", type=int, default=1000)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--dry-run", action="store_true")
-    return p.parse_args()
+    a = p.parse_args(argv)
+    if a.nll_weight != 0:
+        p.error("--nll-weight must be 0: B1b predictions must autonomously evolve H+S; "
+                "teacher-forced Kalman NLL may only be evaluated separately.")
+    if a.es_warmup_steps != 0:
+        p.error("--es-warmup-steps must be 0; autonomous training has no NLL-only warmup.")
+    if not (a.es_weight > 0 and a.physical_es_weight >= 0 and a.rmsd_weight >= 0):
+        p.error("es-weight must be positive; other loss weights must be nonnegative")
+    if a.es_num_samples < 2:
+        p.error("energy score requires at least 2 independent autonomous samples")
+    for key in ("steps", "history_frames", "horizon_steps", "frame_stride", "batch_size",
+                "validation_every", "validation_batches", "log_every", "save_every"):
+        if getattr(a, key) < 1:
+            p.error(f"--{key.replace('_', '-')} must be positive")
+    for key in ("es_horizon_steps", "rmsd_horizon_steps", "validation_horizon_steps"):
+        if getattr(a, key) is not None and getattr(a, key) < 1:
+            p.error(f"--{key.replace('_', '-')} must be positive")
+    if a.manifest and not a.val_manifest and not a.dry_run:
+        p.error("real-data training requires --val-manifest for held-out autonomous selection")
+    if not a.dry_run and not a.oracle_gate_report:
+        p.error("formal B1b training requires --oracle-gate-report; --dry-run is contract smoke only")
+    return a
 
 
-def _take_last_k(batch: dict, k: int) -> dict:
-    out = dict(batch)
-    for key in ("context_coords", "context_residue_mask", "context_time_ps"):
-        v = out.get(key)
-        if torch.is_tensor(v) and v.dim() >= 2 and v.shape[1] > k:
-            out[key] = v[:, -k:].contiguous()
-    return out
+class EpochPermutation(Sampler):
+    """Per-epoch shuffle recoverable from step alone, with an isolated RNG."""
+
+    def __init__(self, data_source, seed):
+        self.length, self.seed, self.epoch = len(data_source), seed, 0
+
+    def __iter__(self):
+        rng = torch.Generator().manual_seed(self.seed+self.epoch)
+        return iter(torch.randperm(self.length, generator=rng).tolist())
+
+    def __len__(self):
+        return self.length
 
 
-def build_paired_batch(samples, total_frames: int):
-    return _take_last_k(collate_paired_windows(samples), total_frames)
+def freeze_module(module):
+    module.eval()
+    module.requires_grad_(False)
+    return module
+
+
+def load_frozen_representation(path, device):
+    ck = torch.load(path, map_location=device, weights_only=False)
+    required = {"encoder", "stage_a_v2_config", "oracle", "stage_b1a_config", "representation_contract"}
+    if required.difference(ck):
+        raise ValueError(f"B1a checkpoint lacks frozen bundle fields: {sorted(required.difference(ck))}")
+    contract = ck["representation_contract"]
+    if contract.get("calibration_mode") != "oracle":
+        raise ValueError("B1b requires true-H oracle calibration, not predicted-H adaptation")
+    cfg = StageAV2Config(**ck["stage_a_v2_config"])
+    encoder = ProteinGeometryEncoder(
+        latent_dim=cfg.latent_dim, depth=cfg.encoder_depth, num_heads=cfg.num_heads,
+        num_rbf=cfg.num_rbf, dropout=cfg.dropout, max_residues=cfg.max_residues,
+        orientation_features=cfg.orientation_features, identity_embed_scale=cfg.identity_embed_scale,
+    ).to(device)
+    encoder.load_state_dict(ck["encoder"], strict=True)
+    oracle = StageBOracleDecoder(StageBOracleConfig.from_saved(ck["stage_b1a_config"])).to(device)
+    oracle.load_state_dict(ck["oracle"], strict=True)
+    if not oracle.h_normalizer.fitted_.item():
+        raise ValueError("B1a normalizer must be fitted before autonomous B1b")
+    validate_representation_contract(
+        contract, encoder_state=encoder.state_dict(), encoder_config=ck["stage_a_v2_config"],
+        normalizer_state=oracle.h_normalizer.state_dict(), decoder_state=oracle.decoder.state_dict(),
+        decoder_config=ck["stage_b1a_config"],
+    )
+    return freeze_module(encoder), freeze_module(oracle), ck
+
+
+def validate_oracle_gate(path, bundle, args, split_audit):
+    """Require the same frozen readout, physical clock and forecast endpoints."""
+    if path is None:
+        if args.dry_run:
+            return {"passed": False, "scope": "contract_smoke_only"}
+        raise ValueError("formal autonomous training requires a held-out oracle gate")
+    report = json.loads(Path(path).read_text())
+    if report.get("schema_version") != 2 or report.get("passed") is not True:
+        raise ValueError("oracle gate report must be schema-v2 and passed")
+    if report.get("representation_id") != bundle["representation_contract"]["representation_id"]:
+        raise ValueError("oracle gate report uses another representation")
+    if report.get("scope") != "heldout_protein":
+        raise ValueError("oracle gate must use heldout_protein evaluation")
+    protocol = report.get("protocol", {})
+    for key in ("history_frames", "frame_stride"):
+        if protocol.get(key) != getattr(args, key):
+            raise ValueError(f"oracle gate protocol mismatch: {key}")
+    raw_dt = protocol.get("frame_interval_ps")
+    if not isinstance(raw_dt, (int, float)) or not math.isfinite(raw_dt) or raw_dt <= 0:
+        raise ValueError("oracle gate protocol requires a positive frame_interval_ps")
+    if not math.isclose(raw_dt*args.frame_stride, args.step_ps, rel_tol=1e-6, abs_tol=1e-6):
+        raise ValueError("oracle gate physical step mismatch: frame_interval_ps * frame_stride != step_ps")
+    horizons = protocol.get("horizons_frames", [])
+    endpoints = {args.horizon_steps*args.frame_stride,
+                 (args.validation_horizon_steps or args.horizon_steps)*args.frame_stride}
+    for horizon in sorted(endpoints):
+        if horizon not in horizons:
+            raise ValueError(f"oracle gate does not cover requested horizon: {horizon} raw frames")
+        if report.get("by_horizon", {}).get(str(horizon), {}).get("passed") is not True:
+            raise ValueError(f"oracle gate did not pass requested horizon: {horizon} raw frames")
+    if not split_audit:
+        raise ValueError("formal oracle gate requires explicit train/validation manifests")
+    for key in ("train_manifest_sha256", "val_manifest_sha256"):
+        if report.get(key) != split_audit[key]:
+            raise ValueError(f"oracle gate manifest mismatch: {key}")
+    return report
 
 
 @torch.no_grad()
 def encode_frames(encoder, coords, rmask, aatype, ridx, cid, normalizer):
-    """coords [B,T,L,4,3] -> H [B,T,L,dH], encoder frozen + stop_grad, normalised."""
     B, T, L = coords.shape[:3]
     H = encoder(
-        coords.reshape(B * T, 1, L, 4, 3),
-        rmask.reshape(B * T, 1, L),
-        aatype[:, None].expand(B, T, L).reshape(B * T, L),
-        ridx[:, None].expand(B, T, L).reshape(B * T, L),
-        cid[:, None].expand(B, T, L).reshape(B * T, L),
-        token_mask=rmask.reshape(B * T, 1, L),
+        coords.reshape(B*T, 1, L, 4, 3), rmask.reshape(B*T, 1, L),
+        aatype[:, None].expand(B, T, L).reshape(B*T, L),
+        ridx[:, None].expand(B, T, L).reshape(B*T, L),
+        cid[:, None].expand(B, T, L).reshape(B*T, L),
+        token_mask=rmask.reshape(B*T, 1, L),
     )[:, 0].reshape(B, T, L, -1)
-    return normalizer(H)
+    return normalizer(H).detach()
 
 
-def main() -> None:
-    args = parse_args()
-    _set_reproducibility(args.seed, False)
-    device = _device("cuda" if torch.cuda.is_available() else "cpu")
-    out_dir = Path(args.output)
-    out_dir.mkdir(parents=True, exist_ok=True)
+def split_contiguous_batch(batch, history_frames, horizon_steps, step_ps):
+    paired = split_contiguous_window(batch, history_frames, horizon_steps, step_ps=step_ps)
+    # Fixed topology is part of the backbone-only conditioning contract. A
+    # changing future mask cannot leak into the forecast as a hidden condition.
+    mask = batch["residue_mask"][:, history_frames-1].bool()
+    if not torch.equal(batch["residue_mask"].bool(), mask[:, None].expand_as(batch["residue_mask"])):
+        raise ValueError("residue validity must be constant across the continuous clip")
+    if not mask.any(dim=1).all():
+        raise ValueError("each sample needs at least one valid residue")
+    return paired["context_coords"], paired["future_coords"], mask, paired["context_dt_ps"]
 
-    # ---- Frozen Stage A encoder ----
-    ck = torch.load(args.stage_a_ckpt, map_location=device)
-    a_cfg = StageAV2Config(**ck.get("stage_a_v2_config", {}))
-    stage_a = StageAV2(a_cfg).to(device)
-    missing, unexpected = stage_a.load_state_dict(ck["model"], strict=False)
-    if missing:
-        print(f"[B1b] Stage A ckpt missing keys (ok if predictor-only): {missing[:4]}", flush=True)
-    stage_a.eval()
-    encoder = stage_a.context_encoder
-    for p in encoder.parameters():
-        p.requires_grad_(False)
 
-    # ---- Frozen H normaliser from B1a (else identity) ----
-    if args.b1a_ckpt:
-        b1a = torch.load(args.b1a_ckpt, map_location=device)
-        o_cfg = StageBOracleConfig.from_saved(b1a.get("stage_b1a_config"))
-        oracle = StageBOracleDecoder(o_cfg)
-        missing, unexpected = oracle.load_state_dict(b1a["oracle"], strict=False)
-        if missing:
-            print(f"WARNING: {len(missing)} missing keys when loading B1a oracle "
-                  f"(only the HNormalizer is required here): {missing[:4]}...", flush=True)
-        normalizer = oracle.h_normalizer.to(device).eval()
-        for p in normalizer.parameters():
-            p.requires_grad_(False)
-        print(f"loaded H normalizer from {args.b1a_ckpt}", flush=True)
-    else:
-        normalizer = torch.nn.Identity()
-        print("WARNING: no B1a normalizer; using identity", flush=True)
+def autonomous_samples(model, H_history, dt_history, residue_mask, temperature,
+                       n_steps, num_samples, *, generator=None, training=True):
+    """History-only API: future coordinates, H and labels cannot enter."""
+    M = num_samples
+    B, K, L, d = H_history.shape
+    repeat = lambda x: x.unsqueeze(0).expand(M, *x.shape).reshape(M*B, *x.shape[1:])
+    hist, dt, mask = repeat(H_history), repeat(dt_history), repeat(residue_mask)
+    temp = None
+    if temperature is not None:
+        t = torch.as_tensor(temperature, device=H_history.device, dtype=H_history.dtype)
+        temp = repeat(t.expand(B) if t.ndim == 0 else t.reshape(B))
+    H, S = model.rollout(
+        hist[:, -1], mask, temp, n_steps=n_steps, H_hist=hist, dt_hist=dt,
+        seq_feature=hist[:, -1], generator=generator, detach=not training, return_bath=True,
+    )
+    H = H.reshape(M, B, n_steps+1, L, d)
+    if S is not None:
+        S = S.reshape(M, B, n_steps+1, L, model.cfg.bath_dim)
+    return H, S
 
+
+def normalized_path_energy_score(samples, target, mask):
+    M, B, T, L, d = samples.shape
+    if target.shape != (B, T, L, d):
+        raise ValueError("forecast/target path shapes differ")
+    scores = []
+    for b in range(B):
+        smp = samples[:, b, :, mask[b]].reshape(M, -1)
+        tgt = target[b, :, mask[b]].reshape(-1).detach()
+        scores.append(energy_score(smp, tgt)/math.sqrt(max(tgt.numel(), 1)))
+    return torch.stack(scores).mean()
+
+
+def decode_paths(oracle, paths, batch, mask, history_frames, H_anchor):
+    """Inverse-normalized autonomous H through the frozen raw-H oracle."""
+    M, B, T, L, d = paths.shape
+    anchor = batch["coords"][:, history_frames-1]
+    R, t = RigidBodyFrame.from_backbone(anchor[..., 0, :], anchor[..., 1, :], anchor[..., 2, :])
+    repeat = lambda x: x[None, :, None].expand(M, B, T, *x.shape[1:]).reshape(M*B*T, *x.shape[1:])
+    out = oracle.decode_structure(
+        oracle.h_normalizer.inverse(paths).reshape(M*B*T, L, d),
+        repeat(batch["aatype"]), repeat(R), repeat(t), repeat(mask),
+    )
+    predicted = out["backbone_coords"].reshape(M, B, T, L, 4, 3)
+    # Fit once using observed H only; never align a predicted future to a true
+    # future frame. The fit is a detached nuisance pose, not a training label.
+    with torch.no_grad():
+        decoded_anchor = oracle.decode_structure(
+            oracle.h_normalizer.inverse(H_anchor), batch["aatype"], R, t, mask,
+        )["CA"]
+        pose_R, pose_t = fit_history_pose(decoded_anchor, anchor[:, :, 1], mask)
+    return torch.einsum("mbtlaj,bjk->mbtlak", predicted, pose_R)+pose_t[None, :, None, None, None]
+
+
+def physical_path_features(backbone, mask, ridx, cid):
+    """Fixed physical scales: distance/10 A, unit contact and torsion sin/cos."""
+    M, B, T, L = backbone.shape[:4]
+    features = []
+    for b in range(B):
+        idx = torch.nonzero(mask[b], as_tuple=False).flatten()
+        ca = backbone[:, b, :, idx, 1, :]
+        pairs = torch.triu_indices(len(idx), len(idx), offset=1, device=ca.device)
+        if pairs.shape[1] > 128:
+            selection = torch.linspace(0, pairs.shape[1]-1, 128, device=ca.device).long()
+            pairs = pairs[:, selection]
+        parts = []
+        if pairs.shape[1]:
+            dist = (ca[..., pairs[0], :]-ca[..., pairs[1], :]).square().sum(-1).clamp_min(1e-12).sqrt()
+            parts = [dist/10.0, torch.sigmoid(8.0-dist)]
+        tor, valid = backbone_torsion_targets(
+            backbone[:, b].reshape(M*T, L, 4, 3), mask[b].expand(M*T, L),
+            ridx[b].expand(M*T, L), cid[b].expand(M*T, L),
+        )
+        tor = tor[..., :3].reshape(M, T, L, 3)[..., valid[0, :, :3]]
+        parts += [torch.sin(tor), torch.cos(tor)]
+        features.append(torch.cat(parts, -1).reshape(M, -1))
+    return features
+
+
+def physical_energy_score(pred, target, batch, mask):
+    smp = physical_path_features(pred, mask, batch["residue_index"], batch["chain_id"])
+    tgt = physical_path_features(target, mask, batch["residue_index"], batch["chain_id"])
+    return torch.stack([
+        energy_score(s, t[0].detach())/math.sqrt(max(t.shape[-1], 1))
+        for s, t in zip(smp, tgt)
+    ]).mean()
+
+
+def displacement_point_loss(pred, target, anchor, mask):
+    """Optional ensemble-mean point forecast in the real-anchor gauge."""
+    from evaluation.geometry import anchor_align_rotation
+    pred_ca, true_ca = pred.mean(0)[..., 1, :], target[..., 1, :]
+    scores = []
+    for b in range(pred_ca.shape[0]):
+        for n in range(pred_ca.shape[1]):
+            R, shift = anchor_align_rotation(anchor[b, :, 1], true_ca[b, n].detach(), mask[b])
+            error = (pred_ca[b, n]@R.detach()+shift.detach()-true_ca[b, n])[mask[b]]
+            scores.append(error.square().sum(-1).mean().clamp_min(1e-12).sqrt())
+    return torch.stack(scores).mean()
+
+
+def forecast_objective(model, encoder, oracle, batch, args, *, generator=None, training=True):
+    K, N = args.history_frames, args.horizon_steps
+    history, targets, mask, dt = split_contiguous_batch(batch, K, N, args.step_ps)
+    aat, ridx, cid = (batch[k] for k in ("aatype", "residue_index", "chain_id"))
+    H_hist = encode_frames(
+        encoder, history, batch["residue_mask"][:, :K], aat, ridx, cid, oracle.h_normalizer,
+    )
+    # Generate the entire forecast before any true future encoding is computed.
+    H_pred, S_pred = autonomous_samples(
+        model, H_hist, dt, mask, batch.get("temperature_k"), N, args.es_num_samples,
+        generator=generator, training=training,
+    )
+    H_target = encode_frames(
+        encoder, targets, batch["residue_mask"][:, K-1:], aat, ridx, cid, oracle.h_normalizer,
+    )
+    end = min(N, args.es_horizon_steps or N)
+    es = normalized_path_energy_score(H_pred[:, :, 1:end+1], H_target[:, 1:end+1], mask)
+    physical, point = es.new_zeros(()), es.new_zeros(())
+    pred_bb = None
+    if args.physical_es_weight > 0 or args.rmsd_weight > 0:
+        pred_bb = decode_paths(oracle, H_pred[:, :, 1:], batch, mask, K, H_hist[:, -1])
+    if args.physical_es_weight > 0:
+        # The physical label is the observed future geometry. True future H
+        # never enters a decoder on either side of the training objective.
+        physical = physical_energy_score(pred_bb, targets[:, 1:].unsqueeze(0), batch, mask)
+    if args.rmsd_weight > 0:
+        end_point = min(N, args.rmsd_horizon_steps or N)
+        point = displacement_point_loss(pred_bb[:, :, :end_point], targets[:, 1:end_point+1], history[:, -1], mask)
+    total = args.es_weight*es+args.physical_es_weight*physical+args.rmsd_weight*point
+    logs = {"loss/total": float(total.detach()), "loss/latent_es": float(es.detach()),
+            "loss/physical_es": float(physical.detach()), "loss/mean_displacement": float(point.detach())}
+    return total, logs, {"H_pred": H_pred, "S_pred": S_pred, "H_target": H_target,
+                         "H_anchor": H_hist[:, -1], "predicted_backbone": pred_bb}
+
+
+def _loader(args, manifest, training):
+    horizon = args.horizon_steps if training else (args.validation_horizon_steps or args.horizon_steps)
+    config = DataConfig(
+        manifest_path=manifest, training_mode="clip", num_frames=args.history_frames+horizon,
+        frame_stride=args.frame_stride, max_residues=args.max_residues,
+        synthetic_size=args.synthetic_size, synthetic_residues=args.synthetic_residues,
+    )
+    dataset = build_dataset(config)
+    if manifest is None:
+        boundary = max(1, len(dataset)//2)
+        dataset = Subset(dataset, range(0, boundary) if training else range(boundary, len(dataset)))
+    if len(dataset) == 0:
+        raise ValueError("empty training/validation dataset")
+    validation_sampling = None
+    if not training:
+        total = len(dataset)
+        budget = args.validation_batches*args.batch_size
+        indices = torch.linspace(0, total-1, min(total, budget)).long().tolist()
+        # The manifest is grouped by trajectories/proteins. Spread a fixed
+        # development budget across its full window range instead of consuming
+        # only the first protein. These remain correlated trajectory windows.
+        validation_sampling = {
+            "method": "global_linspace_windows_v1", "available_windows": total,
+            "selected_windows": len(indices), "window_budget": budget,
+            "indices_in_validation_dataset": indices,
+            "unit": "trajectory_windows_not_independent_proteins",
+        }
+        dataset = Subset(dataset, indices)
+    # A private RNG prevents iterator/worker seeds from perturbing the dynamics
+    # noise stream, including when resuming at a mid-epoch cursor.
+    loader_rng = torch.Generator().manual_seed(args.seed + (0 if training else 1))
+    sampler = EpochPermutation(dataset, args.seed) if training else None
+    loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False, sampler=sampler,
+                        num_workers=args.num_workers, collate_fn=collate_clips,
+                        drop_last=False, generator=loader_rng)
+    loader.validation_sampling = validation_sampling
+    return loader
+
+
+def validate(model, encoder, oracle, loader, args, device):
+    val_args = argparse.Namespace(**vars(args))
+    val_args.horizon_steps = args.validation_horizon_steps or args.horizon_steps
+    val_args.es_horizon_steps = None  # validate the complete requested path
+    val_args.rmsd_horizon_steps = None
+    was_training = model.training
+    model.eval()
+    records = []
+    gen = torch.Generator(device=device).manual_seed(args.seed+1000003)
+    with torch.no_grad(), sdpa_kernel([SDPBackend.MATH]):
+        for index, batch in enumerate(loader):
+            if index >= args.validation_batches:
+                break
+            batch = _move_batch(batch, device)
+            loss, logs, forecast = forecast_objective(
+                model, encoder, oracle, batch, val_args, generator=gen, training=False,
+            )
+            if not torch.isfinite(forecast["H_pred"]).all() or not torch.isfinite(loss):
+                raise FloatingPointError("nonfinite autonomous validation forecast or score")
+            logs["validation/max_abs_H"] = float(forecast["H_pred"].abs().max())
+            logs["validation/fraction_abs_H_above_8std"] = float((forecast["H_pred"].abs() > 8).float().mean())
+            mask = batch["residue_mask"][:, args.history_frames-1]
+            backbone = forecast["predicted_backbone"]
+            if backbone is None:
+                backbone = decode_paths(oracle, forecast["H_pred"][:, :, 1:], batch, mask,
+                                        args.history_frames, forecast["H_anchor"])
+            if not torch.isfinite(backbone).all():
+                raise FloatingPointError("nonfinite decoded autonomous validation structure")
+            logs["validation/mean_displacement_angstrom"] = float(displacement_point_loss(
+                backbone, batch["coords"][:, args.history_frames:],
+                batch["coords"][:, args.history_frames-1], mask,
+            ))
+            adjacent = ((batch["chain_id"][:, 1:] == batch["chain_id"][:, :-1])
+                        & (batch["residue_index"][:, 1:]-batch["residue_index"][:, :-1] == 1)
+                        & mask[:, 1:] & mask[:, :-1])
+            ca = backbone[..., 1, :]
+            bonds = (ca[..., 1:, :]-ca[..., :-1, :]).norm(dim=-1)
+            weights = adjacent[None, :, None].expand_as(bonds)
+            violations = ((bonds < 3.0) | (bonds > 4.5)) & weights
+            logs["validation/ca_bond_violation_fraction"] = float(violations.sum()/weights.sum().clamp_min(1))
+            records.append(logs)
+    model.train(was_training)
+    return {key: sum(r[key] for r in records)/len(records) for key in records[0]}
+
+
+def capture_rng():
+    rng = {"torch": torch.get_rng_state(), "python": random.getstate(), "numpy": np.random.get_state()}
+    if torch.cuda.is_available():
+        rng["cuda"] = torch.cuda.get_rng_state_all()
+    return rng
+
+
+def restore_rng(rng):
+    torch.set_rng_state(rng["torch"].cpu())
+    random.setstate(rng["python"])
+    np.random.set_state(rng["numpy"])
+    if "cuda" in rng and torch.cuda.is_available():
+        torch.cuda.set_rng_state_all(rng["cuda"])
+
+
+def checkpoint_payload(model, optimizer, step, bundle, args, validation, best_score, bad_validations):
+    return {
+        **{k: bundle[k] for k in ("encoder", "stage_a_v2_config", "oracle", "stage_b1a_config", "representation_contract")},
+        "model": model.state_dict(), "optimizer": optimizer.state_dict(), "step": step,
+        "stage_b1b_config": asdict(model.cfg), "train_args": vars(args),
+        "training_contract": TRAINING_CONTRACT, "validation": validation, "best_score": best_score,
+        "bad_validations": bad_validations, "rng_state": capture_rng(),
+        "run_scope": "contract_smoke_only" if args.dry_run else "oracle_gate_passed",
+        "oracle_gate": getattr(args, "oracle_gate_record", None),
+        "manifest_split": getattr(args, "manifest_split_record", None),
+        "validation_sampling": getattr(args, "validation_sampling", None),
+        "physical_feature_schema": {"version": 1, "distance_scale_angstrom": 10.0,
+                                    "contact_cutoff_angstrom": 8.0, "contact_width_angstrom": 1.0,
+                                    "max_pairs": 128, "torsion": "signed_sin_cos"},
+    }
+
+
+def resume_training(path, model, optimizer, bundle, args, device):
+    ck = torch.load(path, map_location=device, weights_only=False)
+    if ck.get("training_contract") != TRAINING_CONTRACT:
+        raise ValueError("resume checkpoint must use autonomous_history_only_v2")
+    assert_same_representation(ck["representation_contract"], bundle["representation_contract"])
+    if ck["stage_b1b_config"] != asdict(model.cfg):
+        raise ValueError("resume dynamics configuration mismatch")
+    if ck.get("manifest_split") != getattr(args, "manifest_split_record", None):
+        raise ValueError("resume manifest split or content mismatch")
+    if ck.get("validation_sampling") != getattr(args, "validation_sampling", None):
+        raise ValueError("resume validation sampling mismatch")
+    for key in ("history_frames", "horizon_steps", "frame_stride", "es_num_samples",
+                "es_weight", "physical_es_weight", "rmsd_weight", "batch_size", "steps",
+                "warmup_steps", "es_horizon_steps", "rmsd_horizon_steps", "seed",
+                "max_residues", "synthetic_size", "synthetic_residues", "lr",
+                "weight_decay", "grad_clip", "validation_horizon_steps", "validation_every",
+                "validation_batches", "patience", "dry_run"):
+        if ck["train_args"].get(key) != getattr(args, key):
+            raise ValueError(f"resume training contract mismatch: {key}")
+    model.load_state_dict(ck["model"], strict=True)
+    optimizer.load_state_dict(ck["optimizer"])
+    restore_rng(ck["rng_state"])
+    return ck
+
+
+def main(argv=None):
+    args = parse_args(argv)
+    _set_reproducibility(args.seed, True)
+    device = _device(args.device)
+    out = Path(args.output)
+    out.mkdir(parents=True, exist_ok=True)
+    encoder, oracle, bundle = load_frozen_representation(args.b1a_ckpt, device)
+    split_audit = None
+    if args.manifest and args.val_manifest:
+        split_audit = validate_manifest_split(args.manifest, args.val_manifest)
+    args.oracle_gate_record = validate_oracle_gate(args.oracle_gate_report, bundle, args, split_audit)
+    args.manifest_split_record = split_audit
+    if args.dry_run:
+        print("B1b contract smoke only: this run does not establish a passed scientific H gate", flush=True)
+    latent_dim = bundle["stage_a_v2_config"]["latent_dim"]
+    if args.latent_dim is not None and args.latent_dim != latent_dim:
+        raise ValueError("latent-dim differs from the frozen B1a encoder")
     cfg = StageB1bConfig(
-        latent_dim=args.latent_dim,
-        bath_dim=args.bath_dim,
-        energy_depth=args.energy_depth,
-        step_ps=args.step_ps,
-        coupling_scale=args.coupling_scale,
-        diffusion_scale=args.diffusion_scale,
-        c_init_std=args.c_init_std,
+        latent_dim=latent_dim, bath_dim=args.bath_dim, energy_depth=args.energy_depth,
+        energy_heads=args.energy_heads, energy_hidden=args.energy_hidden,
+        history_hidden=args.history_hidden, step_ps=args.step_ps, coupling_scale=args.coupling_scale,
+        diffusion_scale=args.diffusion_scale, c_init_std=args.c_init_std,
+        gamma_scale=args.gamma_scale, gamma_floor=args.gamma_floor, max_gamma_step=args.max_gamma_step,
     )
     model = StageB1b(cfg).to(device)
-    weights = StageB1bLossWeights(
-        nll_weight=args.nll_weight,
-        es_weight=args.es_weight,
-        es_warmup_steps=args.es_warmup_steps,
-        es_num_samples=args.es_num_samples,
-        es_horizon_steps=args.es_horizon_steps,
-    )
-
-    # ---- Residual CA decoder for end-to-end RMSD supervision ----
-    decoder = None
-    if args.rmsd_weight > 0.0:
-        dec_cfg = ResidualDecoderConfig(
-            latent_dim=args.latent_dim,
-            hidden=args.decoder_hidden,
-            depth=args.decoder_depth,
-        )
-        decoder = ResidualCADecoder(dec_cfg).to(device)
-        print(f"residual CA decoder: hidden={args.decoder_hidden} depth={args.decoder_depth}", flush=True)
-
-    # ---- Data: K history frames + (N+1) supervised frames in one window ----
-    total = args.history_frames + args.horizon_steps + 1
-    dcfg = DataConfig(
-        manifest_path=args.manifest,
-        batch_size=args.batch_size,
-        num_workers=args.num_workers,
-        training_mode="paired_window",
-        num_frames=total,
-        paired_all_horizons=False,
-    )
-    ds = build_dataset(dcfg)
-    loader = DataLoader(
-        ds, batch_size=args.batch_size, shuffle=True,
-        num_workers=args.num_workers,
-        collate_fn=lambda s: build_paired_batch(s, total),
-        drop_last=True, pin_memory=(device.type == "cuda"),
-    )
-
-    param_groups = [{"params": list(model.parameters()), "lr": args.lr}]
-    if decoder is not None:
-        param_groups.append({"params": list(decoder.parameters()), "lr": args.decoder_lr})
-    optimizer = torch.optim.AdamW(param_groups, weight_decay=args.weight_decay)
-    for pg in optimizer.param_groups:
-        pg["base_lr"] = pg["lr"]
-
-    start_step = 0
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    train_loader = _loader(args, args.manifest, True)
+    val_loader = _loader(args, args.val_manifest, False) if args.val_manifest or not args.manifest else None
+    args.validation_sampling = getattr(val_loader, "validation_sampling", None)
+    step, best, bad, validation = 0, float("inf"), 0, {}
     if args.resume:
-        r = torch.load(args.resume, map_location=device)
-        model.load_state_dict(r["model"])
-        optimizer.load_state_dict(r["optimizer"])
-        start_step = int(r.get("step", 0))
-        print(f"resumed at {start_step}", flush=True)
-
-    with (out_dir / "config.json").open("w") as f:
-        json.dump({"stage_b1b_config": cfg.__dict__,
-                   "loss_weights": weights.__dict__,
-                   "train_args": vars(args)}, f, indent=2)
-
+        ck = resume_training(args.resume, model, optimizer, bundle, args, device)
+        step, best, bad, validation = ck["step"], ck["best_score"], ck["bad_validations"], ck["validation"]
+    (out/"config.json").write_text(json.dumps({
+        "stage_b1b_config": asdict(cfg), "train_args": vars(args),
+        "representation_contract": bundle["representation_contract"], "training_contract": TRAINING_CONTRACT,
+        "manifest_split": split_audit,
+        "validation_sampling": args.validation_sampling,
+    }, indent=2))
     model.train()
-    step = start_step
-    t0 = time.time()
-    running: dict[str, float] = {}
-    seen = 0
-
-    while step < args.steps:
-        for paired in loader:
+    stop = False
+    # Per-epoch deterministic permutations + cursor + RNG restore permit resume.
+    while step < args.steps and not stop:
+        first_batch = step % len(train_loader)
+        train_loader.sampler.epoch = step // len(train_loader)
+        for index, batch in enumerate(train_loader):
+            if index < first_batch:
+                continue
             if step >= args.steps:
                 break
-            paired = _move_batch(paired, device)
-            scale = _lr_scale(step, args.steps, args.warmup_steps)
-            for pg in optimizer.param_groups:
-                pg["lr"] = pg["base_lr"] * scale
-
-            ctx_c = paired["context_coords"]        # [B,K,L,4,3]
-            ctx_m = paired["context_residue_mask"]
-            fut_c = paired["future_coords"]         # [B,Tf,L,4,3]
-            fut_m = paired["future_residue_mask"]
-            aat = paired["future_aatype"]
-            ridx = paired["future_residue_index"]
-            cid = paired["future_chain_id"]
-
-            K = ctx_c.shape[1]
-            Np1 = min(args.horizon_steps + 1, fut_c.shape[1])
-
-            # ---- Encode history and supervised windows (frozen, no grad) ----
-            H_hist = encode_frames(encoder, ctx_c, ctx_m, aat, ridx, cid, normalizer)  # [B,K,L,dH]
-            H_seq = encode_frames(
-                encoder, fut_c[:, :Np1], fut_m[:, :Np1], aat, ridx, cid, normalizer,
-            )                                                                          # [B,N+1,L,dH]
-
-            rmask = fut_m[:, 0].bool()            # [B,L]; residues valid across the window
-            dt_hist = torch.full((H_hist.shape[0], K), args.step_ps, device=device)
-            temperature_k = paired.get("temperature_k")
-
-            # The NLL depends on f = -grad_H U, so backward requires second-order
-            # autograd through attention.  The flash/mem-efficient kernels do not
-            # implement double backward; force kernels that do.
-            # The NLL force f = -grad_H U requires double-backward through the
-            # energy's attention.  Only the MATH kernel implements the needed
-            # second-order derivative; the flash/efficient kernels do not.
-            backends = [SDPBackend.MATH]
-
-            with sdpa_kernel(backends):
-                # ---- Kalman innovation NLL (§2.4) ----
-                _want_diag = (step % args.log_every == 0)
-                if _want_diag:
-                    nll_sum, _diag = model.kalman_nll(
-                        H_hist, dt_hist, H_seq, rmask, temperature_k,
-                        return_diagnostics=True,
-                    )
-                    running["diag/bath_ratio"] = _diag.get("bath_ratio", float("nan"))
-                    running["diag/jitter_hits"] = float(_diag.get("jitter_hits", 0))
-                else:
-                    nll_sum = model.kalman_nll(
-                        H_hist, dt_hist, H_seq, rmask, temperature_k,
-                    )
-                n_valid = int(rmask.sum().item()) * (Np1 - 1) if Np1 > 1 else 1
-                n_valid = max(n_valid, 1)
-
-                # ---- Energy score (§2.5), added after warmup ----
-                es_val = None
-                lam = weights.lambda_es_at(step)
-                nll_finite = torch.isfinite(nll_sum).all().item()
-                if lam > 0.0 and args.es_horizon_steps > 0 and nll_finite:
-                    es_val = _energy_score_term(
-                        model, H_hist, dt_hist, H_seq, rmask, temperature_k, weights,
-                    )
-                    # Guard: if ES itself produced NaN/Inf, discard it
-                    if es_val is not None and not torch.isfinite(es_val).all():
-                        es_val = None
-
-                comp = compute_stage_b1b_loss(nll_sum, n_valid, weights, step=step, es_value=es_val)
-
-                # ---- End-to-end RMSD on teacher-forced one-step predictions ----
-                rmsd_loss = torch.zeros((), device=device)
-                pers_rmsd_val = 0.0
-                if decoder is not None and args.rmsd_weight > 0.0:
-                    rmsd_loss, pers_rmsd_val = _rmsd_term(
-                        decoder, H_seq, fut_c[:, :Np1], rmask,
-                        n_steps=args.rmsd_horizon_steps,
-                    )
-
-                total = comp.total + args.rmsd_weight * rmsd_loss
-
-                optimizer.zero_grad(set_to_none=True)
-                total.backward()
+            for group in optimizer.param_groups:
+                group["lr"] = args.lr*_lr_scale(step, args.steps, args.warmup_steps)
+            optimizer.zero_grad(set_to_none=True)
+            with sdpa_kernel([SDPBackend.MATH]):
+                loss, logs, _ = forecast_objective(
+                    model, encoder, oracle, _move_batch(batch, device), args, training=True,
+                )
+                if not torch.isfinite(loss):
+                    raise FloatingPointError("nonfinite autonomous training score")
+                loss.backward()
             if args.grad_clip > 0:
-                clip_params = list(model.parameters())
-                if decoder is not None:
-                    clip_params = clip_params + list(decoder.parameters())
-                torch.nn.utils.clip_grad_norm_(clip_params, args.grad_clip)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip, error_if_nonfinite=True)
             optimizer.step()
-
-            seen += 1
-            for k, v in comp.as_loggable_dict().items():
-                running[k] = running.get(k, 0.0) + v
-            running["loss/rmsd"] = running.get("loss/rmsd", 0.0) + float(rmsd_loss.item())
-            running["loss/persist_rmsd"] = running.get("loss/persist_rmsd", 0.0) + pers_rmsd_val
-            if step % args.log_every == 0:
-                avg = {k: v / seen for k, v in running.items()}
-                # diag/* are instantaneous, not accumulated averages.
-                for k in [k for k in avg if k.startswith("diag/")]:
-                    avg[k] = running[k]
-                print(f"step {step:6d} | lr {optimizer.param_groups[0]['lr']:.2e} | "
-                      f"{time.time()-t0:.1f}s | " +
-                      " ".join(f"{k.replace('b1b/','')}={v:.3g}" for k, v in avg.items()),
-                      flush=True)
-                running = {}
-                seen = 0
-                t0 = time.time()
-
-            if step > 0 and step % args.save_every == 0:
-                _save(out_dir, model, optimizer, step, cfg, weights, decoder)
-            if args.dry_run and step >= 3:
-                print("dry-run complete", flush=True)
-                return
             step += 1
-
-    _save(out_dir, model, optimizer, step, cfg, weights, decoder)
-    print(f"training complete at step {step}", flush=True)
-
-
-def _rmsd_term(decoder, H_seq, fut_coords, rmask, n_steps):
-    """Kabsch-RMSD using oracle (true) future H as decoder input.
-
-    For each supervised step n (1..n_steps):
-        H_future = H_seq[:, n]        (true encoded future frame — oracle)
-        H_anchor = H_seq[:, 0]        (true encoded anchor frame)
-        X_hat    = decoder(H_future, H_anchor, X_anchor)
-        loss     = Kabsch_RMSD(X_hat, X_true[:, n])
-
-    Using true H gives the decoder a real signal: delta = H_future - H_anchor
-    has measurable variance tied to actual conformational change.  Training
-    the decoder with GLE-predicted mu (which is tiny and untrained) gives
-    delta ≈ 0 and no gradient signal.
-
-    Once the decoder learns to map H-deltas → displacements we can optionally
-    couple it back to GLE rollout in a second phase.
-
-    Returns (mean_rmsd_loss, mean_persistence_rmsd_float).
-    """
-    B, T, L, dH = H_seq.shape
-    N = min(n_steps, T - 1)
-    if N < 1:
-        return H_seq.new_zeros(()), 0.0
-
-    # CA coordinates [B, T, L, 3] from backbone atom index 1
-    ca = fut_coords[:, :, :, 1, :]                  # [B, T, L, 3]
-
-    H_anchor = H_seq[:, 0]                           # [B, L, dH]
-
-    # Center anchor CA over valid residues.
-    mask_f = rmask.unsqueeze(-1).to(ca.dtype)        # [B, L, 1]
-    def _center(x):
-        s = (x * mask_f).sum(1, keepdim=True)
-        n = mask_f.sum(1, keepdim=True).clamp_min(1.0)
-        return (x - s / n) * mask_f
-
-    X_anchor = _center(ca[:, 0])                      # [B, L, 3]
-
-    rmsd_losses = []
-    pers_vals = []
-    for n in range(1, N + 1):
-        H_future = H_seq[:, n]                        # oracle true H
-        out = decoder(H_future, H_anchor, X_anchor, rmask)
-        X_pred = out["ca_pred"]
-        X_true = _center(ca[:, n])
-
-        rmsd_losses.append(kabsch_rmsd_loss(X_pred, X_true, rmask))
-        with torch.no_grad():
-            pers_vals.append(kabsch_rmsd_loss(X_anchor, X_true, rmask).item())
-
-    loss = torch.stack(rmsd_losses).mean()
-    pers = float(sum(pers_vals) / len(pers_vals)) if pers_vals else 0.0
-    return loss, pers
-
-
-def _energy_score_term(model, H_hist, dt_hist, H_seq, rmask, temperature_k, weights):
-    """Short rollout from H_0; energy score against the observed trajectory (§2.5).
-
-    Gradients flow through r_psi and the dynamics (detach=False), so ES trains
-    both the history posterior and the kernel.
-    """
-    cfg = model.cfg
-    B, T, L, dH = H_seq.shape
-    M = max(2, weights.es_num_samples)
-    Ns = min(weights.es_horizon_steps, T - 1)
-    if Ns < 1:
-        return None
-
-    m = rmask.unsqueeze(-1).to(H_seq.dtype)                          # [B,L,1]
-    # Observed trajectory, invalid residues zeroed to match the masked sampler.
-    v_star = (H_seq[:, :Ns + 1] * m.unsqueeze(1)).reshape(B, -1)     # [B,(Ns+1)*L*dH]
-
-    # Baseline history so r_psi contributes to the ES gradient (2.3).
-    H_hist_rep = H_hist.unsqueeze(0).expand(M, *H_hist.shape).reshape(M * B, *H_hist.shape[1:])
-    dt_rep = dt_hist.unsqueeze(0).expand(M, *dt_hist.shape).reshape(M * B, *dt_hist.shape[1:])
-    rmask_rep = rmask.unsqueeze(0).expand(M, B, L).reshape(M * B, L)
-    temp_rep = None
-    if temperature_k is not None:
-        t = temperature_k if torch.is_tensor(temperature_k) else torch.tensor(temperature_k)
-        temp_rep = t.reshape(-1).expand(M * B) if t.numel() == 1 else t.unsqueeze(0).expand(M, B).reshape(-1)
-
-    m0, chol0 = model.history_posterior(H_hist_rep, dt_rep, temp_rep, rmask_rep)
-    eps = torch.randn(m0.shape, device=m0.device, dtype=m0.dtype)
-    S0 = m0 + torch.einsum("blij,blj->bli", chol0, eps)              # [M*B,L,dS]
-
-    H0 = H_seq[:, 0].unsqueeze(0).expand(M, *H_seq[:, 0].shape).reshape(M * B, L, dH)
-    seq_feature = H0
-    rollout = model.rollout(
-        H0, rmask_rep, temp_rep, n_steps=Ns,
-        seq_feature=seq_feature, S0=S0, detach=False,
-    )                                                                # [M*B,Ns+1,L,dH]
-    v_samp = rollout.reshape(M, B, (Ns + 1) * L * dH)
-
-    es = torch.zeros((), device=H_seq.device, dtype=H_seq.dtype)
-    for b in range(B):
-        es = es + energy_score(v_samp[:, b], v_star[b])
-    return es / B
-
-
-def _save(out_dir, model, optimizer, step, cfg, weights, decoder=None):
-    payload = {"model": model.state_dict(),
-               "optimizer": optimizer.state_dict(),
-               "step": step,
-               "stage_b1b_config": cfg.__dict__,
-               "loss_weights": weights.__dict__}
-    if decoder is not None:
-        payload["decoder"] = decoder.state_dict()
-        payload["decoder_config"] = decoder.cfg.__dict__
-    torch.save(payload, out_dir / "checkpoint_latest.pt")
-    print(f"checkpoint saved at step {step}", flush=True)
+            if step == 1 or step % args.log_every == 0:
+                print(f"step {step} "+" ".join(f"{k}={v:.6g}" for k,v in logs.items()), flush=True)
+            improved = False
+            if val_loader is not None and (step % args.validation_every == 0 or step == args.steps):
+                validation = validate(model, encoder, oracle, val_loader, args, device)
+                score = validation["loss/total"]
+                improved, best = score < best, min(best, score)
+                bad = 0 if improved else bad+1
+                print("validation "+json.dumps(validation, sort_keys=True), flush=True)
+                stop = args.patience > 0 and bad >= args.patience
+            if improved or step % args.save_every == 0 or step == args.steps or stop or args.dry_run:
+                payload = checkpoint_payload(model, optimizer, step, bundle, args, validation, best, bad)
+                torch.save(payload, out/"checkpoint_latest.pt")
+                if improved:
+                    torch.save(payload, out/"checkpoint_best.pt")
+            if args.dry_run and step >= min(args.steps, 2):
+                return
+            if stop:
+                break
 
 
 if __name__ == "__main__":

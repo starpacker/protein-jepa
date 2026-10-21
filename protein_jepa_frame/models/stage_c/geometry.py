@@ -215,6 +215,36 @@ class RigidBodyFrame:
 # Equivariant IPA-style graph network
 # ═══════════════════════════════════════════════════════════════════════
 
+@torch.no_grad()
+def fit_history_pose(decoded_anchor_ca: torch.Tensor, observed_anchor_ca: torch.Tensor,
+                     mask: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Fit one history-only decoder pose using row vectors: X @ R + t.
+
+    A shape-trained invariant decoder has an arbitrary canonical pose. Only the
+    decoded observed anchor and the real observed anchor fix that nuisance pose;
+    the same detached transform must be used at every predicted future time.
+    """
+    if decoded_anchor_ca.shape != observed_anchor_ca.shape or decoded_anchor_ca.ndim != 3:
+        raise ValueError("decoded and observed anchor coordinates must have shape [B,L,3]")
+    if decoded_anchor_ca.shape[-1] != 3 or mask.shape != decoded_anchor_ca.shape[:2]:
+        raise ValueError("history-pose mask must match [B,L]")
+    rotations, translations = [], []
+    for pred, real, valid in zip(decoded_anchor_ca.detach(), observed_anchor_ca.detach(), mask.bool()):
+        if valid.sum() < 3:
+            raise ValueError("history pose fitting requires at least three valid residues")
+        p, q = pred[valid].double(), real[valid].double()
+        if not torch.isfinite(p).all() or not torch.isfinite(q).all():
+            raise FloatingPointError("nonfinite observed history pose")
+        pc, qc = p.mean(0), q.mean(0)
+        U, _, Vh = torch.linalg.svd((p-pc).T @ (q-qc))
+        correction = torch.eye(3, device=p.device, dtype=p.dtype)
+        correction[2, 2] = torch.where(torch.det(U@Vh) < 0, -1.0, 1.0)
+        rotation = U@correction@Vh
+        rotations.append(rotation.to(pred.dtype))
+        translations.append((qc-pc@rotation).to(pred.dtype))
+    return torch.stack(rotations), torch.stack(translations)
+
+
 class InvariantPointAttention(nn.Module):
     """Simplified IPA: content attention + geometric bias from pairwise distances.
 
@@ -338,5 +368,6 @@ __all__ = [
     "invert_rotation",
     "RigidBodyFrame",
     "InvariantPointAttention",
+    "fit_history_pose",
     "test_se3_equivariance",
 ]

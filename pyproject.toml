@@ -44,7 +44,7 @@ protein_jepa_frame = [
 ]
 
 [tool.pytest.ini_options]
-testpaths = ["tests"]
+testpaths = ["tests", "evaluation/tests"]
 pythonpath = ["."]
 filterwarnings = [
   # Vendored official OpenFold uses non-tuple sequence indexing; harmless here.

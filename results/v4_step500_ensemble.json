@@ -1,0 +1,161 @@
+{
+  "ckpt": "artifacts/fromnone/stage_cb1b_v4/checkpoint_best.pt",
+  "manifest": "artifacts/mdcath_manifest_1000dom/val.jsonl",
+  "step_ps": 1000.0,
+  "n_samples": 8,
+  "n_windows": 150,
+  "horizons_ns": [
+    1.0,
+    4.0
+  ],
+  "horizons_frames": [
+    1,
+    4
+  ],
+  "by_horizon": {
+    "1": {
+      "horizon_ns": 1.0,
+      "n_windows": 75,
+      "metrics": {
+        "rmsf_mae": {
+          "model": 1.3442391673723857,
+          "persistence": 1.3446283157666523,
+          "improvement": 0.00038914839426676433,
+          "ci95": [
+            0.00036367029945055644,
+            0.0004157648384571075
+          ],
+          "model_better": true,
+          "win_rate": 1.0
+        },
+        "root_mean_w2": {
+          "model": 6.332001724888844,
+          "persistence": 1.238242507068707,
+          "improvement": -5.0937592178201365,
+          "ci95": [
+            -5.569615607378915,
+            -4.660105375478226
+          ],
+          "model_better": false,
+          "win_rate": 0.0
+        },
+        "variance_w2": {
+          "model": 5.547534239614936,
+          "persistence": 5.5475343776290735,
+          "improvement": 1.380141362994358e-07,
+          "ci95": [
+            1.1839082887708334e-07,
+            1.5877202023798866e-07
+          ],
+          "model_better": true,
+          "win_rate": 1.0
+        },
+        "md_pca_w2": {
+          "model": 0.1297067502630429,
+          "persistence": 0.13113026115652823,
+          "improvement": 0.0014235108934853168,
+          "ci95": [
+            0.0011028434788813418,
+            0.0017681760816147536
+          ],
+          "model_better": true,
+          "win_rate": 1.0
+        },
+        "weak_contact_j": {
+          "model": 0.9733333333333334,
+          "persistence": 1.0,
+          "improvement": -0.02666666666666667,
+          "ci95": [
+            -0.06666666666666667,
+            0.0
+          ],
+          "model_better": false,
+          "win_rate": 0.0
+        },
+        "transient_contacts_j": {
+          "model": 0.0004739962194313312,
+          "persistence": 0.0,
+          "improvement": 0.0004739962194313312,
+          "ci95": [
+            0.0,
+            0.0010774422770503647
+          ],
+          "model_better": true,
+          "win_rate": 0.04
+        }
+      }
+    },
+    "4": {
+      "horizon_ns": 4.0,
+      "n_windows": 75,
+      "metrics": {
+        "rmsf_mae": {
+          "model": 1.7018897406260172,
+          "persistence": 2.0116832621892295,
+          "improvement": 0.3097935215632121,
+          "ci95": [
+            0.29843311198552447,
+            0.3213328049282233
+          ],
+          "model_better": true,
+          "win_rate": 1.0
+        },
+        "root_mean_w2": {
+          "model": 3.4405479649734834,
+          "persistence": 1.7848549851537299,
+          "improvement": -1.655692979819753,
+          "ci95": [
+            -1.8463348522880432,
+            -1.4757646343918545
+          ],
+          "model_better": false,
+          "win_rate": 0.02666666666666667
+        },
+        "variance_w2": {
+          "model": 9.746404973947628,
+          "persistence": 9.883539119245823,
+          "improvement": 0.13713414529819712,
+          "ci95": [
+            0.13235721650480647,
+            0.14201012783144695
+          ],
+          "model_better": true,
+          "win_rate": 1.0
+        },
+        "md_pca_w2": {
+          "model": 0.11540218606777418,
+          "persistence": 0.1262379472576027,
+          "improvement": 0.010835761189828493,
+          "ci95": [
+            0.009989401406737942,
+            0.011701874891324453
+          ],
+          "model_better": true,
+          "win_rate": 1.0
+        },
+        "weak_contact_j": {
+          "model": 0.09831578154046347,
+          "persistence": 0.0,
+          "improvement": 0.09831578154046347,
+          "ci95": [
+            0.08710635357444231,
+            0.10958210733351355
+          ],
+          "model_better": true,
+          "win_rate": 1.0
+        },
+        "transient_contacts_j": {
+          "model": 0.210891022014635,
+          "persistence": 0.0,
+          "improvement": 0.210891022014635,
+          "ci95": [
+            0.1931751107837011,
+            0.22826585244377917
+          ],
+          "model_better": true,
+          "win_rate": 1.0
+        }
+      }
+    }
+  }
+}

@@ -229,3 +229,152 @@ def test_temporal_contrast_has_gradient_in_near_collapsed_regime():
     assert H.grad is not None and H.grad.norm().item() > 1e-4, (
         "temporal contrast must have a usable gradient in the near-collapsed regime"
     )
+
+
+# ── P0-A: structural-displacement readout ────────────────────────────────────
+
+def test_anchor_local_displacement_is_rigid_invariant_and_internal_sensitive():
+    """Pure rigid motion ⇒ zero target; internal change ⇒ nonzero at that residue."""
+    torch.manual_seed(0)
+    B, L = 2, 12
+    anchor = torch.randn(B, L, 4, 3)
+    mask = torch.ones(B, L, dtype=torch.bool)
+    ang = 0.7
+    R = torch.tensor([[torch.cos(torch.tensor(ang)), -torch.sin(torch.tensor(ang)), 0.0],
+                      [torch.sin(torch.tensor(ang)), torch.cos(torch.tensor(ang)), 0.0],
+                      [0.0, 0.0, 1.0]])
+    rigid = anchor @ R.T + torch.tensor([5.0, -3.0, 2.0])
+    d_rigid = StageAV2._anchor_local_ca_displacement(rigid, anchor, mask)
+    assert d_rigid.abs().max().item() < 1e-5, "rigid motion must give ~0 internal displacement"
+
+    internal = anchor.clone()
+    internal[0, 5, 1, :] += torch.tensor([1.5, 0.0, 0.0])
+    d_int = StageAV2._anchor_local_ca_displacement(internal, anchor, mask)
+    assert d_int[0, 5].norm().item() > 0.5, "a real CA move must appear at that residue"
+
+
+def test_displacement_readout_has_grad_to_encoder_and_predictor():
+    """The displacement loss must back-propagate to encoder and predictor."""
+    torch.manual_seed(0)
+    cfg = _cfg()
+    model = StageAV2(cfg)
+    model.train()
+    batch = _batch(B=2, K=4, L=10, horizon_frames=8)
+    model.zero_grad(set_to_none=True)
+    out = model.forward_temporal_multilag(batch, (0,), recent_frac=0.5)
+    assert out["target_delta_local"].shape == (2, 10, 3)
+    loss = model.displacement_readout_loss(
+        pred_factors=out["pred_factors"],
+        target_delta_local=out["target_delta_local"],
+        residue_mask=out["valid_mask"],
+        synth_delta_H=out["synth_delta_H"],
+    )
+    loss.backward()
+    enc = sum(p.grad.abs().sum().item() for p in model.context_encoder.parameters() if p.grad is not None)
+    pred = sum(p.grad.abs().sum().item() for p in model.predictor.parameters() if p.grad is not None)
+    assert enc > 0 and pred > 0, "displacement supervision must reach encoder and predictor"
+
+
+def test_displacement_anchor_is_online_not_detached_teacher():
+    """The anchor factors must come from the ONLINE encoder with grad.
+
+    Regression guard for the bug where anchor came from the teacher (detached),
+    so the synthesized delta had gradient only through the predictor and the
+    encoder's anchor representation never received displacement supervision.
+    """
+    torch.manual_seed(0)
+    cfg = _cfg()
+    model = StageAV2(cfg)
+    model.train()
+    batch = _batch(B=2, K=4, L=10, horizon_frames=8)
+    out = model.forward_temporal_multilag(batch, (0,), recent_frac=0.5)
+    assert out["anchor_factors"].requires_grad, "anchor_factors must carry grad"
+    assert out["anchor_H"].requires_grad, "anchor_H must carry grad"
+    # And it must equal the online encoding of the last context frame, i.e. the
+    # encoder forward already computed into context_H[:, -1].
+    assert out["anchor_H"].shape == out["context_H"][:, -1].shape
+
+
+def test_displacement_head_input_is_change_only():
+    """The head must read ONLY the dH-wide predicted change (no side-channel)."""
+    torch.manual_seed(0)
+    cfg = _cfg()
+    model = StageAV2(cfg)
+    first = next(model.displacement_head.parameters())
+    assert first.shape[1] == cfg.latent_dim, (
+        "displacement head input must be dH (change only), got "
+        f"{first.shape[1]}"
+    )
+
+
+def test_displacement_readout_does_not_tolerate_constant_prediction():
+    """A constant (mean-only) prediction must score ≈1, not 0, after normalisation."""
+    torch.manual_seed(0)
+    cfg = _cfg()
+    model = StageAV2(cfg)
+    B, L = 4, 12
+    # Constant predicted change ⇒ head can only see a constant; target varies.
+    tgt = torch.randn(B, L, 3)
+    tgt = tgt - tgt.mean(dim=1, keepdim=True)      # vary across residues
+    pf = torch.zeros(B, L, cfg.num_factors, cfg.factor_dim)
+    synth = torch.zeros(B, L, cfg.latent_dim)
+    mask = torch.ones(B, L, dtype=torch.bool)
+    loss = model.displacement_readout_loss(
+        pf, tgt, mask, synth_delta_H=synth,
+    )
+    # With the direction term, a constant-ish prediction is penalised >= 1.
+    assert loss.item() >= 0.5, (
+        f"constant prediction should score near 1.0 or worse, got {loss.item():.3f}"
+    )
+
+
+
+# ── Relative-position (within-frame canonical frame) channel ──────────────────
+
+def test_within_frame_canonical_positions_are_rigid_invariant():
+    """Global rigid motion must not change the canonical-frame positions."""
+    from protein_jepa_frame.models.encoder import _within_frame_canonical_positions
+    torch.manual_seed(0)
+    coords = torch.randn(2, 15, 4, 3)
+    valid = torch.ones(2, 15, dtype=torch.bool)
+    p0 = _within_frame_canonical_positions(coords, valid)
+    ang = 0.9
+    R = torch.tensor([[torch.cos(torch.tensor(ang)), -torch.sin(torch.tensor(ang)), 0.0],
+                      [torch.sin(torch.tensor(ang)), torch.cos(torch.tensor(ang)), 0.0],
+                      [0.0, 0.0, 1.0]])
+    moved = coords @ R.T + torch.tensor([4.0, -1.0, 2.5])
+    p1 = _within_frame_canonical_positions(moved, valid)
+    assert (p0 - p1).abs().max().item() < 1e-4, "canonical positions must be rigid-invariant"
+
+
+def test_within_frame_canonical_positions_encode_position():
+    """Two residues at DIFFERENT positions but with identical local geometry must
+    get different canonical positions (the channel is position-aware)."""
+    from protein_jepa_frame.models.encoder import _within_frame_canonical_positions
+    torch.manual_seed(1)
+    coords = torch.randn(1, 20, 4, 3)
+    valid = torch.ones(1, 20, dtype=torch.bool)
+    p = _within_frame_canonical_positions(coords, valid)
+    assert p[0].std(dim=0).min().item() > 1e-3, (
+        "canonical positions must vary across residues (position-aware)"
+    )
+
+
+def test_encoder_relative_position_channel_changes_H():
+    """Enabling the channel must change the encoder output for a moved residue."""
+    from protein_jepa_frame.models.encoder import ProteinGeometryEncoder
+    torch.manual_seed(0)
+    enc = ProteinGeometryEncoder(latent_dim=16, depth=1, num_heads=2,
+                                 relative_position_features=True)
+    enc.eval()
+    coords = torch.randn(1, 1, 12, 4, 3)
+    rm = torch.ones(1, 1, 12, dtype=torch.bool)
+    aa = torch.zeros(1, 12, dtype=torch.long)
+    ri = torch.arange(12)[None]
+    ci = torch.zeros(1, 12, dtype=torch.long)
+    with torch.no_grad():
+        h0 = enc(coords, rm, aa, ri, ci)
+        coords2 = coords.clone()
+        coords2[0, 0, 3, 1, :] += torch.tensor([2.0, 0.0, 0.0])  # move one CA
+        h1 = enc(coords2, rm, aa, ri, ci)
+    assert (h0 - h1).abs().max().item() > 1e-4

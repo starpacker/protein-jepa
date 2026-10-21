@@ -69,6 +69,114 @@ def _pair_orientation_features(coords: torch.Tensor) -> torch.Tensor:
     return torch.cat([local_direction, relative_rotation], dim=-1)
 
 
+def _within_frame_canonical_positions(
+    coords: torch.Tensor, valid: torch.Tensor
+) -> torch.Tensor:
+    """Express each residue's CA in a per-frame canonical frame.
+
+    Args:
+        coords: ``[Bf, L, 4, 3]`` backbone coordinates (N, CA, C, O).
+        valid:  ``[Bf, L]`` bool residue mask.
+
+    Returns:
+        ``[Bf, L, 3]`` centroid-relative CA positions in the frame's principal
+        axes.  SE(3)-invariant (the frame is derived from the same frame), but
+        position-aware within the fold.
+
+    The canonical frame is the PCA eigenbasis of the visible CA covariance with
+    a deterministic sign convention (largest-|component| eigenvector entry made
+    positive) so the frame is stable under small perturbations and identical for
+    identical frames.
+    """
+    ca = coords[:, :, 1, :]                                  # [Bf, L, 3]
+    m = valid.to(ca.dtype).unsqueeze(-1)                     # [Bf, L, 1]
+    denom = m.sum(dim=1, keepdim=True).clamp_min(1.0)        # [Bf, 1, 1]
+    centroid = (ca * m).sum(dim=1, keepdim=True) / denom     # [Bf, 1, 3]
+    centred = (ca - centroid) * m                            # [Bf, L, 3]
+
+    # Covariance [Bf, 3, 3]; PCA basis via eigh (deterministic, no sign flip in
+    # the eigenvalues, so we fix the eigenvector signs explicitly).
+    cov = torch.einsum("bli,blj->bij", centred, centred)     # [Bf, 3, 3]
+    # Tiny jitter keeps eigh well-posed for degenerate (e.g. single-residue) cases.
+    eye = torch.eye(3, device=coords.device, dtype=coords.dtype).unsqueeze(0)
+    cov = cov + 1.0e-6 * eye
+    evals, evecs = torch.linalg.eigh(cov)                    # ascending eigenvalues
+    basis = evecs.flip(-1)                                   # [Bf, 3, 3] cols = axes, desc eigval
+    # Rotation-invariant sign convention: flip each axis so the projected cloud
+    # has positive skewness along it.  The eigenvector sign is otherwise only
+    # defined up to ±1, and a convention based on the basis entries themselves
+    # is NOT invariant to a global rotation (the flipped entry changes).  The
+    # skewness of the *projected points* is intrinsic to the cloud, so this
+    # convention is identical for a globally-rotated copy.
+    proj = torch.einsum("blj,bjk->blk", centred, basis)      # [Bf, L, 3]
+    m3 = m.squeeze(-1)                                       # [Bf, L]
+    n = m3.sum(dim=1, keepdim=True).clamp_min(1.0)           # [Bf, 1]
+    skew = (proj.pow(3).sum(dim=1) / n)                      # [Bf, 3]
+    sign = torch.where(skew >= 0, torch.ones_like(skew), -torch.ones_like(skew))
+    basis = basis * sign.unsqueeze(1)                        # [Bf, 3, 3]
+    local = proj * sign.unsqueeze(1)                         # [Bf, L, 3]
+    return local * m
+
+
+def _canonical_frame(
+    coords: torch.Tensor, valid: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Centroid and PCA basis of a frame's visible CA cloud.
+
+    Args:
+        coords: ``[N, L, 4, 3]`` backbone coordinates.
+        valid:  ``[N, L]`` bool residue mask.
+
+    Returns:
+        ``(centroid [N, 3], basis [N, 3, 3])`` with ``basis`` columns the
+        principal axes in descending-eigenvalue order and a rotation-invariant
+        sign convention (matches ``_within_frame_canonical_positions``).
+    """
+    ca = coords[:, :, 1, :]
+    m = valid.to(ca.dtype).unsqueeze(-1)
+    centroid = (ca * m).sum(dim=1, keepdim=True) / m.sum(dim=1, keepdim=True).clamp_min(1.0)
+    centred = (ca - centroid) * m
+    cov = torch.einsum("bli,blj->bij", centred, centred)
+    cov = cov + 1.0e-6 * torch.eye(3, device=coords.device, dtype=coords.dtype).unsqueeze(0)
+    _, evecs = torch.linalg.eigh(cov)
+    basis = evecs.flip(-1)
+    proj = torch.einsum("blj,bjk->blk", centred, basis)
+    n = m.sum(dim=1).clamp_min(1.0)
+    skew = proj.pow(3).sum(dim=1) / n
+    sign = torch.where(skew >= 0, torch.ones_like(skew), -torch.ones_like(skew))
+    basis = basis * sign.unsqueeze(1)
+    return centroid.squeeze(1), basis
+
+
+def _positions_in_anchor_frame(
+    coords: torch.Tensor, valid: torch.Tensor,
+    anchor_centroid: torch.Tensor, anchor_basis: torch.Tensor,
+) -> torch.Tensor:
+    """Express each residue's CA in the *anchor* frame's canonical coordinates.
+
+    The anchor's centroid/basis are derived from the anchor frame's own geometry,
+    so both are invariant to a global rigid motion.  Projecting the current
+    frame's CA into that basis therefore yields an SE(3)-INVARIANT per-residue
+    position that is directly comparable across frames: the difference between
+    this and the anchor's own ``_within_frame_canonical_positions`` is the
+    (rotation-canonicalised) displacement the decoder must reproduce.
+
+    Args:
+        coords: ``[N, L, 4, 3]`` the frame being encoded.
+        valid:  ``[N, L]`` residue mask.
+        anchor_centroid: ``[N, 3]`` anchor centroid (broadcast per row).
+        anchor_basis: ``[N, 3, 3]`` anchor PCA basis (columns = axes).
+
+    Returns:
+        ``[N, L, 3]`` CA positions relative to the anchor centroid, in the
+        anchor's principal-axis coordinates, zeroed on invalid residues.
+    """
+    ca = coords[:, :, 1, :]
+    m = valid.to(ca.dtype).unsqueeze(-1)
+    rel = (ca - anchor_centroid.unsqueeze(1)) * m
+    return torch.einsum("blj,bjk->blk", rel, anchor_basis) * m
+
+
 def _orientation_pair_bias(
     coords: torch.Tensor, weight: torch.Tensor, chunk: int = 32
 ) -> torch.Tensor:
@@ -185,11 +293,35 @@ class ProteinGeometryEncoder(nn.Module):
         max_residues: int = 4096,
         orientation_features: bool = False,
         identity_embed_scale: float = 1.0,
+        relative_position_features: bool = False,
+        anchor_conditioned: bool = False,
     ):
         super().__init__()
         self.latent_dim = latent_dim
         self.num_rbf = num_rbf
         self.orientation_features = orientation_features
+        # Within-frame canonical-frame position channel (2026-10-18).
+        #
+        # The encoder's other inputs (intra-residue distances, torsions, pairwise
+        # CA distances/rotations) are invariant to a *global* rigid motion AND
+        # carry no per-residue position within the fold: two residues with the
+        # same local geometry and the same CA distance pattern get identical
+        # features.  A probe on such H can *overfit* the displacement of seen
+        # frames (R2=1.0) but cannot generalise to unseen frames of the SAME
+        # protein (R2=0.09), even with anchor+future concat — because H has no
+        # reference frame in which "how residue i moved relative to the anchor"
+        # is expressible.  This channel fixes exactly that:
+        #
+        # For each frame independently, build a canonical orthonormal frame from
+        # the visible CA cloud (centroid + principal axes of the CA covariance)
+        # and express each residue's CA displacement from the centroid in it.
+        # The result is still SE(3)-INVARIANT (the frame is derived from the frame
+        # itself, so a global rotation/translation cancels), but it now says
+        # *where* in the fold each residue sits.  Then the anchor→future change
+        # in this channel is exactly the (rotation-canonicalised) displacement
+        # that the decoder must reproduce.
+        self.relative_position_features = relative_position_features
+
         # Time-invariant identity embeddings (amino-acid type, residue index,
         # chain id) are constant along a trajectory.  If they dominate the
         # geometry projection the encoder can satisfy the JEPA objective from
@@ -205,6 +337,35 @@ class ProteinGeometryEncoder(nn.Module):
         # with the geom_gain scale) produces the ~10x shared direction that
         # dominates H and drives cross-protein cosine similarity toward 1.
         self.geom_proj = nn.Linear(12 if orientation_features else 6, latent_dim, bias=False)
+        # Projection for the within-frame canonical-frame position channel
+        # (centroid-relative CA in principal-axis coordinates; 3 dims).
+        if relative_position_features:
+            self.relpos_proj = nn.Linear(3, latent_dim, bias=False)
+            nn.init.normal_(self.relpos_proj.weight, std=0.1)
+        else:
+            self.relpos_proj = None
+        # Anchor-conditioned position channel (2026-10-18).
+        #
+        # The relpos channel above is per-frame: its PCA frame is re-derived from
+        # each frame's own cloud, so two geometrically similar conformations get
+        # almost identical features regardless of how far the atoms moved between
+        # them.  A ridge probe confirmed the consequence: dH carries zero
+        # linearly-decodable displacement at every horizon (best alpha -> 100,
+        # i.e. the zero map), so the decoder can only output near-persistence.
+        #
+        # This channel fixes the *reference frame* problem: the anchor frame's
+        # centroid + PCA basis are computed once and every frame's CA is projected
+        # into that basis.  The result stays SE(3)-invariant (both the anchor basis
+        # and the projected current-frame CA transform identically under a global
+        # rotation/translation) but is now measured against a fixed reference, so
+        # "where residue i is relative to the anchor's frame" is expressible and
+        # changes as the protein moves.
+        self.anchor_conditioned = anchor_conditioned
+        if anchor_conditioned:
+            self.anchor_pos_proj = nn.Linear(3, latent_dim, bias=False)
+            nn.init.normal_(self.anchor_pos_proj.weight, std=0.1)
+        else:
+            self.anchor_pos_proj = None
         # Learnable per-channel gain on the geometry term, initialised so that
         # geometry is at least as strong as the (scaled) identity embeddings.
         self.geom_gain = nn.Parameter(torch.ones(latent_dim))
@@ -237,6 +398,8 @@ class ProteinGeometryEncoder(nn.Module):
         residue_index: torch.Tensor,
         chain_id: torch.Tensor,
         token_mask: torch.Tensor | None = None,
+        anchor_centroid: torch.Tensor | None = None,
+        anchor_basis: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if coords.dim() != 5 or coords.shape[-2:] != (4, 3):
             raise ValueError("coords must be [B,T,L,4,3]")
@@ -261,6 +424,19 @@ class ProteinGeometryEncoder(nn.Module):
             + self.residue_embed(res_pos).unsqueeze(1).expand(B, T, L, -1).reshape(B * T, L, -1)
             + self.chain_embed(chain_pos).unsqueeze(1).expand(B, T, L, -1).reshape(B * T, L, -1)
         )
+        if self.relpos_proj is not None:
+            # Within-frame canonical-frame position channel. Computed per frame
+            # (the B*T flattening already makes each frame its own row).
+            relpos = _within_frame_canonical_positions(coords_f, valid_f)  # [B*T, L, 3]
+            base = base + self.relpos_proj(relpos)
+        if self.anchor_pos_proj is not None and anchor_centroid is not None:
+            # Anchor-conditioned position channel: express each residue's CA in
+            # the anchor's canonical PCA frame so that H_future - H_anchor
+            # encodes displacement rather than pure structural identity.
+            anc_pos = _positions_in_anchor_frame(
+                coords_f, valid_f, anchor_centroid, anchor_basis
+            )
+            base = base + self.anchor_pos_proj(anc_pos)
         h = base * valid_f.unsqueeze(-1).float()
 
         distances = torch.cdist(ca, ca).clamp(max=80.0)

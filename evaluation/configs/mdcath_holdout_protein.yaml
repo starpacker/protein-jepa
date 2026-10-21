@@ -1,8 +1,17 @@
+# Schema-v2 example paths; override checkpoint locations explicitly after training.
 name: mdcath_holdout_protein
-# Held-out-PROTEIN axis: 20 val proteins (disjoint from train), all 5 temperatures.
-# Horizons 1..96 ns (mdCATH = 1 ns/frame).
 manifest: artifacts/mdcath_manifest_200dom/val.jsonl
-horizons_frames: [1, 2, 4, 8, 16, 24, 32, 48, 64, 96]
+horizons_frames:
+- 1
+- 2
+- 4
+- 8
+- 16
+- 24
+- 32
+- 48
+- 64
+- 96
 context_frames: 8
 context_stride: 1
 frame_stride: 1
@@ -10,18 +19,22 @@ temperatures: null
 max_proteins: null
 n_rollout_reps: 4
 seed: 0
-# Multi-lag alignment (see smoke.yaml): emit the same (horizon, lag) grid the
-# Stage-A predictor was trained on.  With base horizons {8,16,24,32,48,64,96}
-# x lags {0,4,6,7} this yields physical gaps
-#   {1,2,4,8,9,10,12,16,17,18,20,24,25,26,28,32,41,42,44,48,57,58,60,64,89,90,92,96} ns,
-# a superset of the plan grid [1,2,4,8,16,24,32,48,64,96].
-temporal_lags: [0, 4, 6, 7]
-emit_multi_lag: true
-anchor_stride: 80          # ~5 anchors per protein: bounds cost; multi-horizon grid retained
-oracle_max_horizon: 8      # only compute the (expensive) oracle decode for horizons <= 8 ns
-variants: [h_only, h_ft, h_plus_s, persist]
+temporal_lags: []
+emit_multi_lag: false
+anchor_stride: 80
+oracle_max_horizon: 8
+variants:
+- h_only
+- h_ft
+- h_plus_s
+- persist
 models:
-  stage_a_ckpt: artifacts/abc_v3/stage_a_unified/checkpoint_latest.pt   # h_only encoder + predictor source
-  stage_a_predictor_ckpt: artifacts/abc_v3/stage_a_unified/checkpoint_latest.pt
-  b1a_ckpt: artifacts/abc_v3/stage_b1a_unified/checkpoint_latest.pt
-  b1b_ckpt: artifacts/abc_v3/stage_b1b_unified/checkpoint_latest.pt
+  stage_a_ckpt: artifacts/repaired_v2/pilot_20261017/stage_a/checkpoint_latest.pt
+  stage_a_predictor_ckpt: artifacts/repaired_v2/pilot_20261017/stage_a/checkpoint_latest.pt
+  b1a_ckpt: artifacts/repaired_v2/pilot_20261017/stage_b1a/checkpoint_latest.pt
+  b1b_ckpt: artifacts/repaired_v2/pilot_20261017/stage_b1b/checkpoint_latest.pt
+split: protein_holdout
+train_manifests:
+- artifacts/mdcath_manifest_200dom/train.jsonl
+allow_legacy: false
+deterministic: true

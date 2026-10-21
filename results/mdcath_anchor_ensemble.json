@@ -1,0 +1,309 @@
+{
+  "ckpt": "artifacts/fromnone/stage_cb1b_anchor/checkpoint_latest.pt",
+  "manifest": "artifacts/mdcath_manifest_1000dom/val.jsonl",
+  "step_ps": 1000.0,
+  "n_samples": 4,
+  "n_windows": 400,
+  "horizons_ns": [
+    1.0,
+    4.0,
+    16.0,
+    64.0
+  ],
+  "horizons_frames": [
+    1,
+    4,
+    16,
+    64
+  ],
+  "by_horizon": {
+    "1": {
+      "horizon_ns": 1.0,
+      "n_proteins": 4,
+      "metrics": {
+        "rmsf_mae": {
+          "model": 1.6839106291532517,
+          "persistence": 1.7749206838011742,
+          "improvement": 0.0910100546479225,
+          "ci95": [
+            0.04185012042522429,
+            0.1401699888706207
+          ],
+          "model_better": true,
+          "win_rate": 1.0
+        },
+        "root_mean_w2": {
+          "model": 6.636029547371856,
+          "persistence": 1.609518541906887,
+          "improvement": -5.026511005464969,
+          "ci95": [
+            -6.265805491768373,
+            -3.7872165191615643
+          ],
+          "model_better": false,
+          "win_rate": 0.0
+        },
+        "variance_w2": {
+          "model": 8.657036355859562,
+          "persistence": 8.679524541550718,
+          "improvement": 0.022488185691155183,
+          "ci95": [
+            0.005264881179309011,
+            0.03977414237899568
+          ],
+          "model_better": true,
+          "win_rate": 1.0
+        },
+        "md_pca_w2": {
+          "model": 0.16535697264943006,
+          "persistence": 0.17126649001672054,
+          "improvement": 0.005909517367290482,
+          "ci95": [
+            0.0028326566116162535,
+            0.00925803491890198
+          ],
+          "model_better": true,
+          "win_rate": 1.0
+        },
+        "weak_contact_j": {
+          "model": 0.06,
+          "persistence": 1.0,
+          "improvement": -0.94,
+          "ci95": [
+            -1.0,
+            -0.8799999999999999
+          ],
+          "model_better": false,
+          "win_rate": 0.0
+        },
+        "transient_contacts_j": {
+          "model": 0.05084859805747128,
+          "persistence": 0.0,
+          "improvement": 0.05084859805747128,
+          "ci95": [
+            0.04633952866968932,
+            0.054471939658673585
+          ],
+          "model_better": true,
+          "win_rate": 1.0
+        }
+      }
+    },
+    "4": {
+      "horizon_ns": 4.0,
+      "n_proteins": 4,
+      "metrics": {
+        "rmsf_mae": {
+          "model": 2.479024006724358,
+          "persistence": 2.6530115526914595,
+          "improvement": 0.17398754596710203,
+          "ci95": [
+            0.05837998390197752,
+            0.28959510803222654
+          ],
+          "model_better": true,
+          "win_rate": 1.0
+        },
+        "root_mean_w2": {
+          "model": 2.7015199204651044,
+          "persistence": 2.3424039060768447,
+          "improvement": -0.3591160143882599,
+          "ci95": [
+            -0.8734222652185193,
+            0.15519023644199947
+          ],
+          "model_better": false,
+          "win_rate": 0.5
+        },
+        "variance_w2": {
+          "model": 15.060261205675614,
+          "persistence": 15.14784094793239,
+          "improvement": 0.08757974225677567,
+          "ci95": [
+            0.015621389603628355,
+            0.159581925167128
+          ],
+          "model_better": true,
+          "win_rate": 1.0
+        },
+        "md_pca_w2": {
+          "model": 0.15731033899046692,
+          "persistence": 0.16619027257109692,
+          "improvement": 0.008879933580630009,
+          "ci95": [
+            0.0029745579375005243,
+            0.014884638981620547
+          ],
+          "model_better": true,
+          "win_rate": 1.0
+        },
+        "weak_contact_j": {
+          "model": 0.025311440796261762,
+          "persistence": 0.0,
+          "improvement": 0.025311440796261762,
+          "ci95": [
+            0.019964113588977823,
+            0.03246373483038146
+          ],
+          "model_better": true,
+          "win_rate": 1.0
+        },
+        "transient_contacts_j": {
+          "model": 0.06013564762902957,
+          "persistence": 0.0,
+          "improvement": 0.06013564762902957,
+          "ci95": [
+            0.0512666256605996,
+            0.07054202368483223
+          ],
+          "model_better": true,
+          "win_rate": 1.0
+        }
+      }
+    },
+    "16": {
+      "horizon_ns": 16.0,
+      "n_proteins": 4,
+      "metrics": {
+        "rmsf_mae": {
+          "model": 3.3852794241905215,
+          "persistence": 3.627001150846481,
+          "improvement": 0.24172172665595998,
+          "ci95": [
+            0.09557329416275018,
+            0.3878701591491698
+          ],
+          "model_better": true,
+          "win_rate": 1.0
+        },
+        "root_mean_w2": {
+          "model": 4.926241833959191,
+          "persistence": 3.100032280546953,
+          "improvement": -1.8262095534122373,
+          "ci95": [
+            -2.758410429110455,
+            -0.94707718031915
+          ],
+          "model_better": false,
+          "win_rate": 0.0
+        },
+        "variance_w2": {
+          "model": 25.52810300417896,
+          "persistence": 25.661450593152175,
+          "improvement": 0.13334758897321475,
+          "ci95": [
+            0.0344008526327233,
+            0.2322943253137062
+          ],
+          "model_better": true,
+          "win_rate": 1.0
+        },
+        "md_pca_w2": {
+          "model": 0.205983096275134,
+          "persistence": 0.2176001368171745,
+          "improvement": 0.01161704054204047,
+          "ci95": [
+            0.004529411800962738,
+            0.018911222565411945
+          ],
+          "model_better": true,
+          "win_rate": 1.0
+        },
+        "weak_contact_j": {
+          "model": 0.027864636416761332,
+          "persistence": 0.0,
+          "improvement": 0.027864636416761332,
+          "ci95": [
+            0.02430600592688638,
+            0.03238884094813812
+          ],
+          "model_better": true,
+          "win_rate": 1.0
+        },
+        "transient_contacts_j": {
+          "model": 0.06681697713460111,
+          "persistence": 0.0,
+          "improvement": 0.06681697713460111,
+          "ci95": [
+            0.05923774085114187,
+            0.08092725864866679
+          ],
+          "model_better": true,
+          "win_rate": 1.0
+        }
+      }
+    },
+    "64": {
+      "horizon_ns": 64.0,
+      "n_proteins": 4,
+      "metrics": {
+        "rmsf_mae": {
+          "model": 4.508261995911598,
+          "persistence": 4.834644562005996,
+          "improvement": 0.3263825660943985,
+          "ci95": [
+            0.1644406950473788,
+            0.48832443714141816
+          ],
+          "model_better": true,
+          "win_rate": 1.0
+        },
+        "root_mean_w2": {
+          "model": 5.288339691299417,
+          "persistence": 3.954144166358585,
+          "improvement": -1.3341955249408324,
+          "ci95": [
+            -2.4208256642715797,
+            -0.247565385610085
+          ],
+          "model_better": false,
+          "win_rate": 0.25
+        },
+        "variance_w2": {
+          "model": 41.599487483044655,
+          "persistence": 41.81699387346791,
+          "improvement": 0.2175063904232606,
+          "ci95": [
+            0.09461871940210731,
+            0.34039406144441386
+          ],
+          "model_better": true,
+          "win_rate": 1.0
+        },
+        "md_pca_w2": {
+          "model": 0.2617195777133415,
+          "persistence": 0.27681287334953947,
+          "improvement": 0.015093295636198,
+          "ci95": [
+            0.007066662288982832,
+            0.02343738366132768
+          ],
+          "model_better": true,
+          "win_rate": 1.0
+        },
+        "weak_contact_j": {
+          "model": 0.030383112553726107,
+          "persistence": 0.0,
+          "improvement": 0.030383112553726107,
+          "ci95": [
+            0.027233656770733278,
+            0.03437634190441559
+          ],
+          "model_better": true,
+          "win_rate": 1.0
+        },
+        "transient_contacts_j": {
+          "model": 0.07011557665151229,
+          "persistence": 0.0,
+          "improvement": 0.07011557665151229,
+          "ci95": [
+            0.05875879707143655,
+            0.08536561446842188
+          ],
+          "model_better": true,
+          "win_rate": 1.0
+        }
+      }
+    }
+  }
+}

@@ -346,18 +346,7 @@ def compute_stage_a_v2_loss(
                     (int(s), factor_prediction_loss(per_slot[sel], tgt_slot[sel]))
                 )
         if lag_balanced and lag_losses:
-            n_lags = lag_slot.unique().numel()
-            # `factor_prediction_loss` returns a mean over elements; scale each
-            # lag term by (elements_in_lag / total_elements) after normalising
-            # per-lag means so every lag contributes equally.
-            counts = torch.tensor(
-                [float((lag_slot_valid == s).sum()) for s, _ in lag_losses],
-                device=device,
-            )
-            fractions = counts / counts.sum().clamp_min(1.0)
-            L_future = sum(
-                fractions[i] * loss for i, (_, loss) in enumerate(lag_losses)
-            )
+            L_future = torch.stack([loss for _, loss in lag_losses]).mean()
 
     # ── Spatial (masked) prediction loss ─────────────────────────────────────
     if spatial_out is not None and weights.masked_weight > 0.0:
@@ -419,11 +408,10 @@ def compute_stage_a_v2_loss(
     # IMPORTANT: no penalty that is a pure function of (H_t - H_{t-1}) can break
     # the collapse symmetry on its own — H_t = H_{t-1} is a stationary point of
     # every such term (the gradient ∝ (H_t - H_{t-1}) vanishes there).  The
-    # actual symmetry-breaking signal is the prediction-task asymmetry: the
-    # anchor frame is now spatially masked before entering the predictor (see
-    # forward_temporal_multilag), so the predictor cannot copy the anchor's H to
-    # satisfy the objective and the encoder must make H frame-sensitive to be
-    # predictable at all.  This term is only a *floor* that keeps the near-
+    # prediction loss does not by itself prove absence of temporal collapse.
+    # Structural calibration and deterministic geometry probes must establish
+    # whether the changing latent contains useful information. This floor
+    # only keeps the near-
     # collapsed regime from being a flat basin: as soon as the steps are
     # nonzero it supplies a strong gradient proportional to -(H_t - H_{t-1}),
     # pushing consecutive frames apart until the floor is met.
@@ -461,8 +449,9 @@ def compute_stage_a_v2_loss(
     # consecutive frame pair in the context window.  This gives the encoder a
     # direct structural supervision signal: pairs that move more (higher RMSD)
     # must produce more distant H embeddings.  Unlike the unsupervised floor
-    # above, this loss specifies *which* directions in H-space should vary
-    # (those correlated with structural change) and cannot be satisfied by noise.
+    # above, this loss constrains the magnitude of H changes against a physical
+    # target. It does not identify the displacement direction or prove that
+    # fine structural changes can be decoded.
     L_contrast = torch.zeros((), device=device)
     if weights.temporal_contrast_weight > 0.0:
         ctx_full_c = temporal_out.get("context_H_full")
