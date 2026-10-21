@@ -51,7 +51,15 @@ def build(args, dev):
     k_cfg["step_ps"] = k_args.get("step_ps", 1000.0); k_cfg["rollout_grad_steps"] = None
     kern = StageB1b(StageB1bConfig(**k_cfg)).to(dev)
     kern.load_state_dict(kck["kernel"]); kern.eval()
-    hs = HSEnsembleProducer(encoder, decoder, kern).to(dev).eval()
+    train_encoder = bool(kck.get("train_encoder", False)) and kck.get("encoder") is not None
+    hs = HSEnsembleProducer(encoder, decoder, kern, train_encoder=train_encoder).to(dev).eval()
+    if train_encoder:
+        # Plan A: the encoder was fine-tuned jointly with the GLE kernel; evaluate
+        # the FINE-TUNED encoder, not the frozen Stage-A one.
+        r = hs.encoder.load_state_dict(kck["encoder"], strict=False)
+        if r.missing_keys or r.unexpected_keys:
+            print(f"[eval] encoder reload: missing={r.missing_keys} "
+                  f"unexpected={r.unexpected_keys}")
     hs._rollout_steps = int(k_args.get("rollout_steps", 1))
     hs._rollout_grad_steps = None
     hs._temperature_k = float(k_args.get("temperature_k", 320.0))

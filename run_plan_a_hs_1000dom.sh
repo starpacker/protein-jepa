@@ -26,8 +26,8 @@ CUDA_VISIBLE_DEVICES=${GPU:-4} python -u -m protein_jepa_frame.training.train_st
   --b1a-ckpt artifacts/stage_b1a_relpos_anchored_1000dom/checkpoint_best.pt \
   --output "$OUT" --device cuda --torch-threads 4 \
   ${RESUME:+--resume "$RESUME"} \
-  --max-train-samples 8000 --max-residues 256 --frame-stride 1 \
-  --history-frames 4 --n-samples 8 \
+  --max-train-samples 8000 --max-residues 192 --frame-stride 1 \
+  --history-frames 4 --n-samples 6 \
   --paired-horizons-frames "$H" \
   --train-encoder --encoder-lr-scale 0.1 \
   --rmsf-weight 1.0 --contact-weight 10.0 --dist-weight 0.3 --pos-weight 0.0 \
