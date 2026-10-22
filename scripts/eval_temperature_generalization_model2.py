@@ -49,6 +49,10 @@ def _parse_args(argv=None):
     p.add_argument("--max-anchors-per-trajectory", type=int, default=4)
     p.add_argument("--n-rollout-reps", type=int, default=4)
     p.add_argument("--wrong-temp", type=float, default=320.0)
+    p.add_argument("--modes", nargs="+", default=["correct", "wrong", "none"],
+                   choices=["correct", "wrong", "none"],
+                   help="Which conditioning ablations to run (skip 'wrong'/'none' "
+                        "to halve/third the cost when the T input is known to be inert).")
     p.add_argument("--device", default="auto")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--out", default=None)
@@ -58,7 +62,7 @@ def _parse_args(argv=None):
 def _cell(args, manifest, T):
     """Run correct/wrong/none cells at temperature T; return a metrics block."""
     block = {}
-    for mode in ("correct", "wrong", "none"):
+    for mode in args.modes:
         argv = [
             "--ckpt", args.ckpt, "--manifest", manifest,
             "--split", "temp", "--heldout-temperature", str(T),
@@ -92,7 +96,7 @@ def main(argv=None):
     args = _parse_args(argv)
     results = {"model": "from-none (GLE)", "ckpt": args.ckpt,
                "n_rollout_reps": args.n_rollout_reps, "horizons": args.horizons,
-               "wrong_temp": args.wrong_temp, "cells": {}}
+               "modes": args.modes, "wrong_temp": args.wrong_temp, "cells": {}}
 
     for T in MDCATH_TEMPS:
         unseen = (T == 450.0)
