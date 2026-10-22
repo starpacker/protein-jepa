@@ -331,7 +331,7 @@ The runner asserts this and logs it in `meta.json`.
 ---
 
 ## 8. What this plan is NOT doing
-- It is **not** retraining H (that is the separate "路 A" in `B1B_DIAGNOSIS_AND_PLAN.md`).
+- It is **not** retraining H (that is the separate "路 A" in `archive/old_docs_20261021/B1B_DIAGNOSIS_AND_PLAN.md`).
 - It does not retrain model weights, but it does contain checkpoint-compatible
   evaluation adapters for the Stage-A predictor and OPF.
 - It is **not** keeping the old scripts as-is — they get folded into `evaluation/` and deprecated.

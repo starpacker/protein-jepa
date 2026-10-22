@@ -125,7 +125,7 @@
 ### 已排除
 - **不是残基太多**：真实样本 L=110（crop 生效；之前 880 是"8 帧求和"的计数错误）。
 - **不是模式**：oracle 与 predicted_adaptation 同样不收敛。
-- **不是超参**：改用仓库自带 `run_b1a_anchorfree.sh` 的权重同样持平。
+- **不是超参**：改用仓库自带 `run_scripts/`run_b1a_anchorfree.sh` 的权重同样持平。
 - **不是 encoder 尺度**：relpos H mean≈0/std≈1。
 
 ### 待查（下一轮）
@@ -208,7 +208,7 @@
 - anchored 路径 `X_hat = R_anchor @ d_local + t_anchor`，从 **anchor 的真实逐残基 CA** 出发，
   只预测有界的构象变化 `d_local`（anchor-local，≤12 Å）—— 这正是 forecast 任务定义。
 - 代码改动：放宽 `train_stage_b1a.py` 里 `--no-anchor-free` 的 argparse 硬门（原被"必须 anchor-free"挡住）。
-- 启动脚本：`run_b1a_relpos_anchored.sh`；日志 `.tmpwork/logs/stage_b1a_relpos_anchored.log`。
+- 启动脚本：`run_scripts/`run_b1a_relpos_anchored.sh`；日志 `.tmpwork/logs/stage_b1a_relpos_anchored.log`。
 
 ### 结果（relpos encoder，horizons 1/2/4/8 frames = 1–8 ns）
 

@@ -53,7 +53,7 @@ from-none GLE 在 RMSF / variance-W2 / MD-PCA-W2 / 瞬态接触上稳定胜 pers
 | --- | --- |
 | `evaluation/baselines/run_bioemu2_zeroshot.py` | 主评测驱动（复用本项目全部评测代码） |
 | `evaluation/baselines/bioemu2_io.py` | mdCATH backbone → bioemu2 System / anchor 桥接 |
-| `run_bioemu2_zeroshot.sh` | 启动脚本（200 窗口，n_samples=12，1/4/16/64 ns） |
+| `run_scripts/`run_bioemu2_zeroshot.sh` | 启动脚本（200 窗口，n_samples=12，1/4/16/64 ns） |
 | `baselines/bioemu2/` | 上游 bioemu2 源码副本 + 本地 checkpoint/config（可追溯） |
 
 **关键实现点**：
@@ -69,7 +69,7 @@ from-none GLE 在 RMSF / variance-W2 / MD-PCA-W2 / 瞬态接触上稳定胜 pers
 
 ```bash
 # 全量（200 窗口）
-bash run_bioemu2_zeroshot.sh
+bash run_scripts/ run_bioemu2_zeroshot.sh
 
 # 冒烟测试
 python -m evaluation.baselines.run_bioemu2_zeroshot --smoke

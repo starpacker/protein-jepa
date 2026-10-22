@@ -154,12 +154,12 @@
 
 **读法：** Model 2 的 **correct ≈ wrong ≈ none**（差异 < 1%），即**温度输入在 v4g 这条 from-none 路径上几乎惰性**——架构支持温度（`temperature_proj`），但训练后该通路贡献极小。（v4g 训练用 `train.jsonl` 含全部 5 个温度。）
 - **温度响应单调**（RMSF 4.56→6.91 随 T 上升），但这是**隐含**的（可能来自 anchor 上下文），**非**来自显式温度输入。
-- **结论**：要让 Model 2 真正温度敏感，需要在温度留出/温度扰动训练下重训（`run_fromnone_temp_v2.sh` 已启动，见 §3.6）。
+- **结论**：要让 Model 2 真正温度敏感，需要在温度留出/温度扰动训练下重训（`run_scripts/run_fromnone_temp_v2.sh` 已启动，见 §3.6）。
 
 ### 3.6 温度留出（LOTO）训练
 - **Manifests**：`artifacts/mdcath_manifest_1000dom_temp/{train_not450(4T,15999),val_not450(4T,2000),val_t450(500)}.jsonl`（T=450 留出）；新增 `train_t450.jsonl`（seen-protein × T=450，用于补全矩阵 seen 格）。
-- **Model 1 temp-cond 头**：`run_ensemble_temp_1000dom.sh` → `artifacts/stage_ensemble_1000dom_temp_cond`（`cond_dims=2`，train/val 均为温度切分）。
-- **Model 2 温度切分重训**：`run_fromnone_temp_v2.sh` → `artifacts/fromnone/stage_cb1b_temp_v2`（从 anchor 恢复、LR 1e-4、encoder-lr-scale 2.0，**训练集不含 T=450**）。该 run 早期曾因非有限梯度崩溃，已用成熟 v4g 配方（resume anchor）修复，现稳定推进。
+- **Model 1 temp-cond 头**：`run_scripts/run_ensemble_temp_1000dom.sh` → `artifacts/stage_ensemble_1000dom_temp_cond`（`cond_dims=2`，train/val 均为温度切分）。
+- **Model 2 温度切分重训**：`run_scripts/run_fromnone_temp_v2.sh` → `artifacts/fromnone/stage_cb1b_temp_v2`（从 anchor 恢复、LR 1e-4、encoder-lr-scale 2.0，**训练集不含 T=450**）。该 run 早期曾因非有限梯度崩溃，已用成熟 v4g 配方（resume anchor）修复，现稳定推进。
 
 #### 3.6.1 温度留出外推代价（Model 2：含 T450 训练 vs 不含 T450 训练）
 两个 ckpt 都在**未见蛋白**的 `val_t450` 上评测（correct-T，horizon=16 ns，n_rollout_reps=3）。`v4g` 训练用 `train.jsonl`（**含全部 5 个温度**）；`temp_v2` 训练用 `train_not450.jsonl`（**完全不含 T=450**，训练到满 70000 步）。
@@ -250,5 +250,5 @@ python -m scripts.eval_temperature_generalization_model2 \
 ## 6. 局限与下一步（诚实）
 1. **主链**：Model 1 主链为 Cα+理想几何拼出，**肽键/ω 不自洽**；要真正逐残基自洽需训练 **frame + torsion 头**（计划文档 T1.2 option B）。
 2. **MSM 状态预测**：1 ns 帧间隔下**转变检测 F1 低**；下一步可缩短有效 lag / 用更多 anchor / 更长轨迹提升转变样本量。
-3. **温度泛化**：Model 1 的 temp-cond head 是**轻头重训**（冻结栈），可进一步在 **encoder 端**注入温度；Model 2 的温度留出训练（`run_fromnone_temp_v2.sh`，已训完 70k）显示**外推代价温和（Δskill ≈ −0.03）但温度输入本身近乎惰性**（§3.5），需在 encoder/decoder 端**显式注入**温度并在温度扰动下训练以激活 `temperature_proj` 通路，再用 §3.5 矩阵复测。
+3. **温度泛化**：Model 1 的 temp-cond head 是**轻头重训**（冻结栈），可进一步在 **encoder 端**注入温度；Model 2 的温度留出训练（`run_scripts/run_fromnone_temp_v2.sh`，已训完 70k）显示**外推代价温和（Δskill ≈ −0.03）但温度输入本身近乎惰性**（§3.5），需在 encoder/decoder 端**显式注入**温度并在温度扰动下训练以激活 `temperature_proj` 通路，再用 §3.5 矩阵复测。
 4. **coverage**：单一 ε 会高估，报告已附 population TV/JSD + free-energy MAE 作为稳健补充。

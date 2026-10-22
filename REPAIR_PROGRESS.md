@@ -82,7 +82,7 @@ python -m evaluation.run_h_gate \
   --output artifacts/repaired_v2/pilot_20261017/h_gate_heldout_diagnostic
 ```
 
-新 [Stage A](run_stage_a_unified.sh)、[B1a](run_b1a_unified.sh)、[B1b](run_b1b_unified.sh) 启动脚本使用独立 repaired_v2 输出、显式 validation、fail-on-error；B1a 默认冻结 encoder 校准 oracle，B1b 默认自主 energy score。全量脚本是后续配方，本轮未运行全量训练。A/B1a 的 resume 恢复权重、optimizer 和 CPU RNG，但尚未恢复 shuffle cursor，不能承诺逐字相同续训；B1b 的一步精确恢复另有测试。
+新 [Stage A](run_scripts/run_stage_a_unified.sh)、[B1a](run_scripts/run_b1a_unified.sh)、[B1b](archive/old_scripts_20261021/run_b1b_unified.sh) 启动脚本使用独立 repaired_v2 输出、显式 validation、fail-on-error；B1a 默认冻结 encoder 校准 oracle，B1b 默认自主 energy score。全量脚本是后续配方，本轮未运行全量训练。A/B1a 的 resume 恢复权重、optimizer 和 CPU RNG，但尚未恢复 shuffle cursor，不能承诺逐字相同续训；B1b 的一步精确恢复另有测试。
 
 下一轮先完成共享 decoder 的少窗口校准与独立窗口检查，再训练 8 蛋白 B1a、检验 4 蛋白 gate。通过后才测 history 增量信息，并进行同表示、同预算的 H+S 对照。还必须单独增加**同蛋白、时间顺序切分**评估；目前只有独立蛋白的开发集 pilot，不能用它替代同蛋白未来预测。
 
@@ -92,7 +92,7 @@ GLE bath 仍条件于初始构象 H，尚未改为纯序列条件；Gamma 限幅
 
 ## 2026-10-18 更新：true-H 读出门槛失败的直接原因已定位
 
-本轮在真实 Stage A checkpoint（`artifacts/repaired_v2/comparison_20261018/stage_a/checkpoint_best.pt`）和真实 mdCATH 数据上，用一个**独立于项目 decoder 的探针**，直接测量 H 携带多少可解码构象信息。方法、脚本、全部数字见 `DIAGNOSIS_H_READOUT_20261018.md`。
+本轮在真实 Stage A checkpoint（`artifacts/repaired_v2/comparison_20261018/stage_a/checkpoint_best.pt`）和真实 mdCATH 数据上，用一个**独立于项目 decoder 的探针**，直接测量 H 携带多少可解码构象信息。方法、脚本、全部数字见 `archive/old_docs_20261021/DIAGNOSIS_H_READOUT_20261018.md`。
 
 **决定性证据。** 探针任务：H_t → 未来内部 CA 位移（与 B1a `target_delta_local` 同定义），指标为解码结构的 shape RMSD（Kabsch 对齐后）；persistence 即"直接输出 anchor 构象"。
 
@@ -312,7 +312,7 @@ teacher 仍只提供 `target_delta_local`（结构真值，无需梯度）。
 # From-None Stage B (B1b → B2): Pipeline & Decoder Architecture
 
 **Date:** 2026-10-18 · full code: `protein_jepa_frame/models/stage_b1b_fromnone/`,
-`protein_jepa_frame/training/train_stage_cb1b.py` · doc: `FROMNONE_B1B_B2_PIPELINE.md`
+`protein_jepa_frame/training/train_stage_cb1b.py` · doc: `archive/old_docs_20261021/FROMNONE_B1B_B2_PIPELINE.md`
 
 ## Motivation
 
@@ -685,7 +685,7 @@ predicted motion), which is what the anchor-H / H-space displacement repairs
 
 ## 2026-10-18 (晚) — 方向 3 完成：结论「<1.2 Å 在 mdCATH 单帧 anchor 下不可达」
 
-完整数据见 `STAGE_A_REPAIR_RESULTS_20261018.md` §8–§10。
+完整数据见 `archive/old_docs_20261021/STAGE_A_REPAIR_RESULTS_20261018.md` §8–§10。
 
 **做了什么**
 1. 单批过拟合探针证明 B1a anchor-free decoder **会收敛**（ca_mse 139→0.47，real-H 1.17 Å），
@@ -708,7 +708,7 @@ predicted motion), which is what the anchor-H / H-space displacement repairs
 
 ## 2026-10-18/19 — 系综级目标 T1–T7 完成 + ATLAS 忠实评估
 
-**计划**：`PLAN_ENSEMBLE_20261018.md`；**结果**：`ENSEMBLE_RESULTS_20261018.md`。
+**计划**：`archive/old_docs_20261021/PLAN_ENSEMBLE_20261018.md`；**结果**：`archive/old_docs_20261021/ENSEMBLE_RESULTS_20261018.md`。
 
 **做了什么**
 1. **T1–T4**（新文件，不动精确坐标解码）：`evaluation/ensemble_metrics.py`、
@@ -734,7 +734,7 @@ predicted motion), which is what the anchor-H / H-space displacement repairs
 
 ## 2026-10-19 — 双数据集训练 + 系综目标 + 位置引导（D0–D7）完成
 
-**计划**：`PLAN_DUAL_ENSEMBLE_20261019.md`；**结果**：`DUAL_ENSEMBLE_RESULTS_20261019.md`。
+**计划**：`archive/old_docs_20261021/PLAN_DUAL_ENSEMBLE_20261019.md`；**结果**：`archive/old_docs_20261021/DUAL_ENSEMBLE_RESULTS_20261019.md`。
 
 **用户要求**：用 mdCATH + ATLAS **两个数据集一起训练**，target **系综级 metrics**，
 并允许**原子位置重建**作为引导指标。
@@ -755,7 +755,7 @@ predicted motion), which is what the anchor-H / H-space displacement repairs
    `scripts/eval_ensemble_manifest.py`，bootstrap 95% CI。
 
 **关键结果**
-- **逐项精确结论（见 `DUAL_ENSEMBLE_RESULTS_20261019.md`）**：
+- **逐项精确结论（见 `archive/old_docs_20261021/DUAL_ENSEMBLE_RESULTS_20261019.md`）**：
   - ✅ **RMSF 谱**：三个 val 上 **100% 窗口优于 persistence**（mdCATH Δ=−0.87；
     ATLAS Δ≈−0.03），这是本轮唯一真正拿下的指标。
   - ✅ **total**：97–100% 窗口更优，但**几乎完全由 rmsf 项贡献**（加权净正）。
@@ -792,7 +792,7 @@ contact Jaccard、内距 soft-EMD）。本次**全部新写**。
 - 结果 JSON：`artifacts/eval_dual_suite/{A,B,C}_{mdcath,atlas100ps,atlas1ns}.json`。
 - **未改动** `protein_jepa_frame/` 内任何精确坐标解码实现（mtime 校验）。
 
-**关键结果（见 `DUAL_ENSEMBLE_RESULTS_20261019.md` §6）**
+**关键结果（见 `archive/old_docs_20261021/DUAL_ENSEMBLE_RESULTS_20261019.md` §6）**
 - **mdCATH**：6 指标**全部 94–100% 窗口优于 persistence**（W2 家族 + Jaccard 全胜）。
 - **ATLAS-1ns / 100ps**：4 个 W2/RMSF **100% 胜**；2 个 Jaccard 均值更好但**胜率仅 6–10%**
   （近刚体系 persistence 已≈0.94，单窗口赢不动）。
@@ -824,7 +824,7 @@ contact Jaccard、内距 soft-EMD）。本次**全部新写**。
   - persistence：三种口径 **全 0.000**；oracle：全 **1.000**。
   - B/C：global +0.516/+0.571，per-target 均值 +0.498/+0.549，排序一致。
 - 按用户判断 **ATLAS 不再作主口径**（近刚性退化），报告只报 mdCATH；ATLAS JSON 留存备查。
-- `DUAL_ENSEMBLE_RESULTS_20261019.md` 新增 §6.2b。
+- `archive/old_docs_20261021/DUAL_ENSEMBLE_RESULTS_20261019.md` 新增 §6.2b。
 
 ### 2026-10-20 · MDGen 基线对照（轨迹生成，mdCATH）
 
@@ -849,6 +849,6 @@ contact Jaccard、内距 soft-EMD）。本次**全部新写**。
 - **我们的 rollout**：7 指标里 6 个最好（rmsf_mae 1.455 / rmsf-r 0.334 /
   var_w2 10.21 / pca_w2 0.080 / 两 Jaccard），**但 Kabsch 6.34 Å 差于 persistence**
   （自回归回填漂移）⇒ 后续 Stage B 轨迹任务的改进点。
-- 结果写入 `DUAL_ENSEMBLE_RESULTS_20261019.md` §7；原始 JSON 在
+- 结果写入 `archive/old_docs_20261021/DUAL_ENSEMBLE_RESULTS_20261019.md` §7；原始 JSON 在
   `artifacts/eval_mdgen/`、`artifacts/eval_ours_traj/`。
 - MDGen mdCATH 训练**仍在继续**（写稿时 epoch 7）。

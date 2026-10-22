@@ -411,7 +411,7 @@ true_rmsf  = (true_var[:, -1]  + eps).sqrt()   # [B,L]
 
 ### 8.3 启动配置（v4e）
 
-`run_fromnone_v4e.sh`：在 v4d 基础上（MLP decoder，从 anchor checkpoint
+`run_scripts/`run_fromnone_v4e.sh`：在 v4d 基础上（MLP decoder，从 anchor checkpoint
 warm start，`--steps 70000` 即继续 40000 步），唯一新增项：
 
 ```bash

@@ -85,16 +85,16 @@ Built by `scripts/build_mdcath_manifest.py --max-domains 1000` →
 | `protein_jepa_frame/training/train_stage_cb1b.py` | trainer (`from_none_encoder_v1` contract) |
 | `protein_jepa_frame/models/stage_b1b/model.py` | shared kernel; adds `force_clip`, `tail_init` |
 | `evaluation/run_eval_fromnone.py` | held-out eval vs persistence (Kabsch RMSD, contact Jaccard) |
-| `run_fromnone_real.sh` / `run_fromnone_temp.sh` | launch scripts (GPU 4) |
+| `run_scripts/`run_fromnone_real.sh` / `run_fromnone_temp.sh` | launch scripts (GPU 4) |
 
 ## Run & evaluate
 
 ```bash
 # held-out protein (main)
-nohup bash run_fromnone_real.sh > logs/fromnone_main.nohup 2>&1 &
+nohup bash run_scripts/ run_fromnone_real.sh > logs/fromnone_main.nohup 2>&1 &
 
 # held-out temperature
-nohup bash run_fromnone_temp.sh > logs/fromnone_temp.nohup 2>&1 &
+nohup bash run_scripts/ run_fromnone_temp.sh > logs/fromnone_temp.nohup 2>&1 &
 
 # evaluation (held-out protein)
 python -m evaluation.run_eval_fromnone \

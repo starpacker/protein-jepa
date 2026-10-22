@@ -126,3 +126,43 @@ Everything is additive and flag-gated.  To revert to the previous behaviour:
 drop `--dense-trajectory` (terminal-only Plan A) or drop `--train-encoder`
 (frozen-encoder join).  No existing code path changes when the flags are absent;
 the `H_traj` key added to the producer's return dict is ignored by the old path.
+
+## 8. Corrected paired-eval result (supersedes §7 numbers)
+
+Two bugs in the first paired-eval pass made the reported numbers invalid:
+
+1. **Global RNG was never seeded.** `GaussianHHead.sample` and the GLE kernel
+   draw noise from the *global* torch generator, but the script only seeded a
+   local dataset-subset Generator. Hence the frozen Model 1 produced a different
+   ensemble in every process. Fixed: `torch.manual_seed` / `np.random.seed` added.
+2. **Model 1 shared HS's encoder object.** `build()` built `m1` and `hs` on the
+   *same* encoder instance; HS then reloaded the *fine-tuned* encoder over it,
+   silently swapping Model 1's encoder too. So each run's "Model 1" was actually
+   that run's fine-tuned encoder, which is what moved the baseline (1.0376 vs
+   1.4248). Fixed: `m1` gets its own `deepcopy(encoder)`.
+
+After both fixes the Model1 baseline is **identical in both runs** (rmsf_mae
+0.8699), i.e. a genuine apples-to-apples paired test. Corrected conclusion:
+
+- **Terminal-only Plan A** is essentially *on par* with Model 1: significant only
+  on `rmsf_corr` (+0.0316 [+0.0020,+0.0629]) and `transient_contacts_j`
+  (+0.0087 [+0.0017,+0.0157]); `rmsf_mae`, `root_mean_w2`, `variance_w2`,
+  `md_pca_w2` are statistically indistinguishable.
+- **Dense Plan A is WORSE than Model 1**: `rmsf_mae` +0.1230 [+0.0391,+0.2125],
+  `variance_w2` +1.0356 [+0.6925,+1.4398], `md_pca_w2` +0.0043 [+0.0012,+0.0072],
+  `transient_contacts_j` -0.0129 [-0.0213,-0.0049]; `rmsf_corr` flat.
+
+So the earlier "beats Model 1 on all 7" was an artefact of the encoder aliasing.
+The dense-supervision idea does **not** win on the ensemble metrics; terminal-only
+is the safer variant, and neither yet clears Model 1 outright.
+
+### Protocol caveat (must be fixed before any "final" claim)
+
+Training used `step_ps=1000` while the MD data is 1 frame / 1000 ps, so the dense
+correspondence "rollout step i <-> truth frame i" is temporally exact *only* for
+the training/contiguous loader. The eval uses the **paired** loader with
+`--horizons 8` (a scalar `num_frames=4` context + a stride-8 future window), which
+is a *different* protocol: the future window is not the same contiguous window the
+dense run trained on. Before declaring a winner, re-run both train and eval on one
+shared contiguous protocol (`split_contiguous_window`, `step_ps` matched) so the
+paired comparison is exact.

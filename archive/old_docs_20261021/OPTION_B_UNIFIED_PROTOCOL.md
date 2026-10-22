@@ -44,12 +44,12 @@ lags (the user's requirement: "both sides should see multi-lag").
   `per_protein.jsonl`; `temporal_lags` read from the config.
 - `evaluation/configs/*.yaml`: `temporal_lags: [0,4,6,7]`, `emit_multi_lag: true`,
   checkpoint paths repointed to `*_unified`.
-- `run_stage_a_unified.sh`: uniform K=8, horizons `{8..96}`, lags `{0,4,6,7}`,
+- `run_scripts/`run_stage_a_unified.sh`: uniform K=8, horizons `{8..96}`, lags `{0,4,6,7}`,
   same architecture/losses as `stage_a_mixed`, from scratch.
 
 ## Run order (Option B)
 
-1. **Stage A unified** — `bash run_stage_a_unified.sh` (launched 2026-10-17,
+1. **Stage A unified** — `bash run_scripts/ run_stage_a_unified.sh` (launched 2026-10-17,
    GPU 2, 15k steps). Output `artifacts/abc_v3/stage_a_unified/`.
 2. **B1a unified** — supervised structure alignment on the unified encoder.
 3. **B1b unified** — GLE dynamics on the unified H + fixed bath (see

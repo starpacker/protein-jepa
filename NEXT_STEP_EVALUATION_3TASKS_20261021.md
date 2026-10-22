@@ -35,7 +35,7 @@
 | 5 temperatures in mdCATH: **320, 348, 379, 413, 450 K** | verified from `artifacts/mdcath_manifest_1000dom/val.jsonl` (500 each) |
 | Temperature **is** a first-class input to both model families | Model 1 path: StageA-v2 `time_embed(lag_ps, temperature_k)` (`stage_a_v2/model.py`), StageB1b GLE `temperature_proj` + `_temp_feature` (`stage_b1b/model.py`), `rollout(..., temperature_k, ...)`. Model 2: `autonomous_rollout` passes `batch["temperature_k"]`. |
 | A held-out-T=450 manifest **already exists** | `artifacts/mdcath_manifest_1000dom_temp/{train_not450,val_not450,val_t450}.jsonl` |
-| A temp-holdout training script + a partial run exist | `run_fromnone_temp.sh`, `artifacts/fromnone/stage_cb1b_temp/` (log shows a **non-finite-grad crash**) |
+| A temp-holdout training script + a partial run exist | `run_scripts/run_fromnone_temp.sh`, `artifacts/fromnone/stage_cb1b_temp/` (log shows a **non-finite-grad crash**) |
 | A temp-holdout eval path exists | `evaluation/run_eval_fromnone.py --split temp --heldout-temperature`, `evaluation/build_temp_holdout.py`, `evaluation/configs/mdcath_holdout_temp.yaml` |
 
 **Task-3 conclusion:** the *plumbing* exists but is (a) partial/crashed, (b) only for Model 2, (c) not a "leave-one-T-out + seen-protein unseen-T" matrix, and (d) never surfaced as a generalization metric. The real work is a **temperature-generalization protocol** (define the split scheme, make BOTH models temperature-aware at eval, run the matrix, and report skill-vs-ΔT), plus fixing the from-none temp run.
@@ -225,8 +225,8 @@ Report, per T* and per ΔT = |T* − nearest train T|:
 
 ### 4.4 What must change in code
 - **T3.1 — Generate the remaining LOTO manifests:** run `evaluation/build_temp_holdout.py` for T ∈ {320,348,379,413} on the 1000dom manifests (450 already exists).
-- **T3.2 — Make Model 1 temperature-aware at eval.** Today `eval_ensemble_metrics_suite.py` builds `cond = [t_norm, T_norm]` **only if the ensemble head had `cond_dim>0`**; the current `stage_ensemble_1000dom` head may be `cond_dim=0`. Verify the ckpt's `cond_dims`; if 0, the *T-conditioning ablation* (§4.2 family 4) is trivially "no T" and we must **train a `cond_dim≥2` ensemble head** (cheap: head only, frozen stack — `run_ensemble_1000dom.sh` already supports cond). Record which variant is used.
-- **T3.3 — from-none temp path:** the existing `stage_cb1b_temp` run **crashed on non-finite grads** (`logs/fromnone_temp.nohup`). Before any temp-eval, fix training stability (lower lr / stricter grad-clip / `error_if_nonfinite=False` guard as a diagnostic, or the `--force-clip`/`tail-init` knobs already in the config) and **re-run `run_fromnone_temp.sh`** to completion, or deliberately scope Task 3 to Model 1 only and say so.
+- **T3.2 — Make Model 1 temperature-aware at eval.** Today `eval_ensemble_metrics_suite.py` builds `cond = [t_norm, T_norm]` **only if the ensemble head had `cond_dim>0`**; the current `stage_ensemble_1000dom` head may be `cond_dim=0`. Verify the ckpt's `cond_dims`; if 0, the *T-conditioning ablation* (§4.2 family 4) is trivially "no T" and we must **train a `cond_dim≥2` ensemble head** (cheap: head only, frozen stack — `run_scripts/run_ensemble_1000dom.sh` already supports cond). Record which variant is used.
+- **T3.3 — from-none temp path:** the existing `stage_cb1b_temp` run **crashed on non-finite grads** (`logs/fromnone_temp.nohup`). Before any temp-eval, fix training stability (lower lr / stricter grad-clip / `error_if_nonfinite=False` guard as a diagnostic, or the `--force-clip`/`tail-init` knobs already in the config) and **re-run `run_scripts/run_fromnone_temp.sh`** to completion, or deliberately scope Task 3 to Model 1 only and say so.
 - **T3.4 — Eval driver:** add a `--temperature` / `--stratify-by-temperature` mode to the suite (or a thin wrapper `scripts/eval_temperature_generalization.py`) that iterates the T-grid × splits and emits a **matrix** `{T*: {seen/unseen protein: metrics}}` plus the **T-conditioning ablation** columns.
 - **T3.5 — Tests:** `tests/test_temperature_protocol.py` — assert the held-out T is absent from train manifests (`protocol.validate_manifest_split(..., heldout_temperature=...)` already enforces this), assert no protein overlap, assert the wrong-T control produces a different prediction than the correct-T one when `cond_dim>0`.
 
@@ -240,9 +240,9 @@ for T in 320 348 379 413; do
     --temperature $T
 done
 # (re)train the temp-holdout from-none run after fixing stability
-bash run_fromnone_temp.sh
+bash run_scripts/run_fromnone_temp.sh
 # Model 1 temperature-aware ensemble head (only if ckpt cond_dim==0)
-bash run_ensemble_1000dom.sh   # ensure --cond-dims 2 --manifest .../train_not450.jsonl
+bash run_scripts/run_ensemble_1000dom.sh   # ensure --cond-dims 2 --manifest .../train_not450.jsonl
 # generalization matrix + T-conditioning ablation
 python -m scripts.eval_temperature_generalization \
   --splits 320 348 379 413 450 --ablation correct wrong frozen \
@@ -295,5 +295,5 @@ Phase 3:         Re-run unified reporting; merge into inbox report as
 | Temp-holdout builder | `evaluation/build_temp_holdout.py` |
 | Temp-holdout eval | `evaluation/run_eval_fromnone.py` (`--split temp`) |
 | Temp manifests | `artifacts/mdcath_manifest_1000dom_temp/*` |
-| Temp-trained from-none (crashed) | `artifacts/fromnone/stage_cb1b_temp/`, `logs/fromnone_temp.nohup`, `run_fromnone_temp.sh` |
+| Temp-trained from-none (crashed) | `artifacts/fromnone/stage_cb1b_temp/`, `logs/fromnone_temp.nohup`, `run_scripts/run_fromnone_temp.sh` |
 | 5 temperatures | 320 / 348 / 379 / 413 / 450 K (`mdcath_manifest_1000dom`) |

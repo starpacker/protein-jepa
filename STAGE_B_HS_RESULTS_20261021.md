@@ -81,7 +81,7 @@ H+S 在 rollout 的 RMSF/RMSF-r 上**更好**，Kabsch 略差；两者都远不�
 | 配对结果 | `artifacts/eval_hs_1000dom/paired_vs_model1.json` |
 | H+S 系综指标 | `artifacts/eval_hs_1000dom/suite.json` |
 | H+S rollout 指标 | `artifacts/eval_hs_1000dom/rollout_100f.json` |
-| 运行脚本 | `run_stage_hs_1000dom.sh` |
+| 运行脚本 | `run_scripts/run_stage_hs_1000dom.sh` |
 
 ## 7. 下一步建议（若想继续）
 

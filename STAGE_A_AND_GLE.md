@@ -41,11 +41,11 @@ objective and a structure-reconstruction auxiliary head. Produces the latent
 **Train it**
 
 ```bash
-bash run_stage_a_unified.sh          # 200dom (default in the script)
+bash run_scripts/run_stage_a_unified.sh          # 200dom (default in the script)
 # or point it at 1000dom:
 TRAIN_MANIFEST=artifacts/mdcath_manifest_1000dom/train.jsonl \
 VAL_MANIFEST=artifacts/mdcath_manifest_1000dom/val.jsonl \
-OUTPUT=artifacts/stage_a_disp_relpos bash run_stage_a_unified.sh
+OUTPUT=artifacts/stage_a_disp_relpos bash run_scripts/run_stage_a_unified.sh
 ```
 
 **Code**
@@ -56,7 +56,7 @@ OUTPUT=artifacts/stage_a_disp_relpos bash run_stage_a_unified.sh
 | `protein_jepa_frame/models/stage_a_v2/model.py` | `StageAV2`, `StageAV2Config` (encoder + predictor + OPF) |
 | `protein_jepa_frame/models/stage_a_v2/objectives.py` | `compute_stage_a_v2_loss`, `StageAV2LossWeights` |
 | `protein_jepa_frame/models/encoder.py` | shared `ProteinGeometryEncoder` (online/EMA, orientation & relative-position features) |
-| `run_stage_a_unified.sh` | launch script |
+| `run_scripts/run_stage_a_unified.sh` | launch script |
 
 **Key config ideas** (`StageAV2Config`): `latent_dim=128`, `num_factors=4` (OPF),
 `orientation_features=True`, `relative_position_features=True`,
@@ -82,9 +82,9 @@ added incrementally through the `v4*` generations).
 **Train it**
 
 ```bash
-bash run_fromnone_v4e.sh     # best checkpoint (v4e) — MLP decoder + RMSF-r loss
-bash run_fromnone_v4f.sh     # from-scratch + CRIDecoder (in progress lineage)
-bash run_fromnone_v4g.sh     # CRIDecoder resumed from anchor ckpt
+bash run_scripts/run_fromnone_v4e.sh     # best checkpoint (v4e) — MLP decoder + RMSF-r loss
+bash run_scripts/run_fromnone_v4f.sh     # from-scratch + CRIDecoder (in progress lineage)
+bash run_scripts/run_fromnone_v4g.sh     # CRIDecoder resumed from anchor ckpt
 ```
 
 **Code**
@@ -127,7 +127,7 @@ transient-contact Jaccard. See `STAGE_B_HS_RESULTS_20261021.md`.
 **Train / evaluate it**
 
 ```bash
-bash run_stage_hs_1000dom.sh                 # 6000 steps on 1000dom
+bash run_scripts/run_stage_hs_1000dom.sh                 # 6000 steps on 1000dom
 python -m scripts.paired_hs_vs_model1 --help # the paired H+S vs Model-1 test
 ```
 
@@ -142,7 +142,7 @@ python -m scripts.paired_hs_vs_model1 --help # the paired H+S vs Model-1 test
 | `protein_jepa_frame/training/train_stage_b1a.py` | B1a anchored-decoder training (`_extract_backbone_frames` etc. reused) |
 | `protein_jepa_frame/models/stage_b1a/model.py` | `StageBOracleDecoder` — the anchored decoder (frozen in the join) |
 | `protein_jepa_frame/models/ensemble_producer.py` | `GaussianHHead` + `EnsembleProducer` (Model-1 static head, for comparison) |
-| `run_stage_hs_1000dom.sh` | launch script |
+| `run_scripts/run_stage_hs_1000dom.sh` | launch script |
 
 ---
 

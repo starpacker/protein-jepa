@@ -1,8 +1,8 @@
 # Protein-JEPA-Frame — 完整项目报告（单一文档）
 
 > **日期**：2026-10-21
-> **本文件是唯一需要的文档**（自包含）。原始材料：`DUAL_ENSEMBLE_RESULTS_20261019.md`、
-> `FROMNONE_GLE_ENSEMBLE_RESULTS_20261019.md`、`BIOEMU2_ZEROSHOT_RESULTS_20261020.md`
+> **本文件是唯一需要的文档**（自包含）。原始材料：`archive/old_docs_20261021/DUAL_ENSEMBLE_RESULTS_20261019.md`、
+> `archive/old_docs_20261021/FROMNONE_GLE_ENSEMBLE_RESULTS_20261019.md`、`archive/old_docs_20261021/BIOEMU2_ZEROSHOT_RESULTS_20261020.md`
 > 及仓库内 JSON（`artifacts/eval_*/*.json`、`results/*.json`）。
 > 所有模型现**统一使用 `mdCATH-1000dom`** 作为默认数据集（见 §7）。
 
@@ -20,6 +20,7 @@
 | **Baseline 3** | **bioemu2 zero-shot**（`bioemu2-preview`，微软 diffusion 全原子系综，无微调） |
 | **主指标（7 项）** | RMSF-幅度 / **RMSF-r（形态）** / ROOT-MEAN W2 / VARIANCE W2 / MD-PCA W2 / WEAK-CONTACT J / TRANSIENT-CONTACTS J（+ Kabsch CA RMSD） |
 | **最强结论** | ✅ 两个模型在**系综分布指标（RMSF 谱/形态 + 3×W2 + 接触类）稳定优于 persistence**；其中**模型 1（最终版）RMSF-r=0.673、RMSF=0.837，已优于所有 zero-shot baseline**。⚠️ **CA 绝对位置精度**（Kabsch / 短时标 root_W2）仍是共同短板 |
+| **Stage A + GLE 直连（Plan A）** | 把 Stage-A 表征与 GLE 动力学接起来（encoder 微调 + decoder 冻结 + GLE 训练）。**terminal-only 版本 ≈ 模型 1**（RMSF-r、TRANSIENT-J 显著更好，其余打平，见 **§3.7**）；**dense 轨迹监督版本失败已回退**（§10.2）。代码/下一步见 **§10**、命令见 **§11** |
 | **⚠️ PDB 口径提醒** | §3 的 SOTA 是**单步系综**任务的成绩，对应 PDB：**`artifacts/pdbs_1000dom_ensemble_20261021/`**（不漂移）。另一个 `..._aligned_.../` 目录是**自回归 rollout PDB**，口径不同，RMSD 差是**另一个任务**，**复现报告不需要 rollout**。详见 **§4.1** |
 
 **三套 baselevel 正交结论**：
@@ -194,7 +195,7 @@ persistence 因此占优）。这正是**系综生成 vs 轨迹推进**两类任
 
 **环境坑（已解决）**：bioemu2 的 `cuequivariance_ops_torch` 需要 `libnvrtc.so.13`；
 本机是 CUDA 12.9，但 pip `nvidia-cu13` wheel 里**有**该库，只是不在默认 search path 上。
-修复：`export LD_LIBRARY_PATH=/opt/conda/lib/python3.13/site-packages/nvidia/cu13/lib:$LD_LIBRARY_PATH`（已写进 `run_bioemu2_zeroshot.sh`）。
+修复：`export LD_LIBRARY_PATH=/opt/conda/lib/python3.13/site-packages/nvidia/cu13/lib:$LD_LIBRARY_PATH`（已写进 `run_scripts/run_bioemu2_zeroshot.sh`）。
 
 ### 3.5b bioemu2 zero-shot — 3 次重复（seed 0/1/2）的 mean ± std 【新增】
 
@@ -258,6 +259,49 @@ persistence 因此占优）。这正是**系综生成 vs 轨迹推进**两类任
 > **读法**：**在 RMSF-r / RMSF / pca_W2 三个分布形态指标上，模型 1 已优于所有 zero-shot baseline**
 > （含 bioemu2）。**位置精度（Kabsch）仍是短板**——模型 1 rollout 8.39 Å 差于 persistence 3.87 Å。
 
+### 3.7 Stage A + GLE 直连（Plan A，terminal-only） vs 模型 1 【新增，当前最佳 GLE 版本】
+
+> 目标：把 **Stage-A encoder 的表征** 与 **GLE latent 动力学** 接起来（"Plan A"），
+> 在**同一冻结栈**（Stage-A encoder + B1a 冻结解码器）下与**模型 1** 做**配对**比较，
+> 看 GLE 是否能在模型 1 的基础上进一步优化系综指标。
+
+**配置（terminal-only）**：
+- 车辆：`protein_jepa_frame/training/train_stage_b_hs.py`，脚本 `run_scripts/run_plan_a_hs_1000dom.sh`。
+- 冻结/开放：**encoder 用 Stage-A 初始化并联合微调**（`--train-encoder --encoder-lr-scale 0.1`，低 LR）；
+  **B1a 解码器冻结**；GLE kernel（`StageB1b`）开放训练。
+- rollout 步数 == 监督窗口帧数（`--rollout-steps 8 --paired-horizons-frames 8`），
+  即"loss 看到的 rollout 长度 == 推理时的 rollout 长度"。
+- ckpt：`artifacts/plan_a_hs_1000dom/checkpoint_best.pt`（6000 步，best val ens/total 1.7509；val_persist 2.6106）。
+
+**配对评测**（`scripts/paired_hs_vs_model1.py`，同一 val 窗口、同一冻结解码器、同一 M=8 采样；
+每窗口取 Δ=(H+S − 模型1)，bootstrap 95% CI）：
+
+| 指标 | 模型 1 | H+S（Plan A） | Δ | 95% CI | 判定 |
+| --- | --- | --- | --- | --- | --- |
+| RMSF ↓ | **0.8699** | 0.8414 | −0.0284 | [−0.0808, +0.0246] | 平 |
+| RMSF-r ↑ | 0.5045 | **0.5361** | +0.0316 | [+0.0020, +0.0629] | ✅显著 |
+| ROOT-MEAN W2 ↓ | **13.4780** | 13.4927 | +0.0147 | [−0.0128, +0.0445] | 平 |
+| VARIANCE W2 ↓ | **7.7866** | 7.9003 | +0.1138 | [−0.2807, +0.5316] | 平 |
+| MD-PCA W2 ↓ | **0.0697** | 0.0719 | +0.0022 | [−0.0009, +0.0053] | 平 |
+| WEAK-CONTACT J ↑ | 0.0748 | **0.0780** | +0.0032 | [−0.0033, +0.0095] | 平 |
+| TRANSIENT J ↑ | 0.1768 | **0.1855** | +0.0087 | [+0.0017, +0.0157] | ✅显著 |
+
+**读法**：**terminal-only Plan A ≈ 模型 1**——仅 **RMSF-r** 与 **TRANSIENT-J** 显著更好，
+其余 5 项统计上打平（无显著变差）。它是一个**可用的、与模型 1 同级的 GLE 版本**，
+但**尚未稳定超越**模型 1；更未达到 §3.6 中模型 1 的 global RMSF-r 水平。
+
+**同一批次里还试了"密集轨迹监督"（dense），结论是失败，已回退**（详见 §10.2）：
+dense 把 rollout 的 **每个中间帧** 都拿去和真实 future 帧对齐监督，但 7 项里 6 项不如模型 1
+（`variance_w2`、`md_pca_w2`、`rmsf_mae` 显著变差）。
+
+> **两个评测 bug（已修，§10.1）**使上一轮"7/7 全胜"为假象；修正并做**真配对**后才得到上表。
+> 数字来源：`results/plan_a_hs_vs_model1.json`（**以此为准**）；
+> 旧的 `results/plan_a_vs_model1.json` / `results/plan_a_dense_vs_model1.json` 为修正前产物，**勿引用**。
+
+> **口径提醒**：训练用 `step_ps=1000`，而评测用 **paired loader**（`--horizons 8`：scalar 4 帧 context + stride-8 future 窗口），
+> 与训练 dense 所用的 **contiguous loader** 不是同一协议。当前**模型 1 与 H+S 两侧同用该 paired loader**，
+> 配对比较是自洽的；但**跨 horizon 比较**需先统一协议（见 §10.3）。
+
 ---
 
 ## 4. 轨迹 PDB 文件（肉眼/可视化检查）
@@ -303,10 +347,10 @@ artifacts/pdbs_1000dom_20261020/<protein>_T<temp>_R<rep>_anchor<f>/
    `artifacts/stage_a_disp_relpos/checkpoint_latest.pt`（**已是 1000dom 训练**）。
 2. **Stage-B1a（anchored decoder）**：从 anchor+history 解码未来 CA，锚定到 anchor。
    损失 = relative-disp + CA-MSE + FAPE + torsion + distance + phys-future + anchor。
-   1000dom 重训产物：`artifacts/stage_b1a_relpos_anchored_1000dom/`（6000 步，`run_b1a_relpos_anchored_1000dom.sh`）。
+   1000dom 重训产物：`artifacts/stage_b1a_relpos_anchored_1000dom/`（6000 步，`run_scripts/run_b1a_relpos_anchored_1000dom.sh`）。
 3. **Gaussian 系综头（本阶段唯一可训练）**：拟合 latent H 的高斯 → 采样 M 个 H → 解码成 CA 云。
    损失 = RMSF(L1) + contact(L1) + 内距 soft-EMD。产物：`artifacts/stage_ensemble_1000dom/`
-   （`run_ensemble_1000dom.sh`；encoder+decoder 冻结）。
+   （`run_scripts/run_ensemble_1000dom.sh`；encoder+decoder 冻结）。
 
 ### 5.2 模型 2 — from-none GLE 训练流程
 
@@ -367,18 +411,18 @@ export CLAUDE_CODE_TMPDIR=/liuyutian/protein_jepa_frame/.tmpwork TMPDIR=$CLAUDE_
 MANIFEST=artifacts/mdcath_manifest_1000dom   # train.jsonl / val.jsonl
 
 # 1) B1a 锚定解码器（1000dom）
-bash run_b1a_relpos_anchored_1000dom.sh
+bash run_scripts/run_b1a_relpos_anchored_1000dom.sh
 
 # 2) Gaussian 系综头（1000dom，依赖 B1a best ckpt）
-bash run_ensemble_1000dom.sh
+bash run_scripts/run_ensemble_1000dom.sh
 
 # 3) 评估 Model 1（7 系综指标 + Kabsch）
 python -m evaluation.eval_ours_trajectory ...   # 见 artifacts/eval_model1_1000dom/
 
 # 4) bioemu2 zero-shot baseline
-bash run_bioemu2_zeroshot.sh
+bash run_scripts/run_bioemu2_zeroshot.sh
 # 4b) bioemu2 zero-shot —— 3 次重复（seed 0/1/2，固定 PYTHONHASHSEED）
-bash run_bioemu2_zeroshot_rep.sh
+bash run_scripts/run_bioemu2_zeroshot_rep.sh
 python -m evaluation.baselines.summarize_reps --in-dir results/bioemu2_reps \
   --out results/bioemu2_reps/summary.json
 
@@ -409,3 +453,88 @@ python scripts/export_eval_trajectories_pdb.py \
 | 指标代码 | `evaluation/ensemble_metrics.py` + `evaluation/ensemble_metrics_ext.py` |
 | 导出脚本 | `scripts/export_eval_trajectories_pdb.py` |
 | 单测 | `tests/test_ensemble_metrics*.py`（26 项全过） |
+
+---
+
+## 10. Stage A + GLE 直连（Plan A）—— 代码路径、失败模式、下一步 【新增】
+
+### 10.1 代码路径与冻结策略（当前最佳 = terminal-only）
+
+**入口**：`protein_jepa_frame/training/train_stage_b_hs.py`
+（车辆必须是它，**不是** cb1b：from-none 的 MLP 解码器绑死在 v4e 的 H 方言上，
+无法解码 Stage-A 的 H；因此 Plan A 的冻结解码器只能是 B1a 的 `StageBOracleDecoder`。）
+
+| 组件 | 状态 | 说明 |
+| --- | --- | --- |
+| Stage-A encoder | **可训练（低 LR，scale 0.1）** | 用 `--train-encoder --encoder-lr-scale 0.1`；Stage A 的 H 在各系综上表现好，是宝贵的初始化 |
+| B1a decoder | **冻结** | 锚定解码器，保证 H→CA 映射不被破坏 |
+| GLE kernel（`StageB1b`） | **可训练** | 唯一从零学的部分（`U(H)` 能量 + 静态浴 D/C/Γ + `HistoryPosterior`） |
+
+**关键训练技巧**：`--rollout-steps == --paired-horizons-frames`。
+旧版 `stage_hs` 用 **1 步 rollout** 去拟合**整窗口**目标 → 多步的 `h·C@S` 浴反馈从未进过 loss，
+推理时发散（实测 ‖H_rollout−H₀‖：1 步 33 → 4 步 9220）。对齐步数后，训练与推理的 rollout 一致。
+
+**结果**：见 **§3.7** —— **terminal-only ≈ 模型 1**（7 项中 2 项显著更好，其余打平）。
+ckpt：`artifacts/plan_a_hs_1000dom/checkpoint_best.pt`。
+
+### 10.2 失败尝试：密集轨迹监督（dense）
+
+代码路径：`train_stage_b_hs.py` 的 `_run_batch_dense` + `_decode_path` +
+`--dense-trajectory --dense-stride --dense-horizon --dense-{ca,es,rmsf,rmsf-corr,var}-weight`；
+数据用 **contiguous loader**（`collate_clips` + `split_contiguous_window`，`step_ps` 匹配）保证
+"rollout 第 i 步 ↔ 真实 future 第 i 帧"。
+
+- 朴素 rollout 只把 `traj[:, -1]` 拿去 loss，**丢掉了 T 个中间帧**（H=8 时 1 用/9 产）。
+- dense 把**整条轨迹**每一步都做 Kabsch 点损失 + energy score + 系综 RMSF/RMSF-r/variance。
+- **结论：失败**。7 项里 6 项不如模型 1（`variance_w2` +1.04、`md_pca_w2` +0.0043、
+  `rmsf_mae` +0.123、`transient_J` −0.013 均显著变差），且训练耗时约 2×。
+  推测：逐步 Kabsch 点损失**压制了 GLE 应有的扩散涨落**，反而拉坏系综的方差/慢模态。
+- **已回退**：一切改动 flag 门控——去掉 `--dense-trajectory` 即回 terminal-only，
+  去掉 `--train-encoder` 即回冻结 encoder；旧路径行为完全不变。
+  结果 `results/plan_a_dense_*.json` 为修正前产物，**勿引用**。
+
+**两个评测 bug（上一轮"全胜"为假象的根因，已在 `scripts/paired_hs_vs_model1.py` 修复）**：
+1. **全局 RNG 未播种**：`GaussianHHead.sample`/GLE 用全局 torch generator，脚本只播了
+   dataset-subset 的局部 generator → 同一个冻结模型 1 每个进程系综都不同。已加 `torch.manual_seed`。
+2. **模型 1 与 H+S 共用同一 encoder 对象**：`build()` 里两者建在同一实例上，H+S 重载
+   **微调后**的 encoder 时把模型 1 的 encoder 也覆盖了 → "模型 1"基线随 run 漂移
+   （rmsf_mae 1.0376 vs 1.4248）。已给模型 1 `deepcopy(encoder)` 隔离。
+  修复后模型 1 基线两次评测**完全一致**（0.8699），才是真配对。
+
+### 10.3 待办：什么是"干净配对" + Next-step plan
+
+**"干净配对（clean paired）"** 指的是四点同时满足的评测：
+1. **同一冻结栈**：模型 1 与 H+S 用**同一份** Stage-A/B1a 权重（不能像 10.2 的 bug 那样被覆盖）；
+2. **同一窗口集合**：同一 manifest、同一 `(anchor, future-window)` 分割（val 域零重叠）；
+3. **同一采样数 M、同一 horizon**；每窗口取 Δ=(H+S−模型1)，用**配对** bootstrap 出 CI（而非各评各的）；
+4. **全局 RNG 播种**，跨进程可复现。
+当前 §3.7 **1–4 全满足**；唯一遗留是**训练用 contiguous、评测用 paired 两个协议**——
+只要"双方同用评测口径"就自洽，但若要比 horizon 曲线，需把训练也切到同一 contiguous 协议。
+
+**Next-step plan（按优先级）**：
+1. **轨迹级指标（回应用户第 1 点）**：现在只有"系综"指标，terminal-only 更是只看终点。
+   引入**整条 rollout 轨迹**的约束/评估：绕行度（path length / 回转半径沿 t）、
+   per-step Kabsch-RMSD 曲线、逐帧 RMSF、时间自相关（ACF/relaxation）、以及
+   **路径分布评分**（ES on 轨迹）。这些作为**评估**先建起来，再考虑**进 loss**（dense 用的就是这条路，失败）。
+2. **解冻 B1a decoder（回应用户第 2 点）**：现在 decoder 冻结。方案：
+   (a) **低 LR 微调 decoder**（`--decoder-lr-scale`），(b) 末端几层解冻，(c) 仅在 Stage-A H 上用 **LoRA/残差 adapter**。
+   风险：模型 1 的强项正是这个冻结 decoder 的保真度，解冻可能**同时破坏模型 1 基线**；
+   因此需要**对照**（冻结 vs 解冻）与**配准**（解冻后模型 1 也要在同栈上重评）。
+3. **统一协议**：train / eval 都切到 contiguous（`split_contiguous_window`, `step_ps` 匹配），
+   消除 §10.2 的口径差，支持跨 horizon 直接比较。
+4. **根因诊断（为何 GLE 赢不过模型 1）**：模型 1 的头是**静态高斯**（H 上一步采样），
+   GLE 是**动力学**；当前 terminal-only 等价于"多步 rollout 后取终点"，
+   但系综指标上看不到动力学优势 → 需要用 (1) 的轨迹指标证明 GLE 的价值，
+   否则应把 GLE 定位为"轨迹推进"而非"系综生成"。
+
+---
+
+## 11. 复现命令（Plan A / terminal-only）【新增】
+
+```bash
+# 训练（terminal-only Plan A，GPU 4）
+bash run_scripts/run_plan_a_hs_1000dom.sh          # -> artifacts/plan_a_hs_1000dom/
+
+# 配对评测（self-contained，内部播种全局 RNG，模型 1 与 H+S 隔离 encoder）
+bash run_scripts/run_paired_eval.sh                # -> results/plan_a_hs_vs_model1.json（以此为准）
+```

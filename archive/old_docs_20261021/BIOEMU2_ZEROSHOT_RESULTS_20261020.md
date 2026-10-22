@@ -152,7 +152,7 @@
 
 ```bash
 # 全量 200 窗口（~40 min, 1×A800）
-bash run_bioemu2_zeroshot.sh
+bash run_scripts/ run_bioemu2_zeroshot.sh
 # 结果 -> results/bioemu2_zeroshot.json / .log
 ```
 
