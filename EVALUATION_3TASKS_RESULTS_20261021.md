@@ -504,7 +504,7 @@
 |---|---|---|---|---|
 | ① | 主表（模型 1 系综） | RMSF/W2/Jaccard/Kabsch | `artifacts/eval_model1_1000dom/suite_v2.json` | 200 样本 / n_samples=8 |
 | ② | 模型 2 系综 | 同上 | `results/v4e_ensemble_eval.json` | 200 窗口 / n_samples=12 |
-| ③ | MDGen zero-shot | 同上 + Kabsch | `results/mdgen_baseline*` | 32 窗口 |
+| ③ | MDGen zero-shot | 同上 + Kabsch | `artifacts/eval_mdgen/mdgen_zeroshot_atlas_mdcath{,_seed7}.json`、`..._short_s{2000,6000}.json` | 32 窗口 |
 | ④ | bioemu2 zero-shot（单次 / 3 次 mean） | 同上 | `results/bioemu2_zeroshot.json` / `results/bioemu2_reps/summary.json` | 200 窗口 / n_samples=12 |
 | ⑤ | Plan A 系综配对 | RMSF/W2/Jaccard | `results/plan_a_hs_vs_model1.json` | 配对窗口 / M=8 |
 | ⑥ | Plan A 轨迹配对（walk） | order-aware | `results/walk_plan_a_contig.json` | 40 窗口 / M=6 |
