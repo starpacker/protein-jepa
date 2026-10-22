@@ -9,7 +9,7 @@ latent-state prediction on **mdCATH** (5 temperatures: 320 / 348 / 379 / 413 / 4
 
 | # | Document | What it is |
 |---|---|---|
-| 1 | **[`EVALUATION_3TASKS_RESULTS_20261021.md`](EVALUATION_3TASKS_RESULTS_20261021.md)** | **Consolidated 3-task evaluation results** (Task 1 OpenFold main-chain reconstruction · Task 2 BioEmu-style metrics + MSM state prediction · Task 3 temperature generalization). Every number has its `n` and sampling budget; static vs. dynamics metrics are separated. |
+| 1 | **[`EVALUATION_3TASKS_RESULTS_20261021.md`](EVALUATION_3TASKS_RESULTS_20261021.md)** | **The authoritative evaluation plan + full results reference.** Defines *every* metric (CA-RMSD / Kabsch, RMSF & RMSF-r, Root-Mean / Variance / MD-PCA W2, contact Jaccard, energy scores, CA geometry validity, backbone N/CA/C/O stereochemistry, BioEmu-style static + MSM dynamics, order-aware trajectory metrics, temperature generalization) with units/direction/code, plus all result tables — the 3 newest tasks **and** every earlier evaluation. Every number carries its `n` + sampling budget; static vs. dynamics metrics are separated. |
 | 2 | **[`PROJECT_REPORT_20261021.md`](PROJECT_REPORT_20261021.md)** | **Full self-contained project report** — models, training recipes, results vs. persistence / MDGen / bioemu2, and limitations. |
 
 > Its plan / companion protocol is [`NEXT_STEP_EVALUATION_3TASKS_20261021.md`](NEXT_STEP_EVALUATION_3TASKS_20261021.md).
