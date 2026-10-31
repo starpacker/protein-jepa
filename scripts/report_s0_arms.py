@@ -25,10 +25,16 @@ Usage
 """
 import argparse
 import json
+import re
 from collections import defaultdict
 from pathlib import Path
 
 PRIMARY = ["rmsf_corr", "md_pca_w2", "variance_w2"]
+
+
+def _strip_seed(name):
+    """'exact_seed42_vs_prior_seed42' -> 'exact_vs_prior'."""
+    return re.sub(r"_seed\d+", "", name)
 
 
 def _is_horizon(key):
@@ -56,9 +62,14 @@ def main():
             raise SystemExit(f"bad --pair {spec!r}, want COMPARISON=SEED=PATH")
         comp, seed, path = parts
         d = json.loads(Path(path).read_text())
-        # a paired file may hold one or several comparisons, or be a bare
-        # horizon-keyed table.  Take the named comparison; refuse to guess.
-        if comp in d.get("comparisons", {}):
+        # A paired file may hold one or several comparisons, or be a bare
+        # horizon-keyed table.  The comparison key carries the seed suffix
+        # ("exact_seed42_vs_prior_seed42"); match it seed-insensitively so the
+        # caller can name the comparison once for all three seeds.
+        found = [k for k in d.get("comparisons", {}) if _strip_seed(k) == comp]
+        if found:
+            table = d["comparisons"][found[0]]
+        elif comp in d.get("comparisons", {}):
             table = d["comparisons"][comp]
         elif all(_is_horizon(k) for k in d if k != "protocol"):
             table = d

@@ -57,4 +57,4 @@ for comp in exact_vs_prior exact_vs_sota prior_vs_sota gru_vs_prior; do
     pairs+=(--pair "${comp}=s${seed}=$OUT/paired_seed${seed}.json")
   done
 done
-python -m scripts.report_s0_arms "${pairs[@]}" --out "$OUT/decision_3seed.json"
+PYTHONPATH=/tmp/lasp_stability_deps:. /opt/conda/bin/python -m scripts.report_s0_arms "${pairs[@]}" --out "$OUT/decision_3seed.json"
