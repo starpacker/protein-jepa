@@ -30,6 +30,7 @@ class EnsembleLossWeights:
     contact_weight: float = 1.0
     dist_weight: float = 1.0
     pos_weight: float = 0.0          # D2 (2026-10-19): atom-position guide
+    contact_temperature: float = 0.5  # Angstrom; 0 reproduces historical hard contacts
     eps: float = 1e-6
 
     def validate(self) -> None:
@@ -75,11 +76,17 @@ def _rmsf_loss(pred_ca: torch.Tensor, true_rmsf: torch.Tensor,
 
 
 def _contact_loss(pred_ca: torch.Tensor, true_contact: torch.Tensor,
-                  mask: torch.Tensor, cutoff: float) -> torch.Tensor:
+                  mask: torch.Tensor, cutoff: float, temperature: float = 0.5) -> torch.Tensor:
     """[B,n,L,3] pred vs [B,L,L] true contact probability map."""
     B, n, L, _ = pred_ca.shape
-    pred_c = torch.stack([contact_probability_map(pred_ca[b], mask[b], cutoff)
-                          for b in range(B)], dim=0)                # [B,L,L]
+    if temperature < 0:
+        raise ValueError("contact temperature must be non-negative")
+    if temperature == 0:
+        pred_c = torch.stack([contact_probability_map(pred_ca[b], mask[b], cutoff)
+                              for b in range(B)], dim=0)
+    else:
+        distances = torch.cdist(pred_ca, pred_ca)
+        pred_c = torch.sigmoid((cutoff - distances) / temperature).mean(dim=1)
     m = mask.to(pred_c.dtype)[:, :, None] * mask.to(pred_c.dtype)[:, None, :]
     diff = (pred_c - true_contact).abs() * m
     return diff.sum() / m.sum().clamp_min(1.0)
@@ -138,7 +145,8 @@ def compute_ensemble_loss(
     pred_ca_pos: torch.Tensor | None = None,      # [B, L, 3] deterministic decode
 ) -> EnsembleLossComponents:
     l_rmsf = _rmsf_loss(pred_ca_samples, true_rmsf, mask)
-    l_contact = _contact_loss(pred_ca_samples, true_contact, mask, cutoff)
+    l_contact = _contact_loss(pred_ca_samples, true_contact, mask, cutoff,
+                              weights.contact_temperature)
     l_dist = _dist_loss(pred_dist_hist, true_dist_hist, dist_bin_width)
     l_pos = None
     if weights.pos_weight > 0.0:

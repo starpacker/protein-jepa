@@ -28,6 +28,7 @@ Notation:
 from __future__ import annotations
 
 import math
+import warnings
 from dataclasses import dataclass
 
 import torch
@@ -91,6 +92,37 @@ class StageB1bConfig:
     # is the legacy value; a larger init (e.g. 1.0) makes an untrained from-none
     # rollout mean-reverting.
     tail_init: float = 1.0e-3
+    # Bath coupling convention.  This is the difference between a stable kernel
+    # and a divergent one; see "why" below.
+    #
+    #   "force" (legacy, default for old checkpoints):
+    #       mu_H = H + h*D*f + h*C*S,    S' = S + h*(C^T f - Gamma*S)
+    #     At the bath steady state S -> C^T f / Gamma, so the H drift becomes
+    #       h*(D + C Gamma^-1 C^T) * f
+    #     The added term is POSITIVE DEFINITE: the bath *amplifies* mobility
+    #     instead of providing friction.  It therefore adds a positive feedback
+    #     loop (larger |H| -> larger |f| -> larger |S| -> larger |H|).  Measured
+    #     on the 1000dom kernel: |C|_F/|D| = 4.2, i.e. a 15.4x mobility boost;
+    #     |H| per residue runs 11 -> 3,969 over 64 one-ns steps.
+    #
+    #   "velocity" (FDT-correct):
+    #       p  = f - C*S,                H' = H + h*D*p + sqrt(2hD) xi
+    #       S' = S - h*Gamma*S + C^T*dH + sqrt(2hGamma) xi_S
+    #     The bath is driven by the realised displacement dH rather than by the
+    #     force, so it is anti-correlated with (H - H0) and acts as genuine
+    #     friction; h*C*S is O(1) rather than O(|H|).  The fluctuation term is
+    #     placed on H (the conservative FDT placement when D is singular), which
+    #     keeps R = 2hD / W = 2hGamma exactly as the Kalman observer assumes.
+    #     Measured: |H| 11 -> 18 and a 6.27 per-residue step against a true 6.87.
+    # The default is "velocity": a checkpoint that predates this option carries
+    # "force" in its saved kernel_config and therefore still loads with its
+    # original (divergent) kernel, while every new run is stable by default.
+    bath_coupling: str = "velocity"
+    # Optional cap on the per-residue DRIFT norm |h*D*p| (latent units), applied
+    # before the noise is added.  A one-ns frame genuinely moves H by ~6.9 per
+    # residue, so a cap near 20 only ever fires on the runaway branch; it is a
+    # guard, not a model term.  None off.
+    max_step_norm: float | None = None
     # Truncated BPTT window (in rollout steps).  None keeps the full graph.
     # Long physical horizons need many steps: 64 ns is 64 steps at 1 ns/frame but
     # 640 at 100 ps/frame, and retaining the graph for all of them costs tens of
@@ -107,6 +139,23 @@ class StageB1bConfig:
         if self.max_gamma_step is not None:
             if not 0 < self.max_gamma_step < 2:
                 raise ValueError("max_gamma_step must lie strictly between 0 and 2")
+        if self.bath_coupling not in ("force", "velocity"):
+            raise ValueError(
+                f"bath_coupling must be 'force' or 'velocity', got {self.bath_coupling!r}")
+        if self.bath_coupling == "force":
+            # Old checkpoints carry this string in their saved kernel_config, so
+            # they keep their original kernel instead of silently changing
+            # behaviour.  That kernel diverges (|H| 11 -> 3,969 over 64 steps),
+            # so loading one is a reproducibility aid, not a viable model.
+            warnings.warn(
+                "bath_coupling='force' is the legacy, structurally divergent "
+                "kernel (the bath adds a positive-definite C*Gamma^-1*C^T "
+                "mobility boost instead of friction). It is retained only to "
+                "reproduce pre-2026-10-22 checkpoints; use 'velocity'.",
+                DeprecationWarning, stacklevel=2)
+        if self.max_step_norm is not None:
+            if not math.isfinite(self.max_step_norm) or self.max_step_norm <= 0:
+                raise ValueError("max_step_norm must be finite and positive")
 
     @property
     def use_bath(self) -> bool:
@@ -378,6 +427,14 @@ class StageB1b(nn.Module):
         self.bath = StaticBathParams(cfg)
         if cfg.use_bath:
             self.history_posterior = HistoryPosterior(cfg)
+        # Source of S_0 when an observed history is supplied to rollout:
+        #   'gru'   -- amortised history network (the historical default),
+        #   'exact' -- closed-form Kalman posterior (exact_bath_posterior),
+        #   'prior' -- unit-variance prior, i.e. ignore the history.
+        # Set per run by the trainer so a checkpoint stays self-describing via
+        # the recorded args; an unknown value is a hard error, never a silent
+        # fallback to a different model.
+        self.s0_mode = "gru"
 
     # -- Forces --------------------------------------------------------------
 
@@ -412,11 +469,171 @@ class StageB1b(nn.Module):
             mu = mu + h * torch.einsum("blij,blj->bli", C, m_or_S)
         return mu
 
+    # -- Versioned fixed-coefficient microstep sampler -----------------------
+
+    def _collective_velocity_step_fixed(
+        self, H, S, residue_mask, temperature_k, D, C, Gamma, dt,
+        generator=None, create_graph=False, noise_H=None, noise_S=None,
+        noise_factor=None,
+    ):
+        """One collective velocity step with anchor-fixed bath coefficients.
+
+        This is the primitive used by ``microstep_v1``.  D/C/Gamma are computed
+        once from the anchor feature for a physical macro path; only the force
+        is reevaluated at each microstate.  ``noise_H`` and ``noise_S`` are
+        standard-normal increments when supplied, which lets a refinement panel
+        aggregate the same fine Brownian path at 2/4/8 microsteps.
+        """
+        if self.cfg.bath_coupling != "velocity":
+            raise ValueError("microstep_v1 requires velocity bath coupling")
+        rmask = residue_mask.unsqueeze(-1).float()
+        if noise_H is None:
+            noise_H = torch.randn(H.shape, device=H.device, dtype=H.dtype, generator=generator)
+        if noise_factor is not None:
+            noise_H = torch.einsum("bij,bjd->bid", noise_factor, noise_H)
+        f = self.compute_forces(H, residue_mask, temperature_k, create_graph=create_graph)
+        p = f if (not self.cfg.use_bath or S is None) else f - torch.einsum(
+            "blij,blj->bli", C, S)
+        root_D = D.sqrt()
+        drive = root_D * p
+        if noise_factor is not None:
+            drive = torch.einsum("bij,bjd->bid", noise_factor.transpose(-1, -2), drive)
+            drive = torch.einsum("bij,bjd->bid", noise_factor, drive)
+        displacement = dt * root_D * drive + torch.sqrt(2.0 * dt * D) * noise_H
+        H_next = (H + displacement) * rmask
+        if not self.cfg.use_bath or S is None:
+            return H_next, None
+        if noise_S is None:
+            noise_S = torch.randn(S.shape, device=S.device, dtype=S.dtype, generator=generator)
+        S_next = S + torch.einsum("blij,bli->blj", C, displacement) \
+            - dt * Gamma * S + torch.sqrt(2.0 * dt * Gamma) * noise_S
+        return H_next, S_next * rmask
+
+    def rollout_microstep_v1(
+        self, H0, residue_mask, temperature_k, n_steps,
+        H_hist=None, dt_hist=None, seq_feature=None, generator=None,
+        S0=None, detach=True, return_bath=False, grad_steps=None,
+        noise_factor=None, collective_mobility=False, microsteps=1,
+        brownian_H=None, brownian_S=None, integrator="explicit",
+        solver_tolerance=1e-6, solver_max_iterations=128, microstate_trace=None,
+    ):
+        """Roll out fixed physical macro steps using ``microsteps`` substeps.
+
+        The macro observation interval remains ``cfg.step_ps``.  Bath
+        coefficients are anchor-conditioned and held fixed over the complete
+        path.  Optional Brownian tensors have shape
+        ``[B, n_steps, microsteps, L, d]`` and contain standard-normal
+        increments; callers can coarsen one fine path by summing and dividing
+        by the square root of the aggregation factor.  This path is opt-in and
+        does not alter the v1 Euler sampler.
+        """
+        if not collective_mobility:
+            raise ValueError("microstep_v1 requires collective_mobility=True")
+        if self.cfg.bath_coupling != "velocity":
+            raise ValueError("microstep_v1 requires velocity bath coupling")
+        if isinstance(microsteps, bool) or int(microsteps) != microsteps or microsteps < 1:
+            raise ValueError("microsteps must be a positive integer")
+        microsteps = int(microsteps)
+        if integrator not in ("explicit", "coupled_midpoint_v1"):
+            raise ValueError(f"unsupported microstep integrator: {integrator}")
+        if integrator == "coupled_midpoint_v1":
+            if not self.cfg.use_bath or self.cfg.force_clip is not None:
+                raise ValueError("coupled midpoint requires a bath and an unclipped energy force")
+        if seq_feature is None:
+            seq_feature = H0
+        B, L, dH = H0.shape
+        if brownian_H is not None:
+            expected = (B, int(n_steps), microsteps, L, dH)
+            if tuple(brownian_H.shape) != expected:
+                raise ValueError(f"brownian_H must have shape {expected}, got {tuple(brownian_H.shape)}")
+        if brownian_S is not None:
+            if not self.cfg.use_bath:
+                raise ValueError("brownian_S requires a bath")
+            expected = (B, int(n_steps), microsteps, L, self.cfg.bath_dim)
+            if tuple(brownian_S.shape) != expected:
+                raise ValueError(f"brownian_S must have shape {expected}, got {tuple(brownian_S.shape)}")
+
+        S = None
+        if self.cfg.use_bath:
+            if S0 is not None:
+                S = S0
+            elif H_hist is None:
+                dS = self.cfg.bath_dim
+                m0 = torch.zeros(B, L, dS, device=H0.device, dtype=H0.dtype)
+                chol0 = torch.eye(dS, device=H0.device, dtype=H0.dtype).expand(
+                    B, L, dS, dS).contiguous()
+                eps = torch.randn(m0.shape, device=H0.device, dtype=H0.dtype, generator=generator)
+                S = m0 + torch.einsum("blij,blj->bli", chol0, eps)
+            else:
+                m0, chol0 = self.initial_bath_state(
+                    H_hist, dt_hist, temperature_k, residue_mask,
+                    seq_feature=seq_feature)
+                eps = torch.randn(m0.shape, device=H0.device, dtype=H0.dtype, generator=generator)
+                S = m0 + torch.einsum("blij,blj->bli", chol0, eps)
+
+        # These are deliberately outside the time loop: mobility and coupling
+        # are fixed by the observed anchor for the entire physical path.
+        D, C, Gamma = self.bath(seq_feature, temperature_k)
+        dt = self.cfg.step_ps / microsteps
+        midpoint = None
+        if integrator == "coupled_midpoint_v1":
+            from protein_jepa_frame.models.lasp_midpoint import CoupledMidpoint
+            midpoint = CoupledMidpoint(
+                D, C, Gamma, F.softplus(self.energy.log_tail), residue_mask, dt,
+                noise_factor, solver_tolerance, solver_max_iterations)
+        traj = [H0]
+        bath_traj = [S] if S is not None else None
+        H = H0
+        for i in range(int(n_steps)):
+            for j in range(microsteps):
+                previous_H, previous_S = H, S
+                noise_H = None if brownian_H is None else brownian_H[:, i, j]
+                noise_S = None if brownian_S is None else brownian_S[:, i, j]
+                if midpoint is None:
+                    H, S = self._collective_velocity_step_fixed(
+                        H, S, residue_mask, temperature_k, D, C, Gamma, dt,
+                        generator=generator, create_graph=not detach,
+                        noise_H=noise_H, noise_S=noise_S, noise_factor=noise_factor,
+                    )
+                else:
+                    if noise_H is None:
+                        noise_H = torch.randn(H.shape, device=H.device, dtype=H.dtype, generator=generator)
+                    if noise_S is None:
+                        noise_S = torch.randn(S.shape, device=S.device, dtype=S.dtype, generator=generator)
+                    force = self.compute_forces(H, residue_mask, temperature_k, create_graph=not detach)
+                    H, S = midpoint.step(H, S, force, noise_H, noise_S)
+                if microstate_trace is not None:
+                    microstate_trace.append({
+                        "macro_step": i, "micro_step": j,
+                        "H_before": previous_H.detach().cpu(),
+                        "S_before": previous_S.detach().cpu() if previous_S is not None else None,
+                        "H_after": H.detach().cpu(),
+                        "S_after": S.detach().cpu() if S is not None else None,
+                        "solver": dict(midpoint.last_solve) if midpoint is not None else None,
+                    })
+            if not detach and grad_steps is not None and i < int(n_steps) - int(grad_steps):
+                H = H.detach()
+                if S is not None:
+                    S = S.detach()
+            traj.append(H)
+            if bath_traj is not None:
+                bath_traj.append(S)
+        out = torch.stack(traj, dim=1)
+        if detach:
+            out = out.detach()
+        if not return_bath:
+            return out
+        bath_out = torch.stack(bath_traj, dim=1) if bath_traj is not None else None
+        if detach and bath_out is not None:
+            bath_out = bath_out.detach()
+        return out, bath_out
+
     # -- Sampler (single-step Euler; identical train/deploy) -----------------
 
     def sample_step(
         self, H, S, residue_mask, temperature_k, seq_feature=None, generator=None,
         create_graph: bool = False,
+        noise_factor=None, collective_mobility: bool = False,
     ):
         """One Euler-Maruyama step of the GLE kernel (2.2).
 
@@ -429,9 +646,60 @@ class StageB1b(nn.Module):
             seq_feature = H
         D, C, Gamma = self.bath(seq_feature, temperature_k)       # D [B,L,dH]
         f = self.compute_forces(H, residue_mask, temperature_k, create_graph=create_graph)
+        rmask = residue_mask.unsqueeze(-1).float()
+        noise_H = torch.randn(H.shape, device=H.device, dtype=H.dtype, generator=generator)
+        if noise_factor is not None:
+            # Experimental spatial covariance; this changes the sampler covariance
+            # and is not the block-diagonal Kalman/FDT model documented above.
+            noise_H = torch.einsum('bij,bjd->bid', noise_factor, noise_H)
+
+        if collective_mobility:
+            if cfg.bath_coupling != 'velocity':
+                raise ValueError('collective mobility requires velocity coupling')
+            # Conditional on the observed anchor, M = sqrt(D) K sqrt(D).
+            # The same M drives relaxation and fluctuations. With E=U+|S|²/2,
+            # the joint mobility is [[M,MC],[C^T M,Gamma+C^T M C]].
+            # It is PSD by factorization [I;C^T] M [I,C]+diag(0,Gamma).
+            p = f if (not cfg.use_bath or S is None) else f-torch.einsum('blij,blj->bli',C,S)
+            root_D=D.sqrt()
+            drive=root_D*p
+            if noise_factor is not None:
+                drive=torch.einsum('bij,bjd->bid',noise_factor.transpose(-1,-2),drive)
+                drive=torch.einsum('bij,bjd->bid',noise_factor,drive)
+            drift=h*root_D*drive
+            displacement=drift+torch.sqrt(2*h*D)*noise_H
+            H_next=(H+displacement)*rmask
+            if not cfg.use_bath or S is None:
+                return H_next,None
+            noise_S=torch.randn(S.shape,device=S.device,dtype=S.dtype,generator=generator)
+            # Shared displacement includes the H noise and the compensating
+            # friction C^T M C S; independent bath noise adds 2h Gamma.
+            S_next=S+torch.einsum('blij,bli->blj',C,displacement)-h*Gamma*S+torch.sqrt(2*h*Gamma)*noise_S
+            return H_next,S_next*rmask
+
+        if cfg.bath_coupling == "velocity":
+            # FDT-correct bath: driven by the realised displacement, so it is
+            # anti-correlated with (H - H0) and damps rather than amplifies.
+            p = f if (not cfg.use_bath or S is None) else f - torch.einsum(
+                "blij,blj->bli", C, S)                            # [B,L,dH]
+            dH = h * D * p
+            if cfg.max_step_norm is not None:
+                n = dH.norm(dim=-1, keepdim=True).clamp_min(1e-12)
+                dH = dH * (float(cfg.max_step_norm) / n).clamp(max=1.0)
+            H_next = (H + dH + torch.sqrt(2.0 * h * D) * noise_H) * rmask
+            if not cfg.use_bath or S is None:
+                return H_next, None
+            CtD = torch.einsum("blij,bli->blj", C, dH)            # [B,L,dS]
+            noise_S = torch.randn(S.shape, device=S.device, dtype=S.dtype, generator=generator)
+            S_next = S + CtD - h * Gamma * S + torch.sqrt(2.0 * h * Gamma) * noise_S
+            return H_next, S_next * rmask
 
         mu_H = self._drift_H(H, f, D, C, S, h)
-        noise_H = torch.randn(mu_H.shape, device=H.device, dtype=H.dtype, generator=generator)
+        dH = mu_H - H
+        if cfg.max_step_norm is not None:
+            n = dH.norm(dim=-1, keepdim=True).clamp_min(1e-12)
+            dH = dH * (float(cfg.max_step_norm) / n).clamp(max=1.0)
+            mu_H = H + dH
         H_next = mu_H + torch.sqrt(2.0 * h * D) * noise_H
         H_next = H_next * residue_mask.unsqueeze(-1).float()
 
@@ -445,6 +713,138 @@ class StageB1b(nn.Module):
         S_next = mu_S + torch.sqrt(2.0 * h * Gamma) * noise_S
         S_next = S_next * residue_mask.unsqueeze(-1).float()
         return H_next, S_next
+
+    # -- Exact bath posterior under the sampler dynamics ---------------------
+
+    def exact_bath_posterior(
+        self, H_hist, dt_hist, temperature_k, residue_mask, seq_feature=None,
+        initial_mean=None, initial_var=None,
+    ):
+        """Exact p(S_0 | H_hist) as a Kalman filter over the sampler dynamics.
+
+        ``sample_step`` (collective mobility) evolves
+
+            H_{k+1} = H_k + h_k D_k (f_k - C_k S_k) + sqrt(2 h_k D_k) eps_H
+            S_{k+1} = S_k + C_k^T (H_{k+1} - H_k) - h_k Gamma_k S_k + sqrt(2 h_k Gamma_k) eps_S
+
+        Reading H_{k+1} as a (linear-Gaussian) observation of S_k,
+
+            z_k := dH_k - h_k D_k f_k = -h_k D_k C_k S_k + sqrt(2 h_k D_k) eps_H,
+
+        so the observation matrix is ``C_obs = -h D C`` with diagonal noise
+        ``R = 2 h D``.  A standard Kalman update followed by the sampler's own
+        time update yields the exact filtered posterior.  No amortised network
+        and no training signal are needed.
+
+        NOTE ON THE DRIVE-ONLY APPROXIMATION.  It is tempting to say that, since
+        the H noise is revealed by the observed increment, the update collapses
+        to
+
+            S_{k+1} = (1 - h Gamma) S_k + C^T dH_k + eta,   eta ~ N(0, 2 h Gamma),
+
+        with no Kalman gain.  That recursion propagates the MEAN correctly but it
+        is not the posterior: it ignores the fact that observing H_{k+1} also
+        CONSTRAINS S_k through the innovation (the information in z_k about S_k
+        is ``h D C / sqrt(2 h D)`` per step, not zero).  Measured on real
+        anchors, the drive-only mean disagrees with the exact filtered mean by
+        76-85 % even at the trained scale, so it is not used here.  It is kept
+        only as the ``mean_only`` branch below for diagnostics.
+
+        Args:
+          H_hist: [B, K, L, dH] observed history, oldest first, ending at H_0.
+          dt_hist: [B, K] interval in ps between frame k and k+1 (last unused).
+          seq_feature: [B, L, dH] anchor feature for the static bath params.
+            Defaults to H_hist[:, -1], which is the rollout anchor.
+
+        Returns:
+          (m0, chol0) with shapes [B, L, dS] and [B, L, dS, dS]; chol0 is lower
+          triangular, so ``m0 + chol0 @ eps`` samples the posterior.
+        """
+        cfg = self.cfg
+        dS = cfg.bath_dim
+        B, K, L, d = H_hist.shape
+        if dt_hist.shape != (B, K):
+            raise ValueError("dt_hist must be [B, K] matching H_hist")
+        if not dt_hist[:, :K - 1].gt(0).all():
+            raise ValueError("history intervals must be positive")
+        device, dtype = H_hist.device, H_hist.dtype
+        if seq_feature is None:
+            seq_feature = H_hist[:, -1]
+        D, C, Gamma = self.bath(seq_feature, temperature_k)       # [B,L,*]
+        if C is None:
+            raise ValueError("exact_bath_posterior requires a bath")
+
+        # Prior: S is unknown at the oldest frame, so start from unit variance.
+        m = (torch.zeros(B, L, dS, device=device, dtype=dtype)
+             if initial_mean is None else initial_mean.expand(B, L, dS))
+        P = (torch.eye(dS, device=device, dtype=dtype).expand(B, L, dS, dS).clone()
+             if initial_var is None
+             else torch.diag_embed(initial_var.expand(B, L, dS)))
+
+        for k in range(K - 1):
+            h_k = dt_hist[:, k].view(B, 1, 1).to(dtype)           # [B,1,1]
+            dH = H_hist[:, k + 1] - H_hist[:, k]                  # [B,L,dH]
+            Hk = H_hist[:, k]
+            f = self.compute_forces(Hk, residue_mask, temperature_k, create_graph=False)
+
+            # Observation: z = dH - h D f = C_obs S + noise, C_obs = -h D C.
+            # h_k is [B,1,1]; promote to [B,1,1,1] to broadcast against C's 4D.
+            R = 2.0 * h_k * D                                     # [B,L,dH]
+            B_h = h_k.unsqueeze(-1) * D.unsqueeze(-1) * C         # [B,L,dH,dS]
+            z = dH - h_k * D * f                                  # [B,L,dH]
+            # Innovation for the current S estimate: e = z - C_obs m = z + B_h m.
+            e = z + torch.einsum("blij,blj->bli", B_h, m)         # [B,L,dH]
+            V = torch.diag_embed(R) + B_h @ P @ B_h.transpose(-1, -2)
+            V = 0.5 * (V + V.transpose(-1, -2))
+            # K = P C_obs^T V^-1 = -P B_h^T V^-1
+            Pbt = P @ B_h.transpose(-1, -2)                        # [B,L,dS,dH]
+            K = -torch.linalg.solve(V, Pbt.transpose(-1, -2)).transpose(-1, -2)
+            m_plus = m + torch.einsum("blsk,blk->bls", K, e)
+            # Joseph form; K C_obs = -K B_h.
+            KC = -torch.einsum("blsk,blkt->blst", K, B_h)
+            ImKC = torch.eye(dS, device=device, dtype=dtype) - KC
+            P_plus = ImKC @ P @ ImKC.transpose(-1, -2) \
+                + torch.einsum("blsk,blk,bltk->blst", K, R, K)
+            P_plus = 0.5 * (P_plus + P_plus.transpose(-1, -2))
+
+            # Sampler time update: S' = (1 - h Gamma) S + C^T dH + sqrt(2hG) eta.
+            a = 1.0 - h_k * Gamma
+            m = a * m_plus + torch.einsum("blij,bli->blj", C, dH)
+            Am = torch.diag_embed(a)
+            P = Am @ P_plus @ Am.transpose(-1, -2) + torch.diag_embed(2.0 * h_k * Gamma)
+            P = 0.5 * (P + P.transpose(-1, -2))
+
+        chol = torch.linalg.cholesky(P + cfg.jitter * torch.eye(
+            dS, device=device, dtype=dtype))
+        rm = residue_mask.unsqueeze(-1).to(dtype)
+        return m * rm, chol * rm.unsqueeze(-1)
+
+    def initial_bath_state(
+        self, H_hist, dt_hist, temperature_k, residue_mask, seq_feature=None,
+    ):
+        """Return (m_0, chol_0) for the bath prior at the rollout anchor.
+
+        Dispatches on ``self.s0_mode`` so every rollout path (``rollout`` and
+        ``rollout_microstep_v1``) shares one definition:
+
+          'gru'   -- amortised history network (historical default),
+          'exact' -- closed-form Kalman posterior (exact_bath_posterior),
+          'prior' -- unit-variance prior, history ignored.
+        """
+        mode = getattr(self, "s0_mode", "gru")
+        if mode == "exact":
+            return self.exact_bath_posterior(
+                H_hist, dt_hist, temperature_k, residue_mask, seq_feature=seq_feature)
+        if mode == "gru":
+            return self.history_posterior(H_hist, dt_hist, temperature_k, residue_mask)
+        if mode == "prior":
+            B, L = residue_mask.shape
+            dS = self.cfg.bath_dim
+            m0 = torch.zeros(B, L, dS, device=H_hist.device, dtype=H_hist.dtype)
+            chol0 = torch.eye(dS, device=H_hist.device,
+                              dtype=H_hist.dtype).expand(B, L, dS, dS).contiguous()
+            return m0, chol0
+        raise ValueError(f"unknown s0_mode {mode!r}")
 
     # -- Diagnostic Kalman innovation NLL; never optimized by the trainer ---
 
@@ -507,11 +907,15 @@ class StageB1b(nn.Module):
             return total_nll
 
         dS = cfg.bath_dim
-        # Linear-Gaussian bath recursion coefficients (per residue):
-        #   A = I - h*Gamma (diagonal),  W = 2 h Gamma (diagonal),  u_n = h C^T f
+        # Linear-Gaussian bath recursion coefficients, matched to sample_step.
+        # The sampler's mean is H + h*D*(f - C S), so the mean effect of S on H
+        # is B_k = h*D*C and NOT h*C.  The old h*C form omitted the mobility D,
+        # which made the diagnostic prediction of the bath's influence wrong by
+        # a factor 1/D (~5e4) and let a regime pass as "calibrated" that was in
+        # fact inert in the deployed kernel.
         A_diag = 1.0 - h * Gamma                                  # [B,L,dS]
         W_diag = 2.0 * h * Gamma                                  # [B,L,dS]
-        B_h = h * C                                               # [B,L,dH,dS]
+        B_h = h * D.unsqueeze(-1) * C                             # [B,L,dH,dS]
         if not torch.isfinite(R).all() or not (R > 0).all():
             raise FloatingPointError("diagnostic likelihood needs finite positive transition diffusion")
         I_dS = torch.eye(dS, device=device, dtype=dtype).expand(B, L, dS, dS)
@@ -528,8 +932,11 @@ class StageB1b(nn.Module):
             Hn, Hn1 = H_seq[:, n], H_seq[:, n + 1]
             f = self.compute_forces(Hn, residue_mask, temperature_k, create_graph=True)
 
-            # Predicted mean of H: mu = H + hDf + h C m_n
-            mu = Hn + h * D * f + torch.einsum("blij,blj->bli", B_h, m_n)
+            # Predicted mean of H, matching sample_step's `f - C S`: the bath
+            # opposes the energy drift, so the coupling enters with a MINUS.
+            # The previous version added it, which inverted the bath's mean
+            # effect and made this likelihood unable to score the deployed model.
+            mu = Hn + h * D * f - torch.einsum("blij,blj->bli", B_h, m_n)
             e = Hn1 - mu                                          # [B,L,dH]
 
             # V = diag(R) + F F^T, F = B_h chol(P). All solves and
@@ -575,19 +982,38 @@ class StageB1b(nn.Module):
                 innov_whitened.append(ev.detach())
 
             # Joseph covariance update of the bath posterior.
-            # K = P B_h^T V^-1   [B,L,dS,dH]
-            # cholesky_solve(X, L) solves L L^T K = X; X must be [B,L,dH,*]
+            # Observation model: dH_n - h*D*f_n = -B_h S_n + noise, so the
+            # effective observation matrix is C_obs = -B_h (NOT +B_h).  The
+            # Kalman gain therefore carries a MINUS:
+            #   K = P C_obs^T V^-1 = -P B_h^T V^-1.
+            # The covariance form is unchanged by that sign, because Joseph
+            # uses K C_obs = (-P B_h^T V^-1)(-B_h) = P B_h^T V^-1 B_h, in which
+            # the two negatives cancel.  The MEAN update, however, is signed:
+            # adding +K e here instead of -K e propagated the bath posterior in
+            # the wrong direction and made this likelihood disagree with the
+            # exact joint Gaussian.
+            #
+            # Vinv_Bh = V^-1 B_h  [B,L,dH,dS]
             Vinv_Bh = solve_innovation(B_h)
-            K = torch.einsum("blsi,blij->blsj", P_n, Vinv_Bh.transpose(-1, -2))  # [B,L,dS,dH]
+            K = -torch.einsum("blsi,blij->blsj", P_n, Vinv_Bh.transpose(-1, -2))  # [B,L,dS,dH]
             m_plus = m_n + torch.einsum("blsk,blk->bls", K, e)   # [B,L,dS]
-            KB = torch.einsum("blsk,blkt->blst", K, B_h)         # [B,L,dS,dS]
+            # Joseph form uses K C_obs with C_obs = -B_h.  With the signed gain
+            # above, K C_obs = -(K B_h), so negate to keep the covariance
+            # identical to the previously-correct (unsigned-gain) version.
+            KB = -torch.einsum("blsk,blkt->blst", K, B_h)       # [B,L,dS,dS] = K C_obs
             ImKB = I_dS - KB
             P_plus = ImKB @ P_n @ ImKB.transpose(-1, -2) \
                    + torch.einsum("blsk,blk,bltk->blst", K, R, K)  # K R K^T (R diagonal)
             P_plus = 0.5 * (P_plus + P_plus.transpose(-1, -2))
 
-            # Bath time update: m_{n+1}=A m_plus + u_n, P_{n+1}=A P_plus A^T + W
-            u_n = h * torch.einsum("blij,bli->blj", C, f)        # [B,L,dS]
+            # Bath time update.  Under sample_step the S increment is
+            #   C^T dH - h Gamma S + sqrt(2 h Gamma) eps_S.
+            # Conditioning on the observed transition removes the H noise from
+            # S entirely (eps_H is revealed by dH), so the exact recursion is
+            #   S_{n+1} = (1 - h Gamma) S_n + C^T (H_{n+1} - H_n) + sqrt(2hG) eps_S.
+            # Using the observed increment here is the filtering update, not a
+            # second use of the observation.
+            u_n = torch.einsum("blij,bli->blj", C, Hn1 - Hn)     # [B,L,dS]
             m_n = A_diag * m_plus + u_n
             A_mat = torch.diag_embed(A_diag)
             P_n = A_mat @ P_plus @ A_mat.transpose(-1, -2) + torch.diag_embed(W_diag)
@@ -611,6 +1037,7 @@ class StageB1b(nn.Module):
         S0=None, detach: bool = True,
         return_bath: bool = False,
         grad_steps: int | None = None,
+        noise_factor=None, collective_mobility: bool = False,
     ):
         """Rollout from H0 for n_steps.
 
@@ -645,7 +1072,9 @@ class StageB1b(nn.Module):
                     chol0 = torch.eye(dS, device=H0.device, dtype=H0.dtype).expand(
                         H0.shape[0], H0.shape[1], dS, dS).contiguous()
                 else:
-                    m0, chol0 = self.history_posterior(H_hist, dt_hist, temperature_k, residue_mask)
+                    m0, chol0 = self.initial_bath_state(
+                        H_hist, dt_hist, temperature_k, residue_mask,
+                        seq_feature=seq_feature)
                 eps = torch.randn(m0.shape, device=H0.device, dtype=H0.dtype, generator=generator)
                 S = m0 + torch.einsum("blij,blj->bli", chol0, eps)
 
@@ -655,7 +1084,7 @@ class StageB1b(nn.Module):
         for i in range(n_steps):
             H, S = self.sample_step(
                 H, S, residue_mask, temperature_k, seq_feature, generator,
-                create_graph=not detach,
+                create_graph=not detach, noise_factor=noise_factor, collective_mobility=collective_mobility,
             )
             # Truncated BPTT aimed at the scored horizon: the losses of interest
             # live at the END of the rollout, so we keep the last `grad_steps`

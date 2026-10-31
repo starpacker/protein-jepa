@@ -36,7 +36,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import time
+from collections import defaultdict
 from dataclasses import replace
 from pathlib import Path
 
@@ -69,6 +71,14 @@ def parse_args(argv=None):
     p.add_argument("--b1a-ckpt", required=True)
     p.add_argument("--output", default="artifacts/stage_hs_run")
     p.add_argument("--resume", default=None)
+    p.add_argument("--init-from", default=None,
+                   help="Warm start all saved model weights with a fresh optimizer and step counter.")
+    p.add_argument("--history-conditioning", action="store_true",
+                   help="Initialize the GLE bath from encoded observed history and physical dt.")
+    p.add_argument("--path-ensemble", action="store_true",
+                   help="Match pooled decoded rollout to the same contiguous true path.")
+    p.add_argument("--contact-temperature", type=float, default=0.5,
+                   help="Soft-contact width in Angstrom; 0 reproduces historical hard contacts.")
     p.add_argument("--device", default="auto")
     p.add_argument("--torch-threads", type=int, default=4)
     p.add_argument("--seed", type=int, default=42)
@@ -97,6 +107,23 @@ def parse_args(argv=None):
     p.add_argument("--contact-weight", type=float, default=10.0)
     p.add_argument("--dist-weight", type=float, default=0.3)
     p.add_argument("--pos-weight", type=float, default=0.0)
+    p.add_argument("--roundtrip-weight", type=float, default=0.0,
+                   help="Weight of the decoder reconstruction term: Enc(true future "
+                        "frame) -> Decoder -> CA vs the true CA. Supervises the H->CA "
+                        "map directly on ground-truth conformations, which is where the "
+                        "mean-collapse ceiling lives. Requires --train-decoder (and "
+                        "--train-encoder if the encoder should adapt too). This is NOT "
+                        "--dense-trajectory: the GLE rollout is left untouched, so "
+                        "ensemble spread is not suppressed.")
+    p.add_argument("--roundtrip-frames", type=int, default=1,
+                   help="Evenly spaced true future frames used per round-trip step "
+                        "(1 = terminal frame only; 2-4 = more of the horizon).")
+    p.add_argument("--ens-rmsf-corr-weight", type=float, default=0.0,
+                   help="Weight on the RMSF-PROFILE-CORRELATION (RMSF-r) loss added on "
+                        "top of the terminal ensemble loss.  The default rmsf loss only "
+                        "matches the RMSF MAGNITUDE; RMSF-r is the SHAPE of the flexibility "
+                        "profile and is the metric bioemu2 currently wins (see report §3.9). "
+                        "0 disables (current Lasp contract).")
     p.add_argument("--cutoff", type=float, default=8.0)
     p.add_argument("--dist-lo", type=float, default=0.0)
     p.add_argument("--dist-hi", type=float, default=20.0)
@@ -117,7 +144,20 @@ def parse_args(argv=None):
     p.add_argument("--gamma-scale", type=float, default=2e-4)
     p.add_argument("--gamma-floor", type=float, default=2e-5)
     p.add_argument("--max-gamma-step", type=float, default=1.9)
-    p.add_argument("--force-clip", type=float, default=1.0)
+    # The old default was 1.0, which clipped a force whose measured per-residue
+    # magnitude is ~7.2, i.e. ~85% of the force was saturated.  That clamp was
+    # only ever papering over the legacy bath's blow-up; with --bath-coupling
+    # velocity the kernel is stable without it, and unclipped is measurably
+    # closer to the true 1 ns step (6.54 vs 6.37) and keeps |H| on the anchor
+    # manifold (11.3 -> 11.7 over 64 steps, vs 11.3 -> 17.6 clipped).
+    p.add_argument("--force-clip", type=float, default=None)
+    # Bath convention.  "force" is the legacy divergence-prone kernel
+    # (mu_H = H + h*D*f + h*C*S  =>  mobility D + C*Gamma^-1*C^T > D);
+    # "velocity" is FDT-correct and is what new runs must use.
+    p.add_argument("--bath-coupling", choices=["force", "velocity"], default="velocity")
+    # Guard on the per-residue step |dH| in latent units.  A real one-ns frame
+    # moves H by ~6.9/residue, so 20 never fires on a healthy rollout.
+    p.add_argument("--max-step-norm", type=float, default=20.0)
     p.add_argument("--tail-init", type=float, default=1.0)
     p.add_argument("--step-ps", type=float, default=1000.0)
     # rollout length in frames (how far the GLE is iterated before decoding)
@@ -137,6 +177,15 @@ def parse_args(argv=None):
                         "letting the rollout shape it, rather than relearning H from scratch.")
     p.add_argument("--encoder-lr-scale", type=float, default=0.1,
                    help="LR multiplier for the encoder group when --train-encoder is set.")
+    p.add_argument("--train-decoder", action="store_true", default=False,
+                   help="Also unfreeze the B1a anchored decoder at a low LR.  Default off == "
+                        "decoder frozen (the exact Model-1 contract: H->CA map preserved).  "
+                        "Turn this on to test whether joint adaptation of the decode map helps "
+                        "the rollout-fit ensemble metrics -- the frozen decoder is a real "
+                        "bottleneck, but unfreezing risks Model 1's fidelity, so ALWAYS keep a "
+                        "frozen-decoder control alongside an unfrozen run.")
+    p.add_argument("--decoder-lr-scale", type=float, default=0.1,
+                   help="LR multiplier for the decoder group when --train-decoder is set.")
     # --- Dense trajectory supervision: score EVERY rollout frame, not just the last ---
     p.add_argument("--dense-trajectory", action="store_true", default=False,
                    help="Score the WHOLE GLE rollout path (all n+1 frames) against the true "
@@ -162,10 +211,64 @@ def parse_args(argv=None):
                    help="Weight on the ensemble-RMSF-profile-correlation loss along the path.")
     p.add_argument("--dense-var-weight", type=float, default=0.0,
                    help="Weight on the ensemble-variance loss along the path.")
+    # --- Trajectory-level supervision (terminal-anchored + path distribution) ---
+    # Different from --dense-trajectory: the primary terminal ensemble loss is
+    # KEPT and trajectory-level *distributional* terms are ADDED on the decoded
+    # path.  We deliberately do NOT re-introduce the dense per-step Kabsch point
+    # loss (that made things worse, see PROJECT_REPORT §10.2): pushing the model
+    # toward the single true frame per step suppresses the stochastic spread.
+    # Uses the SAME contiguous loader as --dense-trajectory (exact step i <-> frame i).
+    p.add_argument("--traj-loss", action="store_true", default=False,
+                   help="Add order-aware trajectory-level distributional losses on the "
+                        "GLE rollout path (path energy score + walk RMSF-corr), on top of "
+                        "the terminal ensemble loss.  Use WITH the contiguous window "
+                        "(set --paired-horizons-frames == --rollout-steps and pass "
+                        "--use-contiguous-window).")
+    p.add_argument("--use-contiguous-window", action="store_true", default=False,
+                   help="Load the CONTIGUOUS future window [anchor,t1..tH] (K+H clip) so "
+                        "rollout step i lines up with truth frame i; required by "
+                        "--traj-loss (and implied by --dense-trajectory).")
+    p.add_argument("--traj-es-weight", type=float, default=0.1,
+                   help="Weight on the trajectory energy score (path distance-marginal "
+                        "energy score over the pooled future frames).")
+    p.add_argument("--traj-rmsf-corr-weight", type=float, default=0.5,
+                   help="Weight on the walk RMSF-profile correlation (predicted chain "
+                        "flexibility from the pooled path vs the true pool).")
+    p.add_argument("--traj-rmsf-weight", type=float, default=0.0,
+                   help="Weight on the walk RMSF magnitude (L1 on pooled-path RMSF).")
+    p.add_argument("--traj-var-weight", type=float, default=0.0,
+                   help="Weight on the walk ensemble-variance loss (pooled path).")
+    p.add_argument("--traj-anchor-loss", action="store_true", default=False,
+                   help="Additionally penalise the rollout's step-0 (anchor replay) drift, "
+                        "i.e. decode H_traj[:,0] and require it to equal the real anchor.")
+    p.add_argument("--traj-stride", type=int, default=1,
+                   help="With --traj-loss, decode/supervise every k-th rollout frame "
+                        "(1 = all; raise it to bound memory at long horizons).")
     # truncated BPTT: keep only the last k transitions differentiable
     p.add_argument("--rollout-grad-steps", type=int, default=None)
+    # --- Multi-horizon terminal training ---
+    # Lasp (single-horizon H) matches Model 1 and beats it almost everywhere, but
+    # at long horizons it OVER-disperses relative to bioemu2 because the GLE was
+    # only ever fit to land on one window length.  Training the SAME terminal
+    # ensemble objective at several horizons (with truncated BPTT so the long
+    # rollouts stay in memory) lets the kernel learn a horizon-dependent rate.
+    p.add_argument("--multi-horizon", action="store_true", default=False,
+                   help="Sample a horizon per batch from --paired-horizons-frames and train "
+                        "the terminal ensemble loss at THAT horizon (rollout_steps := h). "
+                        "Batches are horizon-homogeneous.  Combine with --rollout-grad-steps "
+                        "to truncate BPTT at long horizons.")
+    p.add_argument("--multi-horizon-max-grad", type=int, default=None,
+                   help="With --multi-horizon, horizons longer than this use truncated BPTT "
+                        "(grad_steps = this value); horizons at or below it keep the full "
+                        "graph.  None keeps the full graph at every horizon (memory-heavy).")
     p.add_argument("--temperature-k", type=float, default=320.0,
-                   help="static T used for the GLE kernel (mdCATH default)")
+                   help="static T used for the GLE kernel when "
+                        "--per-sample-temperature is off (mdCATH default)")
+    p.add_argument("--per-sample-temperature", action="store_true", default=False,
+                   help="Condition each sample on ITS OWN manifest temperature (320/348/"
+                        "379/413/450 K) instead of the single --temperature-k value. "
+                        "Without this, 4/5 of an mdCATH batch is mislabelled and the "
+                        "kernel learns to ignore the temperature input entirely.")
 
     p.add_argument("--val-batches", type=int, default=8)
     p.add_argument("--val-every", type=int, default=250)
@@ -191,18 +294,24 @@ class HSEnsembleProducer(nn.Module):
         X^{(n)}_CA  = Decoder(H^{(n)}_tau, anchor basis)      (frozen)
     """
 
-    def __init__(self, encoder, decoder, kernel: StageB1b, train_encoder: bool = False):
+    def __init__(self, encoder, decoder, kernel: StageB1b, train_encoder: bool = False,
+                 train_decoder: bool = False, history_conditioning: bool = False):
         super().__init__()
         self.encoder = encoder
         self.decoder = decoder
         self.kernel = kernel
+        self.history_conditioning = bool(history_conditioning)
         for p in self.encoder.parameters():
             p.requires_grad_(bool(train_encoder))
         for p in self.decoder.parameters():
-            p.requires_grad_(False)
+            p.requires_grad_(bool(train_decoder))
         # When the encoder is frozen we can (and should) run it under no_grad;
         # when it is fine-tuned we must keep the graph so the GLE losses reach it.
         self._encoder_grad = bool(train_encoder)
+        # Decoder grad is separate: this is the exact preserved branch that keeps
+        # the H->CA map intact.  When it is trainable the decode is differentiable
+        # (never wrapped in no_grad) and the decoder parameters join the optimizer.
+        self._decoder_grad = bool(train_decoder)
 
     def encode_frame(self, coords, residue_mask, aatype, residue_index, chain_id):
         c5 = coords.unsqueeze(1)
@@ -217,15 +326,51 @@ class HSEnsembleProducer(nn.Module):
     def sample_future_ca(
         self, context_coords, residue_mask, aatype, residue_index, chain_id,
         R_anchor, t_anchor, n_samples: int, generator=None, cond=None,
-        temperature_k: float | None = None,
+        temperature_k=None, context_time_ps=None,
     ) -> dict:
+        """Sample ``n_samples`` future CA clouds per batch element.
+
+        ``temperature_k`` may be a SCALAR, a per-sample tensor/list of shape [B],
+        or None.  Per-sample is what training and evaluation must use: mdCATH
+        spans 320-450 K, and collapsing that axis to one constant both mislabels
+        4/5 of the data and teaches the kernel to ignore the conditioning input.
+        """
         B, K, L, _, _ = context_coords.shape
         device = context_coords.device
         anchor_coords = context_coords[:, -1]
         H_anchor = self.encode_frame(anchor_coords, residue_mask, aatype,
                                      residue_index, chain_id)             # [B,L,dH]
-        temp = torch.full((B,), float(temperature_k if temperature_k is not None else 320.0),
-                          device=device)
+        if temperature_k is None:
+            temp = torch.full((B,), 320.0, device=device)
+        else:
+            temp = torch.as_tensor(temperature_k, device=device, dtype=torch.float32)
+            if temp.dim() == 0:
+                temp = temp.expand(B)
+            elif temp.shape[0] == 1 and B != 1:
+                temp = temp.expand(B)
+            elif temp.shape[0] != B:
+                raise ValueError(
+                    f"temperature_k has {temp.shape[0]} entries for batch size {B}")
+            temp = temp.reshape(B)
+
+        flat_hist = flat_dt = None
+        if self.history_conditioning:
+            if context_time_ps is None:
+                raise ValueError("history conditioning requires observed context_time_ps")
+            times = torch.as_tensor(context_time_ps, device=device)
+            if times.shape != (B, K) or not torch.isfinite(times).all():
+                raise ValueError("context timestamps must be finite [B,K]")
+            intervals = times.diff(dim=1)
+            if K < 2 or not (intervals > 0).all():
+                raise ValueError("history conditioning requires at least two increasing timestamps")
+            dt = torch.cat((intervals[:, :1], intervals), dim=1)
+            hist = torch.stack([
+                self.encode_frame(context_coords[:, k], residue_mask, aatype,
+                                  residue_index, chain_id) for k in range(K - 1)
+            ] + [H_anchor], dim=1)
+            flat_hist = hist[:, None].expand(B, n_samples, K, L, hist.shape[-1]).reshape(
+                B * n_samples, K, L, hist.shape[-1])
+            flat_dt = dt[:, None].expand(B, n_samples, K).reshape(B * n_samples, K)
 
         # Roll out `n_samples` independent GLE trajectories in parallel.
         Hs = H_anchor[:, None].expand(B, n_samples, L, H_anchor.shape[-1])
@@ -234,14 +379,16 @@ class HSEnsembleProducer(nn.Module):
         flat_T = temp[:, None].expand(B, n_samples).reshape(B * n_samples)
         return self._rollout_decode(flat_H, flat_mask, flat_T, B, n_samples, L,
                                     R_anchor, t_anchor, aatype, residue_mask,
-                                    H_anchor, generator)
+                                    H_anchor, generator, flat_hist, flat_dt)
 
     def _rollout_decode(self, flat_H, flat_mask, flat_T, B, n_samples, L,
-                        R_anchor, t_anchor, aatype, residue_mask, H_anchor, generator):
+                        R_anchor, t_anchor, aatype, residue_mask, H_anchor, generator,
+                        H_hist=None, dt_hist=None):
         n_steps = getattr(self, "_rollout_steps", 1)
         grad_steps = getattr(self, "_rollout_grad_steps", None)
         traj = self.kernel.rollout(
             flat_H, flat_mask, flat_T, n_steps,
+            H_hist=H_hist, dt_hist=dt_hist,
             seq_feature=flat_H, generator=generator,
             detach=False, grad_steps=grad_steps,
         )                                                                 # [BN, n+1, L, dH]
@@ -279,9 +426,82 @@ def _build_kernel(args, device) -> StageB1b:
         c_init_std=args.c_init_std, gamma_scale=args.gamma_scale,
         gamma_floor=args.gamma_floor, max_gamma_step=args.max_gamma_step,
         force_clip=args.force_clip, tail_init=args.tail_init, step_ps=args.step_ps,
+        bath_coupling=args.bath_coupling, max_step_norm=args.max_step_norm,
         rollout_grad_steps=args.rollout_grad_steps,
     )
     return StageB1b(cfg).to(device)
+
+
+def _batch_temperature(paired, args, device):
+    """Per-sample temperature for the batch: [B] tensor, or the pinned scalar.
+
+    ``--temperature-k`` used to be fed to EVERY sample regardless of the
+    trajectory it came from, so a batch mixing 320 K and 450 K trajectories
+    trained the kernel on a single, wrong, conditioning value.  With
+    ``--per-sample-temperature`` each sample carries its own manifest value; the
+    flag stays opt-in so previously reported runs remain reproducible.
+    """
+    if not getattr(args, "per_sample_temperature", False):
+        return args.temperature_k
+    t = paired.get("temperature_k")
+    if t is None:
+        return args.temperature_k
+    t = torch.as_tensor(t, device=device, dtype=torch.float32).reshape(-1)
+    if not torch.isfinite(t).all() or (t <= 0).any():
+        raise ValueError("per-sample temperature has non-finite/non-positive entries")
+    return t
+
+
+def _roundtrip_loss(producer, paired, fut, fmask, R_a, t_a, aatype, args, device):
+    """Decoder reconstruction loss on TRUE conformations: Enc(X_t) -> Dec -> X_t.
+
+    Why this exists.  The end-to-end ensemble loss only ever asks the decoder to
+    reproduce the *terminal* cloud that the GLE rollout produced, so the decoder
+    is free to map a wide range of H onto nearly the same CA shape (mean
+    collapse).  Measured on the 1000dom checkpoint, encoding a TRUE future frame
+    and decoding it back recovers only 38-41 % of the true RMSF at 16-64 ns with
+    RMSF-r ~0.38-0.41 -- i.e. the H->CA map itself is the bottleneck, and it is
+    *worse* than the rollout it is supposed to render.
+
+    This term supervises that map directly on ground-truth conformations, so the
+    decoder must be sensitive to conformational differences in H.  Gradients go
+    to the decoder and (when unfrozen) to the encoder.
+
+    Deliberately NOT the same thing as ``--dense-trajectory``: that loss scored
+    every ROLLOUT step against truth and was reverted (§10.2 of the report)
+    because it suppressed ensemble spread by dragging samples onto one path.
+    Here the GLE rollout is untouched; only the static H->CA decoder is trained,
+    and its input is the true frame's own encoding.
+    """
+    weight = float(getattr(args, "roundtrip_weight", 0.0))
+    if weight <= 0.0:
+        return None
+    from protein_jepa_frame.training.train_stage_cb1b import weighted_ca_rmsd
+
+    # _run_batch's fmask is [B, T, L]; the encoder/decoder and weighted_ca_rmsd all
+    # want the single-frame [B, L] residue mask.
+    rmask = fmask[:, -1].bool() if fmask.dim() == 3 else fmask.bool()
+
+    B, T, L = fut.shape[0], fut.shape[1], fut.shape[2]
+    if T - 1 < 1:                      # need at least one non-anchor frame
+        return None
+    n_frames = max(1, int(getattr(args, "roundtrip_frames", 1)))
+    # Evenly spaced, deterministic coverage of the scored horizon (frame 0 is the
+    # anchor and is already exact by construction, so it is excluded).
+    steps = min(n_frames, T - 1)
+    idx = torch.linspace(1, T - 1, steps=steps).round().long().tolist()
+
+    ri = paired["future_residue_index"].to(device)
+    ci = paired["future_chain_id"].to(device)
+    total = fut.new_zeros(())
+    for i in idx:
+        frame = fut[:, i]                                   # [B,L,4,3]
+        H_true = producer.encode_frame(frame, rmask, aatype, ri, ci)   # [B,L,dH]
+        out = producer.decoder.decode_structure(H_true, aatype, R_a, t_a, rmask)
+        pred_ca = out["backbone_coords"][:, :, 1, :]        # [B,L,3]
+        true_ca = frame[:, :, 1, :]                         # [B,L,3]
+        total = total + weighted_ca_rmsd(pred_ca[None, :, None], true_ca[:, None], rmask)
+    return total / len(idx)
 
 
 def _run_batch(producer, paired, args, weights, device, generator=None):
@@ -298,9 +518,18 @@ def _run_batch(producer, paired, args, weights, device, generator=None):
     out = producer.sample_future_ca(
         ctx, ctx_mask, aatype, ri, ci, R_a, t_a,
         n_samples=args.n_samples, generator=generator,
-        temperature_k=args.temperature_k,
+        temperature_k=_batch_temperature(paired, args, device),
+        context_time_ps=paired.get("context_time_ps"),
     )
     ca = out["ca_samples"]
+    if getattr(args, "path_ensemble", False):
+        horizon = fut.shape[1] - 1
+        if horizon != out["n_steps"]:
+            raise ValueError("path ensemble requires a contiguous [anchor,...,horizon] target")
+        step_idx = torch.arange(horizon + 1, device=device)
+        path = _decode_path(producer, out["H_traj"], R_a, t_a, aatype,
+                            ctx_mask, ctx.shape[0], args.n_samples, ctx.shape[2], None, step_idx)
+        ca = path.flatten(1, 2)
     pred_hist = targets.dist_hist_from_ca(ca)
     true_hist = targets.dist_hist_true()
     bin_w = (targets.dist_hi - targets.dist_lo) / (targets.dist_bins - 1)
@@ -314,7 +543,46 @@ def _run_batch(producer, paired, args, weights, device, generator=None):
         targets.mask, bin_w, weights, cutoff=args.cutoff,
         true_ca_pos=true_ca_pos, pred_ca_pos=pred_ca_pos,
     )
+    # Optional RMSF-profile correlation term: the ensemble RMSF loss above matches
+    # only the per-residue RMSF MAGNITUDE; rmsf_corr (RMSF-r, the metric bioemu2
+    # wins) is the SHAPE of the flexibility profile.  ensemble_rmsf_corr_loss is a
+    # differentiable Pearson-r surrogate identical to the evaluator's definition.
+    w_rc = float(getattr(args, "ens_rmsf_corr_weight", 0.0))
+    if w_rc > 0.0:
+        from protein_jepa_frame.models.stage_b1b_fromnone.objectives import (
+            ensemble_rmsf_corr_loss)
+        if fut.shape[1] < 2:
+            raise ValueError("RMSF correlation requires multiple true frames")
+        true_window = fut[:, :, :, 1, :]
+        l_rc = ensemble_rmsf_corr_loss(ca.permute(1, 0, 2, 3).unsqueeze(2),
+                                       true_window, targets.mask)
+        comp = _MaxNose(comp, w_rc * l_rc, extra={"ens/rmsf_corr": l_rc})
+    # Decoder round-trip: Enc(true X_t) -> Dec -> X_t.  Removes the H->CA
+    # mean-collapse ceiling without touching the GLE rollout (see
+    # _roundtrip_loss for why this is not the reverted --dense-trajectory loss).
+    w_rt = float(getattr(args, "roundtrip_weight", 0.0))
+    if w_rt > 0.0:
+        l_rt = _roundtrip_loss(producer, paired, fut, fmask, R_a, t_a,
+                               aatype, args, device)
+        if l_rt is not None:
+            comp = _MaxNose(comp, w_rt * l_rt, extra={"ens/roundtrip": l_rt})
     return comp, targets, out
+
+
+class _MaxNose:
+    """Wrap an EnsembleLossComponents and add a term (keeping base logs)."""
+    def __init__(self, base, term, extra=None):
+        self._base = base
+        self.total = base.total + term
+        self._term = term
+        self._extra = extra or {}
+
+    def as_loggable_dict(self):
+        d = dict(self._base.as_loggable_dict())
+        for k, v in self._extra.items():
+            d[k] = float(v.detach())
+        d["ens/total"] = float(self.total.detach())
+        return d
 
 
 def _decode_path(producer, H_traj, R_anchor, t_anchor, aatype, residue_mask,
@@ -371,7 +639,8 @@ def _run_batch_dense(producer, paired, args, weights, device, generator=None):
     out = producer.sample_future_ca(
         ctx, ctx_mask, aatype, ri, ci, R_a, t_a,
         n_samples=args.n_samples, generator=generator,
-        temperature_k=args.temperature_k,
+        temperature_k=_batch_temperature(paired, args, device),
+        context_time_ps=paired.get("context_time_ps"),
     )
     H_traj = out["H_traj"]
     n_samples, L = args.n_samples, ctx.shape[2]
@@ -441,23 +710,127 @@ def _run_batch_dense(producer, paired, args, weights, device, generator=None):
     return _Comp(), None, out
 
 
+def _run_batch_traj(producer, paired, args, weights, device, generator=None):
+    """Terminal ensemble loss + trajectory-level distributional losses.
+
+    Kept: the proven terminal ensemble loss (``_run_batch``), which scores the
+    decoded terminal H_T cloud against the true future window -- this is what
+    makes the frozen/unfrozen Plan-A runs match Model 1 on the ensemble metrics.
+
+    Added: order-aware path terms on the WHOLE decoded rollout path, built from
+    the *distribution* along the path, NOT per-step point matching:
+      * ``traj energy score``  -- proper scoring rule on the predicted vs true
+        pool of future frames (spread + accuracy jointly);
+      * ``walk RMSF-corr / RMSF / var`` -- pooled-path flexibility profile.
+    This deliberately DROPS the dense per-step Kabsch point loss, which was shown
+    to hurt (PROJECT_REPORT §10.2): fitting each step to one true frame kills the
+    stochastic spread the ensemble metrics reward.
+    """
+    from protein_jepa_frame.models.stage_b1b_fromnone.objectives import (
+        ensemble_rmsf_loss, ensemble_rmsf_corr_loss, ensemble_variance_loss,
+        energy_score,
+    )
+    from protein_jepa_frame.training.train_stage_cb1b import weighted_ca_rmsd
+    # --- (1) terminal ensemble loss (exactly _run_batch) ---
+    comp_term, targets, out = _run_batch(producer, paired, args, weights, device, generator)
+    total = comp_term.total
+
+    # --- (2) trajectory-level distributional losses on the decoded path ---
+    fut = paired["future_coords"].to(device)                 # [B, H+1, L, 4, 3] contiguous
+    fmask = paired["future_residue_mask"].to(device)[:, -1].bool()   # [B, L]
+    ctx = paired["context_coords"].to(device)
+    ctx_mask = paired["context_residue_mask"].to(device)[:, -1]
+    aatype = paired["future_aatype"].to(device)
+    ri = paired["future_residue_index"].to(device)
+    ci = paired["future_chain_id"].to(device)
+    R_a, t_a = _anchors(paired, device)
+    B, L = ctx.shape[0], ctx.shape[2]
+    M = args.n_samples
+    H_traj = out["H_traj"]
+    n_steps = out["n_steps"]
+    horizon = fut.shape[1] - 1
+    if n_steps != horizon:
+        raise ValueError(f"--traj-loss needs rollout_steps == future horizon; got "
+                         f"rollout_steps={n_steps}, window={horizon}.")
+    step_idx = torch.arange(0, n_steps + 1, max(1, args.traj_stride), device=device)
+    ca_path = _decode_path(producer, H_traj, R_a, t_a, aatype, ctx_mask,
+                           B, M, L, None, step_idx)          # [B, M, T, L, 3]
+    ca_flat = ca_path.permute(1, 0, 2, 3, 4).contiguous()    # [M, B, T, L, 3]
+    true_path = fut[:, step_idx, :, 1, :]                    # [B, T, L, 3]
+
+    # pooled-path terms (M>=2, T>=2)
+    l_es = l_rc = l_rf = l_var = l_anchor = ca_flat.new_zeros(())
+    if ca_flat.shape[0] >= 2 and ca_flat.shape[2] >= 2:
+        if args.traj_es_weight > 0:
+            # Energy score of the pooled CA cloud (all path frames together) vs the
+            # true future window cloud -- same proper scoring rule as the ensemble
+            # trainer, but over the whole trajectory rather than the terminal frame.
+            pooled_pred = ca_flat.permute(0, 1, 2, 3, 4)          # [M,B,T,L,3]
+            rows = []
+            for b in range(B):
+                mb = fmask[b]
+                smp = pooled_pred[:, b][:, :, mb, :].reshape(M, -1)   # [M, T*Lv*3]
+                tgt = true_path[b][:, mb, :].reshape(-1)              # [T*Lv*3]
+                rows.append(energy_score(smp, tgt) / (tgt.numel() ** 0.5))
+            l_es = torch.stack(rows).mean()
+        if args.traj_rmsf_corr_weight > 0:
+            l_rc = ensemble_rmsf_corr_loss(ca_flat, true_path, fmask)
+        if args.traj_rmsf_weight > 0:
+            l_rf = ensemble_rmsf_loss(ca_flat, true_path, fmask)
+        if args.traj_var_weight > 0:
+            l_var = ensemble_variance_loss(ca_flat, true_path, fmask)
+    if args.traj_anchor_loss:
+        anchor_true = ctx[:, -1, :, 1, :]                     # [B, L, 3]
+        # ca_path[:, :, 0] is [B, M, L, 3]; weighted_ca_rmsd wants [M, B, T, L, 3].
+        ca_anchor = ca_path[:, :, 0].permute(1, 0, 2, 3).unsqueeze(2)   # [M,B,1,L,3]
+        l_anchor = weighted_ca_rmsd(ca_anchor, anchor_true[:, None], fmask)
+
+    total = (total
+             + args.traj_es_weight * l_es
+             + args.traj_rmsf_corr_weight * l_rc
+             + args.traj_rmsf_weight * l_rf
+             + args.traj_var_weight * l_var
+             + (1.0 if args.traj_anchor_loss else 0.0) * l_anchor)
+
+    class _Comp:
+        def __init__(self, base):
+            self.total = total
+            self._base = base
+        def as_loggable_dict(self):
+            d = dict(self._base.as_loggable_dict())
+            d["ens/total"] = float(total.detach())
+            d["traj/es"] = float(l_es.detach())
+            d["traj/rmsf_corr"] = float(l_rc.detach())
+            d["traj/rmsf"] = float(l_rf.detach())
+            d["traj/var"] = float(l_var.detach())
+            d["traj/anchor"] = float(l_anchor.detach())
+            return d
+    return _Comp(comp_term), targets, out
+
+
 @torch.no_grad()
 def _validate(producer, loader, args, weights, device, max_batches):
     producer.eval()
     from collections import defaultdict
     agg = defaultdict(float); pers = defaultdict(float); n = 0
     dense = bool(getattr(args, "dense_trajectory", False))
+    traj = bool(getattr(args, "traj_loss", False))
+    val_generator = torch.Generator(device=device).manual_seed(args.seed + 100003)
     for i, batch in enumerate(loader):
         if i >= max_batches:
             break
         paired = _move_batch(batch, device)
         if dense:
-            comp, _, _ = _run_batch_dense(producer, paired, args, weights, device)
+            comp, _, _ = _run_batch_dense(producer, paired, args, weights, device, generator=val_generator)
+        elif traj:
+            comp, _, _ = _run_batch_traj(producer, paired, args, weights, device, generator=val_generator)
         else:
-            comp, _, _ = _run_batch(producer, paired, args, weights, device)
+            comp, _, _ = _run_batch(producer, paired, args, weights, device, generator=val_generator)
         for k, v in comp.as_loggable_dict().items():
             agg[k] += v
         if not dense:
+            # persistence reference: fine here for BOTH _run_batch and _run_batch_traj
+            # (they read the same paired["context_*"]/["future_*"] keys).
             ctx = paired["context_coords"].to(device)
             pmask = paired["context_residue_mask"].to(device)
             pca = persistence_ensemble(ctx, args.n_samples, pmask)
@@ -465,9 +838,17 @@ def _validate(producer, loader, args, weights, device, max_batches):
             phist = targets.dist_hist_from_ca(pca)
             thist = targets.dist_hist_true()
             bin_w = (targets.dist_hi - targets.dist_lo) / (targets.dist_bins - 1)
-            pcomp = compute_ensemble_loss(
-                pca, targets.rmsf, targets.contact, phist, thist,
-                targets.mask, bin_w, weights, cutoff=args.cutoff)
+            # The persistence baseline has no predicted structure to guide, so
+            # score it with the same weights minus the atom-position term;
+            # otherwise pos_weight>0 makes the *diagnostic* raise.
+            pw = weights.pos_weight
+            weights.pos_weight = 0.0
+            try:
+                pcomp = compute_ensemble_loss(
+                    pca, targets.rmsf, targets.contact, phist, thist,
+                    targets.mask, bin_w, weights, cutoff=args.cutoff)
+            finally:
+                weights.pos_weight = pw
             for k, v in pcomp.as_loggable_dict().items():
                 pers[k] += v
         n += 1
@@ -475,7 +856,94 @@ def _validate(producer, loader, args, weights, device, max_batches):
         return {}
     out = {f"val/{k}": v / n for k, v in agg.items()}
     out.update({f"val_persist/{k}": v / n for k, v in pers.items()})
+    # Checkpoint selection must be comparable across runs.  `ens/pos` is an
+    # atom-position MSE in A^2 and is only present when --pos-weight > 0, so
+    # including it makes val/ens/total jump from O(4) to O(40) and silently
+    # changes which step is "best".  Selecting on the base objective (rmsf +
+    # contact + dist), i.e. total minus the position contribution, keeps every
+    # run -- with or without the guide -- on one scale.  Weight 0 is a no-op.
+    pw = float(getattr(weights, "pos_weight", 0.0))
+    out["val/selection"] = out["val/ens/total"] - pw * out.get("val/ens/pos", 0.0)
     return out
+
+
+def _build_multi_horizon_loaders(args):
+    """Horizon-homogeneous paired-window loaders for --multi-horizon training.
+
+    Builds ONE ``PairedWindowDataset`` per horizon (so every batch is a single
+    horizon, since mixed horizons cannot be stacked into one ``future_coords``
+    tensor), each using the normal paired loader and the standard
+    ``collate_paired_windows``.  The training loop then picks a horizon per step.
+    """
+    from protein_jepa_frame.config import DataConfig
+    from protein_jepa_frame.data.collate import collate_paired_windows
+    from protein_jepa_frame.data.dataset import build_dataset
+    from protein_jepa_frame.data.protocol import apply_protocol, protocol_from_args
+    from protein_jepa_frame.training.train_stage_b1a import _truncate_history
+    from torch.utils.data import DataLoader, Subset
+
+    horizons = sorted({int(h) for h in (args.paired_horizons_frames or [8])})
+    loaders = {}
+    for h in horizons:
+        if args.use_contiguous_window or args.traj_loss:
+            # Contiguous K+H clip -> [K history | anchor, t1..tH]: rollout step i
+            # aligns with truth frame i, so trajectory-level losses are well-posed.
+            from protein_jepa_frame.data.collate import collate_clips
+            from protein_jepa_frame.data.protocol import split_contiguous_window
+            K = args.history_frames
+            ccfg = DataConfig(manifest_path=args.manifest, batch_size=args.batch_size,
+                              num_workers=args.num_workers, training_mode="clip",
+                              num_frames=K + h, frame_stride=args.frame_stride,
+                              max_residues=args.max_residues)
+            cds = build_dataset(ccfg)
+            if args.max_train_samples:
+                n_sub = min(len(cds), args.max_train_samples)
+                st = max(1, len(cds) // n_sub)
+                cds = Subset(cds, list(range(0, len(cds), st))[:n_sub])
+            if args.smoke:
+                cds = Subset(cds, list(range(0, min(len(cds), 16))))
+            if not len(cds):
+                print(f"[multi-horizon] H={h}: empty contiguous dataset, skip", flush=True)
+                continue
+            cfn = lambda s, hh=h: split_contiguous_window(collate_clips(s), K, hh, step_ps=args.step_ps)  # noqa: E731
+            cdl = DataLoader(cds, batch_size=args.batch_size, shuffle=True,
+                             num_workers=args.num_workers, collate_fn=cfn,
+                             drop_last=True, pin_memory=True)
+            if len(cdl):
+                loaders[h] = cdl
+                print(f"[multi-horizon|contig] H={h}: {len(cds)} windows, {len(cdl)} batches",
+                      flush=True)
+            continue
+        class _P: pass
+        pr = _P()
+        pr.history_frames = args.history_frames
+        pr.frame_stride = args.frame_stride
+        pr.paired_horizons_frames = [h]
+        cfg = DataConfig(manifest_path=args.manifest, batch_size=args.batch_size,
+                         num_workers=args.num_workers, training_mode="paired_window",
+                         num_frames=args.history_frames, paired_all_horizons=False,
+                         max_residues=args.max_residues)
+        apply_protocol(cfg, protocol_from_args(pr))
+        ds = build_dataset(cfg)
+        if args.max_train_samples:
+            n_sub = min(len(ds), args.max_train_samples)
+            stride = max(1, len(ds) // n_sub)
+            ds = Subset(ds, list(range(0, len(ds), stride))[:n_sub])
+        if args.smoke:
+            ds = Subset(ds, list(range(0, min(len(ds), 16))))
+        if not len(ds):
+            print(f"[multi-horizon] horizon {h}: empty dataset, skipping", flush=True)
+            continue
+        collate_fn = lambda s: _truncate_history(collate_paired_windows(s), args.history_frames)  # noqa: E731
+        dl = DataLoader(ds, batch_size=args.batch_size, shuffle=True,
+                        num_workers=args.num_workers, collate_fn=collate_fn,
+                        drop_last=True, pin_memory=True)
+        if len(dl):
+            loaders[h] = dl
+            print(f"[multi-horizon] H={h}: {len(ds)} windows, {len(dl)} batches", flush=True)
+    if not loaders:
+        raise ValueError("--multi-horizon produced no non-empty horizon loaders")
+    return loaders, horizons
 
 
 def _build_contiguous_loaders(args):
@@ -521,6 +989,12 @@ def _build_contiguous_loaders(args):
                             num_workers=0, collate_fn=_collate)
         return dl
 
+    if not (args.use_contiguous_window or args.traj_loss or args.dense_trajectory):
+        from protein_jepa_frame.data.dataset import validate_real_paired_window_protocol
+        validate_real_paired_window_protocol(DataConfig(
+            manifest_path=args.manifest, num_frames=args.history_frames,
+            frame_stride=args.frame_stride,
+            paired_horizons_frames=tuple(args.paired_horizons_frames or (8,16,24,32,48,64,96))))
     if args.manifest and args.val_manifest:
         validate_manifest_split(args.manifest, args.val_manifest)
     train_loader = make(args.manifest, True)
@@ -528,8 +1002,55 @@ def _build_contiguous_loaders(args):
     return train_loader, val_loader
 
 
+def _safe_step(opt, params, loss, grad_clip, lr_groups=None):
+    """Backward + clip + step, refusing to poison the weights with a non-finite loss.
+
+    ``clip_grad_norm_`` cannot help here: the norm of a NaN gradient is NaN, and
+    ``clamp(max=clip)`` of NaN is still NaN, so a single bad batch propagates
+    NaN into every parameter and every later step is wasted.  Measured on the
+    2026-10-22 A/B set, ``lasp_v3_velocity`` hit this at step 8,630 and kept
+    "training" for 5,000+ more steps with 64/73 kernel tensors NaN;
+    ``lasp_v5_pos03`` hit it at 12,700.  The loss values immediately before the
+    failure were unremarkable, so the trigger is bursty and cannot be avoided by
+    tuning the learning rate -- it has to be detected.
+
+    Returns (ok, grad_norm).  On ``ok=False`` the optimizer state is untouched.
+    """
+    if not torch.isfinite(loss):
+        return False, float("nan")
+    opt.zero_grad(set_to_none=True)
+    loss.backward()
+    gn = torch.nn.utils.clip_grad_norm_(params, grad_clip)
+    gn = float(gn) if torch.is_tensor(gn) else float(gn)
+    if not math.isfinite(gn):
+        opt.zero_grad(set_to_none=True)
+        return False, gn
+    for p in params:
+        if p.grad is not None and not torch.isfinite(p.grad).all():
+            opt.zero_grad(set_to_none=True)
+            return False, gn
+    if lr_groups is not None:
+        for pg in opt.param_groups:
+            pg["lr"] = pg["base_lr"] * lr_groups
+    opt.step()
+    return True, gn
+
+
 def main():
     args = parse_args()
+    if args.path_ensemble:
+        args.use_contiguous_window = True
+    if args.history_conditioning and args.history_frames < 2:
+        raise ValueError("history conditioning requires at least two history frames")
+    if args.manifest and args.val_manifest:
+        from protein_jepa_frame.data.protocol import validate_manifest_split
+        validate_manifest_split(args.manifest, args.val_manifest)
+    # Fail before loading any checkpoint: a round-trip loss with a frozen decoder
+    # cannot move a single parameter, so the run would silently be a no-op.
+    if float(getattr(args, "roundtrip_weight", 0.0)) > 0.0 and not args.train_decoder:
+        raise SystemExit(
+            "--roundtrip-weight > 0 requires --train-decoder: the loss trains the "
+            "decoder's H->CA map and has no effect on a frozen decoder.")
     _set_reproducibility(args.seed, False)
     torch.set_num_threads(args.torch_threads)
     device = _device(args.device)
@@ -542,25 +1063,39 @@ def main():
         args.latent_dim = dH
     kernel = _build_kernel(args, device)
     producer = HSEnsembleProducer(encoder, decoder, kernel,
-                                  train_encoder=args.train_encoder).to(device)
-    print(f"[planA] train_encoder={args.train_encoder} rollout_steps={args.rollout_steps} "
-          f"encoder_lr_scale={args.encoder_lr_scale}", flush=True)
+                                  train_encoder=args.train_encoder,
+                                  train_decoder=args.train_decoder,
+                                  history_conditioning=args.history_conditioning).to(device)
+    print(f"[planA] train_encoder={args.train_encoder} train_decoder={args.train_decoder} "
+          f"rollout_steps={args.rollout_steps} encoder_lr_scale={args.encoder_lr_scale} "
+          f"decoder_lr_scale={args.decoder_lr_scale}", flush=True)
 
     weights = EnsembleLossWeights(
         rmsf_weight=args.rmsf_weight, contact_weight=args.contact_weight,
-        dist_weight=args.dist_weight, pos_weight=args.pos_weight)
+        dist_weight=args.dist_weight, pos_weight=args.pos_weight,
+        contact_temperature=args.contact_temperature)
     weights.validate()
 
+    # --- Multi-horizon terminal training (paired loaders, one per horizon) ---
+    if args.multi_horizon:
+        if args.dense_trajectory:
+            raise ValueError("--multi-horizon cannot be combined with "
+                             "--dense-trajectory (use one objective)")
+        mh_loaders, mh_horizons = _build_multi_horizon_loaders(args)
+        loader, val_loader = None, None  # validation uses a horizon-paired loader below
+        print(f"[multi-horizon] horizons={mh_horizons}", flush=True)
     # --- Dense-trajectory mode: contiguous future window [anchor, t1..tH] ---
     # The paired loader returns a FLAT future "window" (H frames at one stride),
     # which cannot be lined up 1:1 with rollout steps.  For dense supervision we
     # reuse the proven from-none contiguous protocol: a single clip of
     # K+rollout_steps frames split (via split_contiguous_window) into K history
     # frames + a contiguous future [anchor, t1, ..., tH] so step i == truth i.
-    if args.dense_trajectory:
+    elif args.dense_trajectory or args.use_contiguous_window or args.traj_loss:
         loader, val_loader = _build_contiguous_loaders(args)
-        print(f"[dense] contiguous window K={args.history_frames} H={args.rollout_steps} "
-              f"stride={args.dense_stride}", flush=True)
+        print(f"[contig] window K={args.history_frames} H={args.rollout_steps} "
+              f"dense={args.dense_trajectory} traj_loss={args.traj_loss} "
+              f"stride={args.dense_stride if args.dense_trajectory else args.traj_stride}",
+              flush=True)
     else:
         data_cfg = DataConfig(
             manifest_path=args.manifest, batch_size=args.batch_size,
@@ -608,14 +1143,60 @@ def main():
             val_loader = DataLoader(Subset(vd, vidx), batch_size=args.batch_size,
                                     num_workers=0, shuffle=False, collate_fn=collate_fn)
 
-    # Plan A: optionally fine-tune the (otherwise frozen) Stage-A encoder jointly
-    # with the GLE kernel.  The decoder stays frozen either way.
-    if args.train_encoder:
+    # Multi-horizon validation: score the terminal objective at EVERY training
+    # horizon and average, so "best" selection rewards horizon calibration rather
+    # than fitting one window length (the Lasp over-dispersion fix).
+    mh_val = {}
+    if args.multi_horizon and args.val_manifest:
+        from protein_jepa_frame.config import DataConfig as _DC
+        from protein_jepa_frame.data.collate import collate_paired_windows as _cpw
+        from protein_jepa_frame.data.dataset import build_dataset as _bd
+        from protein_jepa_frame.data.protocol import apply_protocol as _ap, protocol_from_args as _pfa
+        from protein_jepa_frame.data.collate import collate_clips as _cl
+        from protein_jepa_frame.data.protocol import split_contiguous_window as _scw
+        for h in mh_horizons:
+            if args.use_contiguous_window or args.traj_loss:
+                vcfg = _DC(manifest_path=args.val_manifest, batch_size=args.batch_size,
+                           num_workers=0, training_mode="clip",
+                           num_frames=args.history_frames + h, frame_stride=args.frame_stride,
+                           max_residues=args.max_residues)
+                vds = _bd(vcfg)
+                if not len(vds):
+                    continue
+                n_v = min(len(vds), args.val_batches * args.batch_size)
+                vi = torch.linspace(0, len(vds) - 1, n_v).long().tolist()
+                vcf = lambda s, hh=h: _scw(_cl(s), args.history_frames, hh, step_ps=args.step_ps)  # noqa: E731
+            else:
+                class _PV: pass
+                pv = _PV(); pv.history_frames = args.history_frames
+                pv.frame_stride = args.frame_stride; pv.paired_horizons_frames = [h]
+                vcfg = _DC(manifest_path=args.val_manifest, batch_size=args.batch_size,
+                           num_workers=0, training_mode="paired_window",
+                           num_frames=args.history_frames, paired_all_horizons=False,
+                           max_residues=args.max_residues)
+                _ap(vcfg, _pfa(pv))
+                vds = _bd(vcfg)
+                if not len(vds):
+                    continue
+                n_v = min(len(vds), args.val_batches * args.batch_size)
+                vi = torch.linspace(0, len(vds) - 1, n_v).long().tolist()
+                vcf = lambda s: _truncate_history(_cpw(s), args.history_frames)  # noqa: E731
+            mh_val[h] = DataLoader(Subset(vds, vi), batch_size=args.batch_size,
+                                   num_workers=0, shuffle=False, collate_fn=vcf)
+
+    # Plan A: optionally fine-tune the (otherwise frozen) Stage-A encoder and/or
+    if args.train_encoder or args.train_decoder:
         groups = [
-            {"params": [p for p in producer.encoder.parameters() if p.requires_grad],
-             "lr": args.lr * args.encoder_lr_scale, "name": "encoder"},
             {"params": list(kernel.parameters()), "lr": args.lr, "name": "kernel"},
         ]
+        if args.train_encoder:
+            groups.append(
+                {"params": [p for p in producer.encoder.parameters() if p.requires_grad],
+                 "lr": args.lr * args.encoder_lr_scale, "name": "encoder"})
+        if args.train_decoder:
+            groups.append(
+                {"params": [p for p in producer.decoder.parameters() if p.requires_grad],
+                 "lr": args.lr * args.decoder_lr_scale, "name": "decoder"})
         groups = [g for g in groups if g["params"]]
         opt = torch.optim.AdamW(groups, lr=args.lr, weight_decay=args.weight_decay)
         for pg in opt.param_groups:
@@ -627,17 +1208,19 @@ def main():
             pg["base_lr"] = pg["lr"]
         clip_params = list(kernel.parameters())
     start_step, best_val = 0, float("inf")
-    if args.resume:
-        rck = torch.load(args.resume, map_location=device, weights_only=False)
+    if args.resume and args.init_from:
+        raise ValueError("use either --resume or --init-from")
+    if args.resume or args.init_from:
+        rck = torch.load(args.resume or args.init_from, map_location=device, weights_only=False)
         kernel.load_state_dict(rck["kernel"])
-        if "encoder" in rck:
+        if rck.get("encoder") is not None:
             producer.encoder.load_state_dict(rck["encoder"])
-        try:
+        if rck.get("decoder") is not None:
+            producer.decoder.load_state_dict(rck["decoder"])
+        if args.resume:
             opt.load_state_dict(rck["optimizer"])
-        except Exception:  # noqa: BLE001
-            pass
-        start_step = int(rck.get("step", 0))
-        best_val = float(rck.get("best_val", best_val))
+            start_step = int(rck.get("step", 0))
+            best_val = float(rck.get("best_val", best_val))
 
     def save(tag, step, val):
         torch.save({
@@ -649,11 +1232,79 @@ def main():
             "train_encoder": bool(getattr(args, "train_encoder", False)),
             "encoder": (producer.encoder.state_dict()
                         if getattr(args, "train_encoder", False) else None),
+            "train_decoder": bool(getattr(args, "train_decoder", False)),
+            "decoder": (producer.decoder.state_dict()
+                        if getattr(args, "train_decoder", False) else None),
         }, out_dir / f"checkpoint_{tag}.pt")
 
     t0 = time.time()
     step = start_step
+    n_skipped = 0
     gen = torch.Generator(device=device).manual_seed(args.seed)
+
+    if args.multi_horizon:
+        # Sample a horizon per step (round-robin) and train the terminal ensemble
+        # loss at that horizon; batches are horizon-homogeneous by construction.
+        mh_iters = {h: iter(dl) for h, dl in mh_loaders.items()}
+        mh_h_idx = 0
+        mh_cycle = list(mh_loaders.keys())
+        while step < args.steps:
+            h = mh_cycle[mh_h_idx % len(mh_cycle)]; mh_h_idx += 1
+            dl = mh_loaders[h]
+            try:
+                batch = next(mh_iters[h])
+            except StopIteration:
+                mh_iters[h] = iter(dl); batch = next(mh_iters[h])
+            paired = _move_batch(batch, device)
+            args.rollout_steps = h
+            if args.multi_horizon_max_grad is not None and h > args.multi_horizon_max_grad:
+                args.rollout_grad_steps = args.multi_horizon_max_grad
+            else:
+                args.rollout_grad_steps = None
+            producer.train()
+            with sdpa_kernel([SDPBackend.MATH]):
+                mh_run = _run_batch_traj if args.traj_loss else _run_batch
+                comp, _, out = mh_run(producer, paired, args, weights, device, generator=gen)
+            lr_scale = min(1.0, (step + 1) / max(args.warmup_steps, 1))
+            ok, gn = _safe_step(opt, clip_params, comp.total, args.grad_clip,
+                                lr_groups=lr_scale)
+            if not ok:
+                n_skipped += 1
+                print(f"step {step:6d} | H={h:3d} | SKIPPED non-finite loss/grad "
+                      f"(grad_norm={gn}); {n_skipped} skipped so far", flush=True)
+                continue
+            step += 1
+            if step % args.log_every == 0:
+                d = comp.as_loggable_dict()
+                extra = "".join(
+                    f" {name}={d[key]:.4f}" for name, key in
+                    (("rt", "ens/roundtrip"), ("pos", "ens/pos")) if key in d)
+                print(f"step {step:6d} | H={h:3d} | lr {opt.param_groups[0]['lr']:.2e} | "
+                      f"{time.time()-t0:6.1f}s | ens/total={d['ens/total']:.4f} "
+                      f"rmsf={d['ens/rmsf']:.4f} contact={d['ens/contact']:.4f} "
+                      f"dist={d['ens/dist']:.4f}{extra}", flush=True)
+            if mh_val and step % args.val_every == 0:
+                vagg = defaultdict(float); vals = {}
+                for hh, vdl in mh_val.items():
+                    args.rollout_steps = hh
+                    args.rollout_grad_steps = None
+                    v = _validate(producer, vdl, args, weights, device, args.val_batches)
+                    vals[f"val/H{hh}"] = round(v.get("val/ens/total", float("nan")), 4)
+                    vagg["val/ens/total"] += v.get("val/ens/total", 0.0) / len(mh_val)
+                    vagg["val/selection"] += v["val/selection"] / len(mh_val)
+                print(f"  [val {step}] mean={vagg['val/ens/total']:.4f} {json.dumps(vals)}",
+                      flush=True)
+                if vagg.get("val/selection", vagg["val/ens/total"]) < best_val:
+                    best_val = vagg.get("val/selection", vagg["val/ens/total"])
+                    save("best", step, best_val)
+            if step % args.save_every == 0:
+                save("latest", step, best_val)
+            if step >= args.steps:
+                break
+        save("latest", step, best_val)
+        print(f"done: {step} steps, best mean val ens/total = {best_val:.4f}", flush=True)
+        return
+
     while step < args.steps:
         for batch in loader:
             paired = _move_batch(batch, device)
@@ -661,15 +1312,21 @@ def main():
             # The energy module's attention backward is only implemented for the
             # MATH SDP backend (efficient/flash attention backward is missing).
             with sdpa_kernel([SDPBackend.MATH]):
-                run = _run_batch_dense if args.dense_trajectory else _run_batch
+                if args.dense_trajectory:
+                    run = _run_batch_dense
+                elif args.traj_loss:
+                    run = _run_batch_traj
+                else:
+                    run = _run_batch
                 comp, _, out = run(producer, paired, args, weights, device, generator=gen)
-            opt.zero_grad(set_to_none=True)
-            comp.total.backward()
-            torch.nn.utils.clip_grad_norm_(clip_params, args.grad_clip)
             lr_scale = min(1.0, (step + 1) / max(args.warmup_steps, 1))
-            for pg in opt.param_groups:
-                pg["lr"] = pg["base_lr"] * lr_scale
-            opt.step()
+            ok, gn = _safe_step(opt, clip_params, comp.total, args.grad_clip,
+                                lr_groups=lr_scale)
+            if not ok:
+                n_skipped += 1
+                print(f"step {step:6d} | SKIPPED non-finite loss/grad "
+                      f"(grad_norm={gn}); {n_skipped} skipped so far", flush=True)
+                continue
             step += 1
             if step % args.log_every == 0:
                 d = comp.as_loggable_dict()
@@ -678,17 +1335,27 @@ def main():
                           f"{time.time()-t0:6.1f}s | total={d['ens/total']:.4f} "
                           f"ca={d['ens/ca']:.4f} es={d['ens/es']:.4f} "
                           f"persist={d['ens/persist']:.4f}", flush=True)
+                elif args.traj_loss:
+                    print(f"step {step:6d} | lr {opt.param_groups[0]['lr']:.2e} | "
+                          f"{time.time()-t0:6.1f}s | tot={d['ens/total']:.4f} "
+                          f"rmsf={d['ens/rmsf']:.4f} dist={d['ens/dist']:.4f} "
+                          f"t_es={d['traj/es']:.4f} t_rc={d['traj/rmsf_corr']:.4f} "
+                          f"t_anc={d['traj/anchor']:.4f}", flush=True)
                 else:
+                    extra = "".join(
+                        f" {name}={d[key]:.4f}" for name, key in
+                        (("rt", "ens/roundtrip"), ("pos", "ens/pos")) if key in d)
                     print(f"step {step:6d} | lr {opt.param_groups[0]['lr']:.2e} | "
                           f"{time.time()-t0:6.1f}s | ens/total={d['ens/total']:.4f} "
                           f"rmsf={d['ens/rmsf']:.4f} contact={d['ens/contact']:.4f} "
-                          f"dist={d['ens/dist']:.4f}", flush=True)
+                          f"dist={d['ens/dist']:.4f}{extra}", flush=True)
             if val_loader is not None and step % args.val_every == 0:
                 v = _validate(producer, val_loader, args, weights, device, args.val_batches)
                 print(f"  [val {step}] {json.dumps({k: round(x,4) for k,x in v.items()})}",
                       flush=True)
-                if v.get("val/ens/total", float("inf")) < best_val:
-                    best_val = v["val/ens/total"]
+                sel = v.get("val/selection", v.get("val/ens/total", float("inf")))
+                if sel < best_val:
+                    best_val = sel
                     save("best", step, best_val)
             if step % args.save_every == 0:
                 save("latest", step, best_val)

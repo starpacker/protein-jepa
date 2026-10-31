@@ -46,7 +46,7 @@ def extract_ca_window(
     if residue_mask is None:
         mask = torch.ones(ca.shape[0], ca.shape[2], dtype=torch.bool, device=ca.device)
     else:
-        mask = residue_mask[:, -1].bool() if residue_mask.dim() == 3 else residue_mask.bool()
+        mask = residue_mask.bool().all(dim=1) if residue_mask.dim() == 3 else residue_mask.bool()
     return ca, mask
 
 
