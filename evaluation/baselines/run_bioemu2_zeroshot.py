@@ -96,7 +96,17 @@ def parse_args(argv=None):
     p.add_argument("--max-proteins", type=int, default=None)
     p.add_argument("--max-anchors-per-trajectory", type=int, default=4)
     p.add_argument("--max-windows", type=int, default=None)
+    p.add_argument('--window-start', type=int, default=0,
+                   help='Skip this many protocol windows for deterministic evaluation shards.')
     p.add_argument("--temperatures", type=float, nargs="+", default=None)
+    # --- benchmark coverage -------------------------------------------------
+    # Round-robin is the DEFAULT so a small window budget still covers many
+    # proteins, temperatures and horizons.  Manifest order used to land the whole
+    # budget on one 60-residue domain; keep the flag only to reproduce old runs.
+    p.add_argument("--manifest-order", action="store_true",
+                   help="legacy manifest-order window walk (single-protein prefix)")
+    p.add_argument("--max-windows-per-protein", type=int, default=None,
+                   help="cap windows contributed by one protein (round-robin only)")
     p.add_argument("--device", default="cuda")
     p.add_argument("--sampler", default="edm",
                    choices=["edm", "edm_gd", "edm_fk", "edm_fkc"])
@@ -132,6 +142,9 @@ def parse_args(argv=None):
     p.add_argument("--trans-lo", type=float, default=0.01)
     p.add_argument("--trans-hi", type=float, default=0.99)
     p.add_argument("--out", default=None)
+    p.add_argument("--save-samples", default=None,
+                   help="Save per-window generated CA ensembles (npz) for T2A-style "
+                        "static-ensemble metrics. Model samples only; no future data.")
     p.add_argument("--smoke", action="store_true")
     return p.parse_args(argv)
 
@@ -178,6 +191,7 @@ def _ensure_hash_seed() -> None:
 def main(argv=None):
     args = parse_args(argv)
     _ensure_hash_seed()
+    if args.window_start < 0:raise ValueError('window-start must be nonnegative')
     if args.smoke:
         args.horizons_ns = [1.0]
         args.n_samples = 2
@@ -236,16 +250,25 @@ def main(argv=None):
         max_anchors_per_trajectory=args.max_anchors_per_trajectory,
         anchor_stride=1, temporal_lags=(), emit_multi_lag=False,
         seed=args.seed,
+        round_robin_proteins=not args.manifest_order,
+        round_robin_conditions=not args.manifest_order,
+        max_windows_per_protein=args.max_windows_per_protein,
     )
 
     per_hz = defaultdict(lambda: defaultdict(list))
+    per_window = []
+    window_records = []
     n_windows = 0
     n_skipped = 0
+    seen_proteins: set[str] = set()
+    seen_temps: set[float] = set()
     # cache bioemu2 embeddings per (protein, temperature) key
     embed_cache: dict[str, object] = {}
 
     t_start = time.time()
-    for w in iter_windows(proto):
+    for window_index,w in enumerate(iter_windows(proto)):
+        if window_index < args.window_start:
+            continue
         if args.max_windows is not None and n_windows >= args.max_windows:
             break
         rmask = w.context["residue_mask"].all(dim=0).bool()
@@ -342,23 +365,76 @@ def main(argv=None):
             weak_lo=args.weak_lo, weak_hi=args.weak_hi,
             trans_lo=args.trans_lo, trans_hi=args.trans_hi,
         )
+        if args.save_samples:
+            # Generated endpoints plus the true reference frames of the SAME
+            # trajectory, so a downstream metric can reuse them without
+            # re-running bioemu2. Future coordinates are reference data only.
+            sample_dir = Path(args.save_samples)
+            sample_dir.mkdir(parents=True, exist_ok=True)
+            tag = f"{w.protein_id}|{w.trajectory_id}|{int(w.anchor_frame)}|{w.horizon:g}"
+            np.savez_compressed(sample_dir / (tag.replace('|', '__') + '.npz'),
+                model_ca=pred_ens.detach().cpu().numpy().astype('float32'),
+                persist_ca=pers_ens.detach().cpu().numpy().astype('float32'),
+                true_ca=true_ens.detach().cpu().numpy().astype('float32'),
+                residue_mask=rmask.numpy(), temperature_k=float(w.temperature_k),
+                horizon=float(w.horizon), anchor_frame=int(w.anchor_frame),
+                protein=str(w.protein_id), trajectory=str(w.trajectory_id))
+            window_records.append(dict(tag=tag, protein=w.protein_id, traj=w.trajectory_id,
+                anchor_frame=int(w.anchor_frame), horizon=float(w.horizon),
+                temperature_k=float(w.temperature_k)))
+        per_window.append({
+            "protein": w.protein_id, "traj": w.trajectory_id,
+            "anchor_frame": int(w.anchor_frame), "horizon": float(w.horizon),
+            "temperature_k": float(w.temperature_k),
+            "bioemu2": {m: float(s_model[m]) for m in METRICS},
+            "persist": {m: float(s_pers[m]) for m in METRICS},
+        })
         hz = w.horizon
         for m in METRICS:
             per_hz[hz]["model_" + m].append(s_model[m])
             per_hz[hz]["pers_" + m].append(s_pers[m])
 
         n_windows += 1
+        seen_proteins.add(w.protein_id)
+        seen_temps.add(float(w.temperature_k))
+        # Persist expensive completed windows for progress inspection and recovery.
+        # This partial file is not a completed benchmark and must not be used to
+        # compare an opportunistically selected intersection of successful rows.
+        if args.out:
+            partial = Path(args.out).with_suffix('.partial.json')
+            partial.parent.mkdir(parents=True, exist_ok=True)
+            temporary = partial.with_suffix('.tmp')
+            temporary.write_text(json.dumps(dict(status='incomplete',
+                metric_version='empirical_w2_v2_pca_projection',
+                manifest=args.manifest, n_samples=args.n_samples,
+                n_windows=n_windows, n_skipped=n_skipped, per_window=per_window)))
+            temporary.replace(partial)
         if n_windows % 10 == 0:
-            print(f"  processed {n_windows} windows  ({time.time()-t_start:.0f}s)",
-                  flush=True)
+            print(f"  processed {n_windows} windows  ({time.time()-t_start:.0f}s, "
+                  f"{len(seen_proteins)} proteins)", flush=True)
 
-    print(f"[bioemu2] windows={n_windows} skipped={n_skipped}", flush=True)
+    print(f"[bioemu2] windows={n_windows} skipped={n_skipped} "
+          f"proteins={len(seen_proteins)} temps={len(seen_temps)}", flush=True)
+    if len(seen_proteins) < 2:
+        print(f"*** WARNING: only {len(seen_proteins)} protein(s) scored; these "
+              f"numbers describe one domain, not the dataset.", flush=True)
 
     result = {
         "baseline": "bioemu2",
+        "metric_version": "empirical_w2_v2_pca_projection",
+        "per_window": per_window,
         "checkpoint": args.checkpoint_path or args.checkpoint,
         "manifest": args.manifest,
         "n_samples": args.n_samples, "n_windows": n_windows,
+        "window_start": args.window_start, "n_skipped": n_skipped,
+        "evaluation_args": vars(args),
+        "n_proteins": len(seen_proteins), "proteins": sorted(seen_proteins),
+        "saved_sample_windows": window_records,
+        "n_temperatures": len(seen_temps),
+        "temperatures": sorted(seen_temps),
+        "protocol": {"round_robin_proteins": not args.manifest_order,
+                     "round_robin_conditions": not args.manifest_order,
+                     "max_windows_per_protein": args.max_windows_per_protein},
         "horizons_ns": args.horizons_ns,
         "sampler": args.sampler,
         "by_horizon": {},

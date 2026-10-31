@@ -55,7 +55,7 @@ def w2_1d(a: Tensor, b: Tensor) -> Tensor:
 
         W2(a, b)^2 = integral_0^1 (F_a^{-1}(q) - F_b^{-1}(q))^2 dq
 
-    approximated on the union grid ``linspace(0, 1, M)`` with ``M = max(na, nb)``.
+    integrated exactly over the union of empirical CDF probability boundaries.
     Returns a scalar tensor.
     """
     a = a.reshape(-1).to(torch.float64)
@@ -66,14 +66,17 @@ def w2_1d(a: Tensor, b: Tensor) -> Tensor:
         return torch.tensor(float("inf"), dtype=torch.float64, device=a.device)
     a = torch.sort(a).values
     b = torch.sort(b).values
-    m = max(a.numel(), b.numel())
-    q = torch.linspace(0.0, 1.0, m, dtype=torch.float64, device=a.device)
-    # linear-interpolation quantile function
-    qa = _quantile(a, q)
-    qb = _quantile(b, q)
-    diff = (qa - qb) ** 2
-    w2_sq = torch.trapz(diff, q) if m > 1 else diff.mean()
-    return torch.sqrt(w2_sq.clamp_min(0.0))
+    # Empirical inverse CDFs are step functions. Integrate over the union
+    # of all probability-mass boundaries, including unequal sample counts.
+    boundaries = torch.cat((
+        torch.arange(a.numel() + 1, device=a.device, dtype=a.dtype) / a.numel(),
+        torch.arange(b.numel() + 1, device=a.device, dtype=a.dtype) / b.numel(),
+    )).unique(sorted=True)
+    widths = boundaries.diff()
+    mid = (boundaries[:-1] + boundaries[1:]) * 0.5
+    ia = (mid * a.numel()).long().clamp_max(a.numel() - 1)
+    ib = (mid * b.numel()).long().clamp_max(b.numel() - 1)
+    return ((a[ia] - b[ib]).square() * widths).sum().clamp_min(0).sqrt()
 
 
 def _quantile(sorted_x: Tensor, q: Tensor) -> Tensor:
@@ -198,7 +201,7 @@ def md_pca_w2(
             m = mask.to(pp.device).bool()
             pp = pp[:, m, :]
             pt = pt[:, m, :]
-        acc = acc + w2_1d(pp, pt) ** 2
+        acc = acc + w2_1d(pp.sum(dim=(-2, -1)), pt.sum(dim=(-2, -1))) ** 2
         used += 1
     return torch.sqrt(acc / max(used, 1))
 
@@ -274,13 +277,8 @@ def transient_contact_jaccard(
 # helpers
 # --------------------------------------------------------------------------- #
 def _default_ref(true_x: Tensor, ref: Tensor | None) -> Tensor | None:
-    """Reference cloud used by the W2 metrics.
-
-    If ``ref`` is given we return it; otherwise we return ``None`` and let the
-    caller simply align each ensemble to its own first frame (the MD convention
-    used by :func:`evaluation.ensemble_metrics.align_ensemble`).
-    """
-    return ref
+    """Use a shared reference so independent rigid motions cannot alter W2."""
+    return true_x[0] if ref is None else ref
 
 
 def _align_pair(pred_x: Tensor, true_x: Tensor, mask: Tensor | None, ref: Tensor | None):
@@ -348,13 +346,15 @@ def _true_slow_modes(true_x: Tensor, mask: Tensor | None, k: int,
     selecting which residues inform the covariance fit would change the vector
     length; we keep the full length so projection is well defined).
     """
-    x = true_x.float()
+    x = true_x.double()
+    if mask is not None:
+        x = x * mask.to(x.device, x.dtype)[None, :, None]
     L = x.shape[1] if L is None else L
     X = x.reshape(x.shape[0], -1)                                # [N, 3L]
     X = X - X.mean(dim=0, keepdim=True)
     # Compute on CPU in float64: eigh on a 3L x 3L matrix (L up to ~330) can
     # fail to converge on GPU for ill-conditioned / near-degenerate spectra.
-    cov = ((X.t() @ X) / max(X.shape[0] - 1, 1)).double().cpu()
+    cov = ((X.t() @ X) / max(X.shape[0] - 1, 1)).cpu()
     try:
         evals, evecs = torch.linalg.eigh(cov)
     except Exception:

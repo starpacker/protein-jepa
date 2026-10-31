@@ -37,13 +37,20 @@ HIGHER_BETTER = {"rmsf_corr","weak_contact_j","transient_contacts_j"}
 
 def build(args, dev):
     encoder, decoder, dH = load_frozen_stack(args.stage_a_ckpt, args.b1a_ckpt, dev)
+    # Model 1 must keep the PRISTINE Stage-A encoder AND B1a decoder.  Give it
+    # its own copies: below we may reload the FINE-TUNED encoder/decoder into the
+    # shared objects for HS, and if m1 shared them it would silently be swapped
+    # too -- which is exactly what made the Model1 baseline move between runs.
+    import copy
+    enc_m1 = copy.deepcopy(encoder)
+    dec_m1 = copy.deepcopy(decoder)
     # Model 1 static head
     ck = torch.load(args.ensemble_ckpt, map_location=dev, weights_only=False)
     ca = ck.get("args", {})
     head = GaussianHHead(dH, hidden=int(ca.get("head_hidden", 128)),
                          cond_dim=int(ca.get("cond_dims", 0)))
     head.load_state_dict(ck["head"]); head.to(dev).eval()
-    m1 = EnsembleProducer(encoder, decoder, head).to(dev).eval()
+    m1 = EnsembleProducer(enc_m1, dec_m1, head).to(dev).eval()
     # H+S kernel
     kck = torch.load(args.kernel_ckpt, map_location=dev, weights_only=False)
     k_cfg = kck.get("kernel_config") or {}
@@ -52,13 +59,22 @@ def build(args, dev):
     kern = StageB1b(StageB1bConfig(**k_cfg)).to(dev)
     kern.load_state_dict(kck["kernel"]); kern.eval()
     train_encoder = bool(kck.get("train_encoder", False)) and kck.get("encoder") is not None
-    hs = HSEnsembleProducer(encoder, decoder, kern, train_encoder=train_encoder).to(dev).eval()
+    train_decoder = bool(kck.get("train_decoder", False)) and kck.get("decoder") is not None
+    hs = HSEnsembleProducer(encoder, decoder, kern, train_encoder=train_encoder,
+                            train_decoder=train_decoder).to(dev).eval()
     if train_encoder:
         # Plan A: the encoder was fine-tuned jointly with the GLE kernel; evaluate
         # the FINE-TUNED encoder, not the frozen Stage-A one.
         r = hs.encoder.load_state_dict(kck["encoder"], strict=False)
         if r.missing_keys or r.unexpected_keys:
             print(f"[eval] encoder reload: missing={r.missing_keys} "
+                  f"unexpected={r.unexpected_keys}")
+    if train_decoder:
+        # Variant B: the B1a decoder was fine-tuned too; evaluate the fine-tuned
+        # decode map (Model 1 keeps its own pristine copy, see above).
+        r = hs.decoder.load_state_dict(kck["decoder"], strict=False)
+        if r.missing_keys or r.unexpected_keys:
+            print(f"[eval] decoder reload: missing={r.missing_keys} "
                   f"unexpected={r.unexpected_keys}")
     hs._rollout_steps = int(k_args.get("rollout_steps", 1))
     hs._rollout_grad_steps = None
@@ -106,6 +122,15 @@ def main():
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--out", default=None)
     args = ap.parse_args()
+
+    # Seed the GLOBAL RNG too: Model1's Gaussian head (GaussianHHead.sample) and
+    # the GLE kernel draw their noise from the global generator, not from the
+    # dataset-subset Generator below.  Without this the SAME frozen Model1
+    # produces a different ensemble in every process, so the paired delta is not
+    # apples-to-apples across runs (observed rmsf_mae 1.0376 vs 1.4248).  Seeding
+    # here makes Model1's baseline and HS's noise reproducible run-to-run.
+    torch.manual_seed(args.seed)
+    np.random.seed(args.seed)
 
     dev = _device(args.device)
     m1, hs, cond_dim = build(args, dev)

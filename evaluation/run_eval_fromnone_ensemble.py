@@ -54,7 +54,14 @@ def parse_args(argv=None):
     p.add_argument("--max-anchors-per-trajectory", type=int, default=4)
     p.add_argument("--max-windows", type=int, default=None,
                    help="Cap total evaluated windows (fair comparison with the Stage-A suite, "
-                        "which reports over 100 windows).  Windows are taken in manifest order.")
+                        "which reports over 100 windows).")
+    # --- benchmark coverage -------------------------------------------------
+    # Round-robin is the DEFAULT: manifest order spends the whole budget on the
+    # first trajectory family (one domain on the 1000dom val split).
+    p.add_argument("--manifest-order", action="store_true",
+                   help="legacy manifest-order window walk (single-protein prefix)")
+    p.add_argument("--max-windows-per-protein", type=int, default=None,
+                   help="cap windows contributed by one protein (round-robin only)")
     p.add_argument("--history-frames", type=int, default=8)
     p.add_argument("--max-residues", type=int, default=256)
     p.add_argument("--device", default="auto")
@@ -190,6 +197,9 @@ def main(argv=None):
         max_anchors_per_trajectory=args.max_anchors_per_trajectory,
         anchor_stride=1, temporal_lags=(), emit_multi_lag=False,
         seed=args.seed,
+        round_robin_proteins=not args.manifest_order,
+        round_robin_conditions=not args.manifest_order,
+        max_windows_per_protein=args.max_windows_per_protein,
     )
 
     # per-horizon accumulators.  Windows are the unit of analysis (same protocol as
@@ -198,6 +208,7 @@ def main(argv=None):
     per_hz: dict[int, dict[str, list[float]]] = defaultdict(lambda: defaultdict(list))
     n_windows = 0
     n_skipped = 0
+    proteins: set[str] = set()
 
     for w in iter_windows(proto):
         if args.max_windows is not None and n_windows >= args.max_windows:
@@ -255,19 +266,30 @@ def main(argv=None):
             per_hz[hz]["pers_"  + m].append(s_pers[m])
 
         n_windows += 1
+        proteins.add(w.protein_id)
         if n_windows % 20 == 0:
-            print(f"  processed {n_windows} windows...")
+            print(f"  processed {n_windows} windows ({len(proteins)} proteins)...")
 
-    print(f"[eval] total windows: {n_windows}  skipped: {n_skipped}")
+    n_proteins = len(proteins)
+    print(f"[eval] total windows: {n_windows}  skipped: {n_skipped}  "
+          f"proteins: {n_proteins}")
 
     # Aggregate: mean + bootstrap CI over windows (same protocol as Stage-A suite).
     # This gives a meaningful CI even with few proteins (100 windows >> 4 proteins).
     result = {
         "ckpt": str(args.ckpt), "manifest": args.manifest,
         "step_ps": step_ps, "n_samples": args.n_samples, "n_windows": n_windows,
+        "n_proteins": n_proteins,
+        "protocol": {"round_robin_proteins": not args.manifest_order,
+                     "round_robin_conditions": not args.manifest_order,
+                     "max_windows_per_protein": args.max_windows_per_protein},
         "horizons_ns": args.horizons_ns, "horizons_frames": list(horizons_frames),
         "by_horizon": {}
     }
+    if n_proteins < 2:
+        print(f"*** WARNING: only {n_proteins} protein(s) scored; the CI below "
+              f"reflects window noise inside one domain, not dataset variation.",
+              flush=True)
 
     summary_rows = []
     for hz in sorted(per_hz):
