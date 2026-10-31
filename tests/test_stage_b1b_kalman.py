@@ -40,12 +40,25 @@ def _linear_joint_gaussian_nll(
     mask,            # [B, L]
     m0, P0,          # [L, dS], [L, dS, dS]
 ):
-    """Exact joint-Gaussian NLL for the linear system.
+    """Exact joint-Gaussian NLL for the sampler's linear system.
 
     State augmented per-residue: z = [H (dH), S (dS)].
-    Dynamics (Euler, linear force f=-k*H):
-      H_{n+1} = (I - h k D) H_n + h C S_n  +  sqrt(2hD) eps_H
-      S_{n+1} = -h k C^T H_n + (I - h Gamma) S_n  +  sqrt(2hGamma) eps_S
+    Dynamics MUST match ``sample_step(collective_mobility=True)`` with the
+    linear force f = -k H:
+
+      H_{n+1} = H_n + h D (f - C S_n) + sqrt(2hD) eps_H
+      S_{n+1} = S_n + C^T (H_{n+1} - H_n) - h Gamma S_n + sqrt(2hGamma) eps_S
+
+    Substituting the H update into the S update shows the coupling carries the
+    mobility D and that eps_H enters BOTH equations, so Q is not block diagonal:
+
+      F_HH = I - h k D,          F_HS = -h D C
+      F_SH = -h k C^T D,         F_SS = I - h Gamma - h C^T D C
+      Q_HH = 2hD,  Q_HS = 2hD C, Q_SS = C^T (2hD) C + 2hGamma
+
+    The earlier version of this reference used +h C S / -h k C^T H and block
+    diagonal Q -- the *old* diagnostic model -- so it validated a recursion
+    that did not describe the deployed kernel.
 
     H_0 is conditioned on (known exactly); NLL is for H_{1:N} given H_0 and
     the initial bath distribution S_0 ~ N(m0, P0).  We marginalise S over
@@ -54,16 +67,20 @@ def _linear_joint_gaussian_nll(
     B, T, L, dH = H_seq.shape
     dS = m0.shape[-1]
     N = T - 1
+    Dm = torch.diag(D_v)                                   # [dH,dH]
+    CDC = C.T @ Dm @ C                                     # [dS,dS]
     # F matrix of the augmented system
     F = torch.zeros(dH + dS, dH + dS)
-    F[:dH, :dH] = torch.eye(dH) - h * k * torch.diag(D_v)
-    F[:dH, dH:] = h * C
-    F[dH:, :dH] = -h * k * C.T
-    F[dH:, dH:] = torch.eye(dS) - h * torch.diag(Gamma_v)
-    # Process noise covariance Q
+    F[:dH, :dH] = torch.eye(dH) - h * k * Dm
+    F[:dH, dH:] = -h * Dm @ C
+    F[dH:, :dH] = -h * k * C.T @ Dm
+    F[dH:, dH:] = torch.eye(dS) - h * torch.diag(Gamma_v) - h * CDC
+    # Process noise covariance Q (eps_H enters both blocks)
     Q = torch.zeros(dH + dS, dH + dS)
-    Q[:dH, :dH] = torch.diag(2 * h * D_v)
-    Q[dH:, dH:] = torch.diag(2 * h * Gamma_v)
+    Q[:dH, :dH] = 2 * h * Dm
+    Q[:dH, dH:] = 2 * h * Dm @ C
+    Q[dH:, :dH] = 2 * h * C.T @ Dm
+    Q[dH:, dH:] = CDC * (2 * h) + torch.diag(2 * h * Gamma_v)
 
     total = 0.0
     for b in range(B):

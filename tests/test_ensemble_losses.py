@@ -180,3 +180,32 @@ def test_compute_loss_pos_changes_total():
     assert withpos.pos is not None
     assert float(withpos.total) > float(base.total)
     assert "ens/pos" in withpos.as_loggable_dict()
+
+
+def test_contact_only_loss_has_coordinate_gradient():
+    from protein_jepa_frame.training.ensemble_losses import _contact_loss
+    ca = torch.tensor([[[[0., 0., 0.], [8.1, 0., 0.]]]], requires_grad=True)
+    target = torch.ones(1, 2, 2)
+    loss = _contact_loss(ca, target, torch.ones(1, 2, dtype=torch.bool), 8.0)
+    loss.backward()
+    assert torch.isfinite(ca.grad).all()
+    assert ca.grad[0, 0, 1, 0] > 0  # descent must reduce separation for a missing contact
+
+
+def test_contact_mask_excludes_padding_gradient():
+    from protein_jepa_frame.training.ensemble_losses import _contact_loss
+    ca = torch.randn(1, 3, 4, 3, requires_grad=True)
+    loss = _contact_loss(ca, torch.zeros(1, 4, 4),
+                         torch.tensor([[True, True, True, False]]), 2.0)
+    loss.backward()
+    assert torch.equal(ca.grad[:, :, -1], torch.zeros_like(ca.grad[:, :, -1]))
+
+
+def test_rmsf_correlation_multiframe_has_nonzero_gradient():
+    from protein_jepa_frame.models.stage_b1b_fromnone.objectives import ensemble_rmsf_corr_loss
+    torch.manual_seed(93)
+    pred = torch.randn(4, 1, 1, 8, 3, requires_grad=True)
+    truth = torch.randn(1, 5, 8, 3)
+    loss = ensemble_rmsf_corr_loss(pred, truth, torch.ones(1, 8, dtype=torch.bool))
+    loss.backward()
+    assert torch.isfinite(pred.grad).all() and pred.grad.abs().sum() > 0

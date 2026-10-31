@@ -62,3 +62,29 @@ def test_kmeans_recovers_separated_clusters():
     assert len(set(labels[:50].tolist())) == 1
     assert len(set(labels[50:100].tolist())) == 1
     assert len(set(labels[100:].tolist())) == 1
+
+
+def test_static_terms_contract_on_pre_restricted_arrays():
+    """Pre-restricted samples must be scored with mask=None, not a full mask."""
+    from evaluation.t2a_static import static_ensemble_terms
+
+    torch.manual_seed(3)
+    L_full, keep = 10, 6
+    base = torch.zeros(L_full, 3)
+    base[:, 0] = torch.arange(L_full, dtype=torch.float32) * 3.8
+    ref = base[None] + 0.2 * torch.randn(64, L_full, 3)
+    mask = torch.zeros(L_full, dtype=torch.bool)
+    mask[:keep] = True
+    # Callers pre-restrict both populations to the masked residues.
+    ref_r = ref[:, mask]
+    model_r = ref_r[:32] + 0.05 * torch.randn(32, keep, 3)
+    ok = static_ensemble_terms(model_r, ref_r, None, 320.0, k_states=3, seed=0)
+    assert 0.0 <= ok['coverage'] <= 1.0
+    assert math.isfinite(ok['free_energy_mae_kcal'])
+    # A full-length mask against compacted arrays is a caller bug, not silence.
+    try:
+        static_ensemble_terms(model_r, ref_r, mask, 320.0, k_states=3, seed=0)
+    except ValueError as exc:
+        assert 'pre-restricted' in str(exc)
+    else:
+        raise AssertionError('full mask over compacted arrays must raise')

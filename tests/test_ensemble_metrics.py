@@ -271,3 +271,48 @@ def test_jaccard_full_exposes_degenerate_sizes():
     # truth has weak contacts (amp=2 gives fractional probabilities) => J == 0
     if out["n_true"] > 0:
         assert out["weak_contact_j"] == 0.0
+
+
+def test_empirical_w2_unequal_counts_exact():
+    from evaluation.ensemble_metrics_ext import w2_1d
+    a = torch.tensor([0., 1.])
+    b = torch.tensor([0., 0., 1.])
+    assert torch.allclose(w2_1d(a, b), torch.tensor(1 / 6, dtype=torch.float64).sqrt())
+    assert torch.allclose(w2_1d(a, b), w2_1d(b, a))
+
+
+def test_empirical_w2_equal_counts_mean_squared_transport():
+    from evaluation.ensemble_metrics_ext import w2_1d
+    a = torch.tensor([0., 2., 10.])
+    b = torch.tensor([1., 5., 20.])
+    assert torch.allclose(w2_1d(a, b).square(), torch.tensor(110 / 3, dtype=torch.float64))
+
+
+def test_root_w2_removes_global_translation_and_rotation():
+    from evaluation.ensemble_metrics_ext import root_mean_w2
+    torch.manual_seed(39)
+    x = torch.randn(6, 9, 3, dtype=torch.float64)
+    r = torch.tensor([[0., -1., 0.], [1., 0., 0.], [0., 0., 1.]], dtype=x.dtype)
+    assert root_mean_w2(x @ r + 5, x) < 1e-10
+
+
+def test_md_pca_uses_scalar_mode_projection():
+    from evaluation.ensemble_metrics_ext import md_pca_w2
+    # The only mode is (1,1,0)/sqrt(2). True projection is +/-sqrt(2),
+    # predicted projection is zero; W2 must be sqrt(2), not coordinate-wise W2.
+    true = torch.tensor([[[-1., -1., 0.]], [[1., 1., 0.]]], dtype=torch.float64)
+    pred = torch.zeros_like(true)
+    assert torch.allclose(md_pca_w2(pred, true, k=1, align=False),
+                          torch.tensor(2., dtype=torch.float64).sqrt())
+
+
+def test_md_pca_ignores_masked_residue_modes():
+    from evaluation.ensemble_metrics_ext import md_pca_w2
+    torch.manual_seed(12)
+    true = torch.randn(5, 5, 3, dtype=torch.float64)
+    pred = torch.randn(6, 5, 3, dtype=torch.float64)
+    mask = torch.tensor([True, True, True, True, False])
+    base = md_pca_w2(pred, true, mask, k=2, align=False)
+    true[:, -1] *= 1e4
+    pred[:, -1] *= 1e4
+    assert torch.allclose(base, md_pca_w2(pred, true, mask, k=2, align=False))
