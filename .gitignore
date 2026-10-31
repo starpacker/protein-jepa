@@ -33,6 +33,11 @@ archive/tmp/
 runs/
 logs/
 
+# evaluation outputs: 3.9 GB of per-window JSON + embedded component
+# checkpoints.  Reproducible from the frozen checkpoints and the scripts;
+# tracking them would dominate the repository.
+results/
+
 # paper drafts (not core code)
 paper/
 docs/

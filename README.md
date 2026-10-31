@@ -9,7 +9,7 @@ latent-state prediction on **mdCATH** (5 temperatures: 320 / 348 / 379 / 413 / 4
 
 | # | Document | What it is |
 |---|---|---|
-| 1 | **[`EVALUATION_3TASKS_RESULTS_20261021.md`](EVALUATION_3TASKS_RESULTS_20261021.md)** | **The authoritative evaluation plan + full results reference.** Defines *every* metric (CA-RMSD / Kabsch, RMSF & RMSF-r, Root-Mean / Variance / MD-PCA W2, contact Jaccard, energy scores, CA geometry validity, backbone N/CA/C/O stereochemistry, BioEmu-style static + MSM dynamics, order-aware trajectory metrics, temperature generalization) with units/direction/code, plus all result tables — the 3 newest tasks **and** every earlier evaluation. Every number carries its `n` + sampling budget; static vs. dynamics metrics are separated. |
+| 1 | **[`EVALUATION_METHODS_AND_COMMANDS_20261021.md`](EVALUATION_METHODS_AND_COMMANDS_20261021.md)** | **The authoritative evaluation methods + reproduction commands + full results reference.** §1.2 lists **every evaluated method** (Model 1 / Model 2 / Lasp-final / H+S / MDGen / bioemu2 + persistence & oracle), §2 defines *every* metric (CA-RMSD / Kabsch, RMSF & RMSF-r, Root-Mean / Variance / MD-PCA W2, contact Jaccard, energy scores, CA geometry validity, backbone N/CA/C/O stereochemistry, BioEmu-style static + MSM dynamics, order-aware trajectory metrics, temperature generalization) with units/direction/code, §9 gives **15 verified runnable commands** (one per result table), and §3–§7 carry all result tables. Every number carries its `n` + sampling budget; static vs. dynamics metrics are separated. |
 | 2 | **[`PROJECT_REPORT_20261021.md`](PROJECT_REPORT_20261021.md)** | **Full self-contained project report** — models, training recipes, results vs. persistence / MDGen / bioemu2, and limitations. |
 
 > Its plan / companion protocol is [`NEXT_STEP_EVALUATION_3TASKS_20261021.md`](NEXT_STEP_EVALUATION_3TASKS_20261021.md).
@@ -91,7 +91,7 @@ protein and held-out-temperature protocols.
 ## Reproducing the 3-task evaluation
 
 Each task's exact command is in the "Repro" section of
-[`EVALUATION_3TASKS_RESULTS_20261021.md`](EVALUATION_3TASKS_RESULTS_20261021.md).
+[`EVALUATION_METHODS_AND_COMMANDS_20261021.md`](EVALUATION_METHODS_AND_COMMANDS_20261021.md).
 The corresponding shell recipes live in [`run_scripts/`](run_scripts/):
 
 | Task | Recipe |

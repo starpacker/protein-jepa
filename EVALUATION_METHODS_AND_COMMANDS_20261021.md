@@ -1,7 +1,10 @@
-# 评测方案与结果总报告（Protein JEPA Frame）
+# 评测方法与复现命令总报告（Protein JEPA Frame）
 > **日期:** 2026-10-21（v2 全面扩充） · **配套:** [`PROJECT_REPORT_20261021.md`](PROJECT_REPORT_20261021.md)（模型/训练细节）
-> **范围:** 本文件是**评测方案的权威描述 + 全部评测结果汇总**。既包含三个最新任务（T1 主链重建 / T2 BioEmu+MSM / T3 温度泛化），也包含此前所有评测指标（CA-RMSD、Root-Mean W2、Variance W2、MD-PCA W2、接触 Jaccard、动力学能量分数、几何有效性、轨迹级 order-aware 指标等）。
+> **范围:** 本文件是**评测方法（method）与复现命令（command）的权威描述 + 全部评测结果汇总**。既包含三个最新任务（T1 主链重建 / T2 BioEmu+MSM / T3 温度泛化），也包含此前所有评测指标（CA-RMSD、Root-Mean W2、Variance W2、MD-PCA W2、接触 Jaccard、动力学能量分数、几何有效性、轨迹级 order-aware 指标等）。
 > **约定:** 每个数字都标注 **n（窗口/蛋白数）+ 采样预算 + 方向（↑/↓）**；分布/静态指标与动力学指标分表。
+> **被评测的方法（5 个 + 2 个参考基线）见 §1.2**；每条结果的复现命令见 §9（15 条，逐条校验过参数）。
+> **五方法同一 harness 的完整横评**（unseen 蛋白 / 温度泛化 / 1–64 ns / rollout）在
+> [`PROJECT_REPORT_20261021.md`](PROJECT_REPORT_20261021.md) **§13**，本文件 §3 是历史口径记录。
 
 ---
 
@@ -21,13 +24,14 @@
 | **轨迹级（order-aware）** | per-step RMSD、path_length/end_to_end/tortuosity、Rg curve、ACF lag-1、ACF-corr、walk-RMSF/RMSF-r、traj energy score | 漂移类↓，一致性↑ | §2.8 |
 | **温度泛化（T3）** | 5×{seen/unseen}×{correct/wrong/none} 矩阵（RMSF/RMSF-r/skill）、temperature_monotone | skill/RMSF-r↑，RMSF↓ | §2.9 |
 
-### 0.2 三个新任务结论
+### 0.2 任务结论（三个新任务 + 五方法横评）
 
 | 任务 | 结论 | 证据文件 |
 |---|---|---|
 | **T1 主链重建（OpenFold）** | 用 **vendored 官方 OpenFold** 把 N/CA/C/O 主链**贯通到 producer → 评测 → PDB 导出**。Model 1 的 backbone CA 列与 Cα 系综**逐位一致**（协议保证）。修正了一个评测口径错误：原 suite 的“真值”是从 Cα **重新 lift** 的理想几何，已改为**直接读真实 MD 的 N/CA/C/O**。 | `results/backbone_suite_model1_1000dom.json`、`artifacts/pdbs_1000dom_backbone_v1/` |
 | **T2 BioEmu 指标 + MSM 状态预测** | 实现 BioEmu 的（A）**静态系综**指标：reference-state **coverage**=0.540、free-energy **MAE**=0.779 kcal/mol、population **TV/JSD**；（B）BioEmu **没做**的**动力学/状态预测**指标：lagged state accuracy/macro-F1、转移矩阵误差、implied timescales，**以及“能否预测状态转变（或不变）”二分类指标**（转变 F1 0.13–0.27，诚实负结果）。 | `artifacts/eval_states_msm_1000dom.json` |
 | **T3 温度泛化性** | **两条模型都考察了温度输入**。Model 1（temp-cond head）给出完整 **5×{seen,unseen protein}×{correct/wrong/none}** 矩阵；**喂错温度显著掉点** → 真在用温度。Model 2（from-none GLE v4g）**correct≈wrong≈none** → 温度输入**几乎惰性**。另用温度留出训练检查未见温度外推（Δskill≈−0.03）。 | `artifacts/eval_temperature_generalization_cond_full.json`、`results/temperature_generalization_model2_v4g.json` |
+| **五方法同口径横评** | Model 1 / Model 2 / Lasp-final / MDGen / bioemu2 放进**同一 harness、同一 140 窗口计划**（5 温度 × {seen,unseen} × 1/4/16/64 ns）。结论：**系综指标 bioemu2 领先我们（19:4）**，但我们**Kabsch 位置精度 4 个时标全胜**、**64 ns rollout 更稳**；MDGen 对 bioemu2 是 0:20。 | `results/five_method/all.jsonl`（→ 主报告 §13） |
 
 ---
 
@@ -43,13 +47,30 @@
 | 窗口 | anchor 帧 → 未来 horizon 帧（horizons ∈ {1,4,16,64,192} ns）|
 | 温度切分 | `train_not450`(4T,15999) / `val_not450`(4T,2000) / `val_t450`(500) / `train_t450`（seen-protein × 450K）|
 
-### 1.2 三条基线（每个指标都必须对照）
+### 1.2 被评测的方法清单（5 个模型 + 2 个参考基线）
+
+> **本节是“到底评了哪些 method”的权威清单。** 每个 method 都有一张同口径结果表 + 一条 §9 复现命令。
+
+| # | 方法 | 是什么 | 评测入口 | 结果（本文件） |
+|---|---|---|---|---|
+| M1 | **模型 1**（Stage-A ensemble） | mdCATH 训练的 Stage-A encoder + B1a 解码器 + Gaussian 系综头 | `scripts/eval_ensemble_metrics_suite.py`（§9.1） | §3.1 / §7-① |
+| M2 | **模型 2**（from-none GLE v4e） | 不经 Stage-A/B1a，直接从 anchor 用 GLE 生成系综 | `evaluation/run_eval_fromnone_ensemble.py`（§9.3） | §3.2 / §7-③ |
+| M3 | **Lasp-final**（解冻解码器的 GLE 变体） | Stage-A 低 LR 联合微调 + **解冻** B1a 解码器 + GLE kernel | `scripts/eval_lasp_final.py`（§9.6） | §3.8 / §7-⑧ |
+| M4 | **H+S（Plan A）** | Stage-A+GLE 直连、clean paired 对模型 1 | `scripts/paired_hs_vs_model1.py` / `scripts/paired_walk_metrics.py`（§9.6） | §3.6 / §3.7 / §7-⑥⑦ |
+| M5 | **MDGen**（zero-shot + mdCATH 短训） | 外部基线；官方 ATLAS 权重 / 2 个短训 ckpt | `scripts/eval_mdgen_baseline.py`（§9.4） | §3.3 / §7-④ |
+| M6 | **bioemu2**（zero-shot，`bioemu2-preview`） | Microsoft 全原子扩散系综模型，**零微调** | `run_scripts/run_bioemu2_zeroshot{,_rep}.sh`（§9.5） | §3.4 / §7-⑤ |
+
+两个**参考基线**（不是竞争方法，但每张表都要有）：
 
 | 基线 | 定义 | 作用 |
 |---|---|---|
 | **persistence** | anchor 帧复制成系综（delta 系综） | “必须打赢”的诚实对手；短时标天花板 |
 | **oracle** | 真值作预测（`pred = true`） | 指标实现的**正确性校验**（RMSD/W2=0、RMSF-r=1） |
-| **zero-shot 外部** | MDGen / bioemu2 | 分布形态对标（见 §3） |
+
+> ⚠️ **五方法「同一 harness、同一窗口计划」的完整横评不在本文件**，而在
+> [`PROJECT_REPORT_20261021.md`](PROJECT_REPORT_20261021.md) **§13（结论）与 §13.8（T0–T8 大表）**。
+> 本文件 §3 的各表来自**不同的历史 harness / 窗口集**，**只能上下比较方向，不能跨节比数字**；
+> 要同表比较请用 §13.8。
 
 ### 1.3 公平性/因果契约（`evaluation/COMPARISON_PROTOCOL.md`）
 
@@ -204,7 +225,7 @@
 
 > 数据口径：**mdCATH-1000dom val（100 蛋白）**，帧间隔 1000 ps。模型 1 / 模型 2 / MDGen / bioemu2 同在 1000dom 家族（唯 MDGen 帧长 OOD）。
 
-### 3.1 模型 1（Stage-A ensemble，1000dom val，50 批/200 样本，n_samples=8）
+### 3.1 模型 1（Stage-A ensemble，1000dom val，50 批 × 4 = 200 窗口，n_samples=8）
 
 > 最终 B1a ckpt + 重训系综头。来源 `artifacts/eval_model1_1000dom/suite_v2.json`。
 
@@ -287,7 +308,16 @@
 | MDGen zero-shot | ~0 | 4.65 | 0.139 | 7.34 |
 | persistence | 0.000 | 1.77 | 0.111 | 3.31 |
 
-> **读法**：**在 RMSF-r / RMSF / pca_W2 三个分布形态指标上，模型 1 已优于所有 zero-shot baseline**（含 bioemu2）。**位置精度（Kabsch）仍是短板**——模型 1 rollout 8.39 Å 差于 persistence 3.87 Å。
+> **读法**：在**各自的历史口径**下，模型 1 的 8 帧窗数字（RMSF-r 0.673）高于 bioemu2 的 64 ns 单点（0.60）。
+> **但这不是同口径胜负**——协议、窗口、时标都不同。**在同 harness 的同口径横评里，
+> bioemu2 在 RMSF-r / pca_W2 / 接触 J 上反超我们**（见 `PROJECT_REPORT_20261021.md` §13.2/§13.3）。
+> 请以 §13 为准，本节此表只保留历史记录。
+> **位置精度（Kabsch）仍是短板**——模型 1 rollout 8.39 Å 差于 persistence 3.87 Å。
+>
+> ⚠️ **本表只能横着看方向，不能跨行比数字**：各行取自不同窗口集与不同时标
+> （模型 1 是 1/2/4/8 帧窗的 8 帧未来窗、bioemu2 是 1–64 ns 单点、MDGen 是 100 帧 rollout）。
+> **同口径五方法对比**见 `PROJECT_REPORT_20261021.md` §13.8。
+> 第五个方法 **Lasp-final** 的单列结果见 §3.8。
 
 ### 3.6 Stage A + GLE 直连（Plan A，terminal-only） vs 模型 1
 
@@ -323,6 +353,52 @@
 | acf_corr ↑ | 0.9191 | 0.9048 | −0.0143 | [−0.0202, −0.0086] | 平（均近满分） |
 
 **读法**：**整条轨迹上 H+S 全面、显著优于模型 1**——模型 1 的自回归 rollout 累积**严重全局漂移**（path_length 33 Å、end_to_end 15 Å），而 GLE 轨迹**物理上合理**（7.6 Å / 1.9 Å / 每步 4.5 Å）。这补上了系综指标看不到的维度：**GLE 的价值在“轨迹推进”，而非“终点系综”**。结果：`results/walk_plan_a_contig.json`。
+
+### 3.8 Lasp-final 系综指标（Lasp vs 模型 1，同窗口同批量）
+
+> 来源 `results/lasp_final_vs_model1_bioemu2.json`；**200 窗口 / n_samples=12**。
+> ⚠️ **该文件里只有 `persist` / `model1` / `lasp` 三列，没有 bioemu2 列**
+> （文件名是历史遗留，bioemu2 的同口径列在 `PROJECT_REPORT_20261021.md` §13.8 T7/T8）。
+> 本表与 §3.1 的窗口集不同，**只在本表内部可比，不要与 §3.1–§3.5 逐格相减**。
+> Lasp = §3.7b 的"解冻解码器"最终版。命令见 §9.6。
+
+| horizon | 指标 | 模型 1 | **Lasp-final** | 谁更好 |
+|---|---|---|---|---|
+| 1 ns | RMSF-r ↑ | 0.2851 | **0.3368** | **Lasp** ✅显著 |
+| 1 ns | RMSF ↓ | 1.1741 | **1.1028** | **Lasp**（不显著） |
+| 1 ns | root_W2 ↓ | **6.0098** | 6.1767 | 模型 1（不显著） |
+| 1 ns | var_W2 ↓ | 5.6502 | **5.3598** | **Lasp**（不显著） |
+| 1 ns | pca_W2 ↓ | 0.0858 | **0.0832** | **Lasp**（不显著） |
+| 1 ns | weak_J ↑ | 0.0000 | 0.0000 | 平（两边都是 0） |
+| 1 ns | trans_J ↑ | 0.1224 | **0.1245** | **Lasp**（不显著） |
+| 4 ns | RMSF-r ↑ | 0.3645 | **0.4789** | **Lasp** ✅显著 |
+| 4 ns | RMSF ↓ | 1.0756 | **1.0718** | **Lasp**（不显著） |
+| 4 ns | root_W2 ↓ | 3.9634 | **3.9433** | **Lasp**（不显著） |
+| 4 ns | var_W2 ↓ | 8.0140 | **7.5231** | **Lasp**（不显著） |
+| 4 ns | pca_W2 ↓ | 0.0843 | **0.0721** | **Lasp** ✅显著 |
+| 4 ns | weak_J ↑ | 0.1476 | **0.1548** | **Lasp**（不显著） |
+| 4 ns | trans_J ↑ | 0.2367 | **0.2431** | **Lasp**（不显著） |
+| 16 ns | RMSF-r ↑ | 0.3476 | **0.4090** | **Lasp** ✅显著 |
+| 16 ns | RMSF ↓ | 1.9652 | **1.6003** | **Lasp** ✅显著 |
+| 16 ns | root_W2 ↓ | **3.2547** | 3.2882 | 模型 1（不显著） |
+| 16 ns | var_W2 ↓ | 20.3343 | **17.2545** | **Lasp** ✅显著 |
+| 16 ns | pca_W2 ↓ | 0.1528 | **0.1310** | **Lasp** ✅显著 |
+| 16 ns | weak_J ↑ | 0.2055 | **0.2319** | **Lasp** ✅显著 |
+| 16 ns | trans_J ↑ | 0.3140 | **0.3206** | **Lasp** ✅显著 |
+| 64 ns | RMSF-r ↑ | **0.3483** | 0.3234 | 模型 1（不显著） |
+| 64 ns | RMSF ↓ | 3.0579 | **2.1136** | **Lasp** ✅显著 |
+| 64 ns | root_W2 ↓ | 4.4359 | **4.3723** | **Lasp** ✅显著 |
+| 64 ns | var_W2 ↓ | 33.3190 | **27.2152** | **Lasp** ✅显著 |
+| 64 ns | pca_W2 ↓ | 0.2041 | **0.1607** | **Lasp** ✅显著 |
+| 64 ns | weak_J ↑ | 0.1815 | **0.2225** | **Lasp** ✅显著 |
+| 64 ns | trans_J ↑ | 0.3015 | **0.3369** | **Lasp** ✅显著 |
+
+> **读法（28 项 = 7 指标 × 4 时标，配对 bootstrap 95% CI）**：
+> **Lasp 显著赢 15 项、显著输 0 项、13 项无显著差异** —— **没有任何一项显著变差**。
+> 优势随时标拉长**变大**：64 ns 的 RMSF 2.11 vs 3.06、var_W2 27.2 vs 33.3、
+> pca_W2 0.161 vs 0.204 —— **解冻解码器显著抑制长时标过度离散**。
+> 唯一均值变差的两项是 **64 ns RMSF-r（0.323 vs 0.348）与 16 ns root_W2**，两者**都不显著**。
+> 结论：**Lasp-final 是模型 1 的无显著退步改进版**，可作为主推 ckpt。
 
 ---
 
@@ -361,7 +437,8 @@
 
 ### 4.3 产物
 - `results/backbone_suite_model1_1000dom.json`（+ `artifacts/` 同名副本）
-- `artifacts/pdbs_1000dom_backbone_v1/{ground_truth,persistence,ours_stageA}.pdb`（真实 N/CA/C/O，PyMOL 可开，无 NaN/塌缩）
+- `artifacts/pdbs_1000dom_backbone_v1/<window>/{ground_truth,persistence,ours_stageA}.pdb`（真实 N/CA/C/O，PyMOL 可开，无 NaN/塌缩）。
+  实际窗口：`1nhwC00_320_R0_anchor7/`（L=60）、`1ka1A01_320_R0_anchor7/`（L=128）；索引见 `index.json`。
 
 ---
 
@@ -500,18 +577,23 @@
 
 ## 7. 全部表汇总（均附 n + 采样预算）
 
-| # | 表 | 指标家族 | 文件 | n / 预算 |
-|---|---|---|---|---|
-| ① | 主表（模型 1 系综） | RMSF/W2/Jaccard/Kabsch | `artifacts/eval_model1_1000dom/suite_v2.json` | 200 样本 / n_samples=8 |
-| ② | 模型 2 系综 | 同上 | `results/v4e_ensemble_eval.json` | 200 窗口 / n_samples=12 |
-| ③ | MDGen zero-shot | 同上 + Kabsch | `artifacts/eval_mdgen/mdgen_zeroshot_atlas_mdcath{,_seed7}.json`、`..._short_s{2000,6000}.json` | 32 窗口 |
-| ④ | bioemu2 zero-shot（单次 / 3 次 mean） | 同上 | `results/bioemu2_zeroshot.json` / `results/bioemu2_reps/summary.json` | 200 窗口 / n_samples=12 |
-| ⑤ | Plan A 系综配对 | RMSF/W2/Jaccard | `results/plan_a_hs_vs_model1.json` | 配对窗口 / M=8 |
-| ⑥ | Plan A 轨迹配对（walk） | order-aware | `results/walk_plan_a_contig.json` | 40 窗口 / M=6 |
-| ⑦ | **静态系综（BioEmu 式）** | coverage/free-energy/population | `artifacts/eval_states_msm_1000dom.json` | 40 蛋白 / 800 窗口 / n_samples=8 |
-| ⑧ | **动力学（MSM/lagged + 转变检测）** | state pred / transition | 同上 | 40 真实轨迹拟合 MSM；160 eval/格 |
-| ⑨ | **主链（backbone）** | N/CA/C/O RMSD + validity | `results/backbone_suite_model1_1000dom.json` | 60 窗口 / n_samples=8 |
-| ⑩ | **温度泛化** | 5×2×3 矩阵 | `artifacts/eval_temperature_generalization_cond_full.json`（M1）、`results/temperature_generalization_model2_v4g.json` + `..._tempsplit.json`（M2） | M1: 12 窗口/格；M2: 12 蛋白 × 3 reps/格 |
+> 每行的**文件**是唯一权威来源；**命令**列指向 §9 里能重跑它的那一节。
+> 「n / 预算」一列的数字都已在对应 JSON 里核实过（`n_windows` / `n_samples` / `n_batches`）。
+
+| # | 表 | 指标家族 | 文件（权威来源） | n / 预算 | 复现命令 |
+|---|---|---|---|---|---|
+| ① | 模型 1 系综（主表） | RMSF/W2/Jaccard | `artifacts/eval_model1_1000dom/suite_v2.json` | 50 批 × 4 = **200 窗口** / n_samples=8 | §9.1 |
+| ② | 模型 1 轨迹 rollout（Kabsch） | 位置精度 | `artifacts/eval_model1_1000dom/ours_rollout_100f_v2.json` | 32 批 × 4 = **128 窗口** / 100 帧 | §9.2 |
+| ③ | 模型 2 系综 | RMSF/W2/Jaccard | `results/v4e_ensemble_v2.json`（**不是** `v4e_ensemble_eval.json`） | **200 窗口** / n_samples=12 | §9.3 |
+| ④ | MDGen zero-shot / 短训 | 同上 + Kabsch | `artifacts/eval_mdgen/mdgen_zeroshot_atlas_mdcath{,_seed7}.json`、`mdgen_mdcath_short_s{2000,6000}.json` | 32 窗口 / n_samples=8 / 100 帧 | §9.4 |
+| ⑤ | bioemu2 zero-shot（单次 / 3 次 mean±std） | 同上 | `results/bioemu2_zeroshot.json` / `results/bioemu2_reps/summary.json` | 200 窗口 / n_samples=12；3 seeds | §9.5 |
+| ⑥ | Plan A 系综配对（Model 1 vs H+S） | RMSF/W2/Jaccard | `results/plan_a_hs_vs_model1.json` | 40 配对窗口 / M=8 | §9.6 |
+| ⑦ | Plan A 轨迹配对（walk） | order-aware | `results/walk_plan_a_contig.json` | 40 窗口 / M=6 | §9.6 |
+| ⑧ | **Lasp-final vs Model 1** | RMSF/W2/Jaccard（同窗口配对） | `results/lasp_final_vs_model1_bioemu2.json` | 200 窗口 / n_samples=12 | §9.6 |
+| ⑨ | **主链（bone，T1）** | N/CA/C/O RMSD + validity | `results/backbone_suite_model1_1000dom.json` | 30 批 × 2 = 60 窗口 / n_samples=8 | §9.7 |
+| ⑩ | **静态系综（BioEmu 口径，T2A）** | coverage/free-energy/population | `artifacts/eval_states_msm_1000dom.json` → `static` | 40 蛋白 / 800 窗口 / n_samples=8 | §9.8 |
+| ⑪ | **动力学（MSM/lagged + 转变检测，T2B）** | state pred / transition | 同上 → `dynamics` | 40 真实轨迹拟合 MSM；160 eval/格 | §9.8 |
+| ⑫ | **温度泛化（T3）** | 5×2×3 矩阵 | `artifacts/eval_temperature_generalization_cond_full.json`（M1 cond2）、`..._cond0.json`（M1 对照）、`results/temperature_generalization_model2_v4g.json` + `..._tempsplit.json`（M2） | M1: 12 窗口/格；M2: 12 蛋白 × 3 reps/格 | §9.9 / §9.10 |
 
 ---
 
@@ -520,7 +602,7 @@
 > 脚本：`scripts/export_eval_trajectories_pdb.py`（原精确坐标解码代码未改动）。每个窗口 6 条多 MODEL PDB（16 帧），可直接在 PyMOL/VMD 叠看。
 
 - **1000dom 版（推荐）**：`artifacts/pdbs_1000dom_20261020/`，窗口 `1nhwC00`(L=60)、`1ka1A01`(L=219)、`1kafD00`(L=104)，T=320 K、anchor frame 7。
-- **主链版（T1）**：`artifacts/pdbs_1000dom_backbone_v1/{ground_truth,persistence,ours_stageA}.pdb`（真实 N/CA/C/O）。
+- **主链版（T1）**：`artifacts/pdbs_1000dom_backbone_v1/<window>/{ground_truth,persistence,ours_stageA}.pdb`（真实 N/CA/C/O）。
 
 ### 8.1 ⚠️ 关键澄清：系综 PDB vs rollout PDB（“SOTA 却 RMSD 很差”的真相）
 
@@ -537,62 +619,100 @@
 
 ## 9. 复现命令
 
+> 全部命令在 `cd /liuyutian/protein_jepa_frame` 下执行。**每节标题后的 `→ 产物` 是它写出的文件**，
+> 与 §7 的表编号一一对应。所有 ckpt 路径均为仓库内相对路径。
+
 ```bash
-export CLAUDE_CODE_TMPDIR=/liuyutian/protein_jepa_frame/.tmpwork TMPDIR=$CLAUDE_CODE_TMPDIR
+export TMPDIR=/liuyutian/protein_jepa_frame/.tmpwork
 export PYTHONPATH=/liuyutian/protein_jepa_frame
+```
 
-# ---------- T1 主链评测（对照真实 MD N/CA/C/O）----------
-python -m scripts.eval_backbone_suite \
+### 9.1 主表：Model 1 系综（§3.1 / §7-①）→ `artifacts/eval_model1_1000dom/suite_v2.json`
+
+> `--batches 50 --batch-size 4` → 200 窗口（`suite_v2.json` 里 `n_batches=50, n_samples_total=200`）。
+> 不传 `--out` 只打印不落盘；**必须显式给 `--out`**。
+
+```bash
+python -m scripts.eval_ensemble_metrics_suite \
   --stage-a-ckpt artifacts/stage_a_disp_relpos/checkpoint_latest.pt \
   --b1a-ckpt artifacts/stage_b1a_relpos_anchored_1000dom/checkpoint_best.pt \
   --ensemble-ckpt artifacts/stage_ensemble_1000dom/checkpoint_best.pt \
   --manifest artifacts/mdcath_manifest_1000dom/val.jsonl \
-  --batches 30 --n-samples 8 --out results/backbone_suite_model1_1000dom.json
-# 主链 PDB
-python scripts/export_eval_trajectories_pdb.py --atoms backbone --ensemble \
-  --which ground_truth persistence ours_stageA \
-  --outdir artifacts/pdbs_1000dom_backbone_v1 --n-windows 2
+  --device cuda --batches 50 --batch-size 4 --n-samples 8 \
+  --horizons 1 2 4 8 --pca-k 3 \
+  --out artifacts/eval_model1_1000dom/suite_v2.json
+```
 
-# ---------- T2 静态 + 动力学 + 转变检测 ----------
-python -m scripts.eval_states_and_msm \
+### 9.2 轨迹 rollout 的 Kabsch / 位置精度（§3.1 末、§8.1）→ `artifacts/eval_model1_1000dom/ours_rollout_100f_v2.json`
+
+> 这是 `8.39 Å` 这唯一一个位置精度数字的来源（100 帧自回归 rollout，32 批 = 128 样本）。
+> **与 9.1 的「单步系综」是两个不同任务**，不要混引（见 §8.1）。
+
+```bash
+python -m scripts.eval_ours_trajectory \
   --stage-a-ckpt artifacts/stage_a_disp_relpos/checkpoint_latest.pt \
   --b1a-ckpt artifacts/stage_b1a_relpos_anchored_1000dom/checkpoint_best.pt \
   --ensemble-ckpt artifacts/stage_ensemble_1000dom/checkpoint_best.pt \
   --manifest artifacts/mdcath_manifest_1000dom/val.jsonl \
-  --max-proteins 40 --horizons 1 4 16 64 192 --n-samples 8 \
-  --out artifacts/eval_states_msm_1000dom.json
+  --device cuda --batches 32 --batch-size 4 --n-samples 8 --num-frames 100 \
+  --out artifacts/eval_model1_1000dom/ours_rollout_100f_v2.json
+```
 
-# ---------- T3 Model 1 温度矩阵 ----------
-python -m scripts.eval_temperature_generalization \
-  --ensemble-ckpt artifacts/stage_ensemble_1000dom_temp_cond/checkpoint_best.pt \
-  --stage-a-ckpt artifacts/stage_a_disp_relpos/checkpoint_latest.pt \
-  --b1a-ckpt artifacts/stage_b1a_relpos_anchored_1000dom/checkpoint_best.pt \
-  --manifest artifacts/mdcath_manifest_1000dom_temp/val_not450.jsonl \
-  --manifest-unseen-temp artifacts/mdcath_manifest_1000dom_temp/val_t450.jsonl \
-  --manifest-seen artifacts/mdcath_manifest_1000dom_temp/train_not450.jsonl \
-  --manifest-seen-t450 artifacts/mdcath_manifest_1000dom_temp/train_t450.jsonl \
-  --out artifacts/eval_temperature_generalization_cond_full.json
+### 9.3 Model 2 系综（§3.2 / §7-②）→ `results/v4e_ensemble_v2.json`
 
-# ---------- T3 Model 2 温度矩阵（from-none）----------
-python -m scripts.eval_temperature_generalization_model2 \
-  --ckpt artifacts/fromnone/stage_cb1b_v4g/checkpoint_latest.pt \
-  --manifest-seen-temp artifacts/mdcath_manifest_1000dom_temp/val_not450.jsonl \
-  --manifest-unseen-temp artifacts/mdcath_manifest_1000dom_temp/val_t450.jsonl \
-  --horizons 1 4 16 --max-proteins 12 --modes correct wrong none \
-  --out results/temperature_generalization_model2_v4g.json
+> ⚠️ **必须是 `v4e_ensemble_v2.json`（200 窗口 / n_samples=12）**。
+> 同目录的 `v4e_ensemble_eval.json` 是另一条 400 窗口 / n_samples=32 的 run，**不是本表来源**。
 
-# ---------- 历史主表：模型 1 系综（7 指标 + Kabsch）----------
-bash run_scripts/run_ensemble_1000dom.sh                 # 训练 Gaussian 系综头
-python -m scripts.eval_ensemble_metrics_suite            # 6 系综指标 + 3 基线
+```bash
+python -m evaluation.run_eval_fromnone_ensemble \
+  --ckpt artifacts/fromnone/stage_cb1b_v4e/checkpoint_latest.pt \
+  --manifest artifacts/mdcath_manifest_1000dom/val.jsonl \
+  --device cuda --max-windows 200 --n-samples 12 \
+  --horizons-ns 1 4 16 64 \
+  --out results/v4e_ensemble_v2.json
+```
 
-# ---------- 外部 zero-shot baseline ----------
-bash run_scripts/run_bioemu2_zeroshot.sh
-bash run_scripts/run_bioemu2_zeroshot_rep.sh             # 3 次重复
-python -m evaluation.baselines.summarize_reps --in-dir results/bioemu2_reps \
-  --out results/bioemu2_reps/summary.json
+### 9.4 MDGen zero-shot / 短训 baseline（§3.3 / §7-③）
 
-# ---------- Plan A 配对（系综 + 轨迹）----------
-bash run_scripts/run_paired_eval.sh                      # -> results/plan_a_hs_vs_model1.json
+```bash
+# zero-shot（官方 atlas 权重）
+python -m scripts.eval_mdgen_baseline \
+  --mdgen-ckpt /liuyutian/mdgen_run/hf_mdgen/atlas.ckpt \
+  --manifest artifacts/mdcath_manifest/val.jsonl \
+  --device cuda --n-windows 32 --n-samples 8 --num-frames 100 --horizon 1 \
+  --out artifacts/eval_mdgen/mdgen_zeroshot_atlas_mdcath.json
+# 同 seed=7 复核
+python -m scripts.eval_mdgen_baseline \
+  --mdgen-ckpt /liuyutian/mdgen_run/hf_mdgen/atlas.ckpt \
+  --manifest artifacts/mdcath_manifest/val.jsonl \
+  --device cuda --n-windows 32 --n-samples 8 --num-frames 100 --horizon 1 --seed 7 \
+  --out artifacts/eval_mdgen/mdgen_zeroshot_atlas_mdcath_seed7.json
+# mdCATH 短训两个 ckpt（e1/s2000、e5/s6000）
+for STEP in 2000 6000; do
+  python -m scripts.eval_mdgen_baseline \
+    --mdgen-ckpt "/liuyutian/mdgen_src/mdgen-master/workdir/mdcath_short/epoch=$( [ $STEP = 2000 ] && echo 1 || echo 5 )-step=${STEP}.ckpt" \
+    --manifest artifacts/mdcath_manifest/val.jsonl \
+    --device cuda --n-windows 32 --n-samples 8 --num-frames 100 --horizon 1 \
+    --out "artifacts/eval_mdgen/mdgen_mdcath_short_s${STEP}.json"
+done
+```
+
+### 9.5 bioemu2 zero-shot（§3.4 / §7-④）
+
+```bash
+bash run_scripts/run_bioemu2_zeroshot.sh        # -> results/bioemu2_zeroshot.json（单次，200 窗口 / n_samples=12）
+bash run_scripts/run_bioemu2_zeroshot_rep.sh    # -> results/bioemu2_reps/seed{0,1,2}.json（3 次重复）
+python -m evaluation.baselines.summarize_reps \
+  --glob "results/bioemu2_reps/seed*.json" --out results/bioemu2_reps/summary.json
+```
+
+### 9.6 Lasp / H+S（GLE）系综 + 轨迹（§3.6 / §3.7 / §7-⑤⑥）
+
+```bash
+# 系综配对（Model 1 vs H+S；clean paired，40 窗口）
+bash run_scripts/run_paired_eval.sh             # -> results/plan_a_hs_vs_model1.json
+                                                #    + results/plan_a_dense_vs_model1.json
+# order-aware 轨迹配对（§3.7）
 python -m scripts.paired_walk_metrics --mode hs \
   --kernel-ckpt artifacts/plan_a_hs_1000dom/checkpoint_best.pt \
   --ensemble-ckpt artifacts/stage_ensemble_1000dom/checkpoint_best.pt \
@@ -601,6 +721,162 @@ python -m scripts.paired_walk_metrics --mode hs \
   --manifest artifacts/mdcath_manifest_1000dom/val.jsonl \
   --protocol contiguous --horizons 8 --n-samples 6 \
   --out results/walk_plan_a_contig.json
+# Lasp-final vs Model 1 vs bioemu2 三方同口径（报告 §3.7b 的 Lasp 列）
+CKPT=artifacts/lasp_mh_1000dom/checkpoint_best.pt \
+OUT=results/lasp_final_vs_model1_bioemu2.json \
+  bash run_scripts/run_lasp_final_eval.sh
+```
+
+### 9.7 T1 主链（§4 / §7-⑨）→ `results/backbone_suite_model1_1000dom.json`
+
+> `--batches 30 --batch-size 2` → 60 窗口（与 §4.2 表头一致）。
+
+```bash
+python -m scripts.eval_backbone_suite \
+  --stage-a-ckpt artifacts/stage_a_disp_relpos/checkpoint_latest.pt \
+  --b1a-ckpt artifacts/stage_b1a_relpos_anchored_1000dom/checkpoint_best.pt \
+  --ensemble-ckpt artifacts/stage_ensemble_1000dom/checkpoint_best.pt \
+  --manifest artifacts/mdcath_manifest_1000dom/val.jsonl \
+  --device cuda --batches 30 --batch-size 2 --n-samples 8 --horizons 1 \
+  --out results/backbone_suite_model1_1000dom.json
+# 主链 PDB（真实 N/CA/C/O）
+python scripts/export_eval_trajectories_pdb.py --atoms backbone --ensemble \
+  --which ground_truth persistence ours_stageA \
+  --outdir artifacts/pdbs_1000dom_backbone_v1 --n-windows 2
+```
+
+### 9.8 T2 静态系综 + MSM 状态预测（§5 / §7-⑦⑧）→ `artifacts/eval_states_msm_1000dom.json`
+
+> `--max-proteins 40 --horizons 1 4 16 64 192 --n-samples 8` → `n_windows=800`（与产物一致）。
+
+```bash
+python -m scripts.eval_states_and_msm \
+  --stage-a-ckpt artifacts/stage_a_disp_relpos/checkpoint_latest.pt \
+  --b1a-ckpt artifacts/stage_b1a_relpos_anchored_1000dom/checkpoint_best.pt \
+  --ensemble-ckpt artifacts/stage_ensemble_1000dom/checkpoint_best.pt \
+  --manifest artifacts/mdcath_manifest_1000dom/val.jsonl \
+  --device cuda --max-proteins 40 --horizons 1 4 16 64 192 --n-samples 8 \
+  --out artifacts/eval_states_msm_1000dom.json
+```
+
+### 9.9 T3 温度泛化：Model 1（§6.3 / §7-⑩）→ `artifacts/eval_temperature_generalization_cond_full.json`
+
+> ⚠️ **必须加 `--max-windows-per-temp 12`**（脚本默认 40）。产物里每格 `n_windows=12`，
+> 用默认值会跑出 40 窗口/格，**复现不出 §6.3 的表**。
+
+```bash
+python -m scripts.eval_temperature_generalization \
+  --ensemble-ckpt artifacts/stage_ensemble_1000dom_temp_cond/checkpoint_best.pt \
+  --stage-a-ckpt artifacts/stage_a_disp_relpos/checkpoint_latest.pt \
+  --b1a-ckpt artifacts/stage_b1a_relpos_anchored_1000dom/checkpoint_best.pt \
+  --manifest artifacts/mdcath_manifest_1000dom_temp/val_not450.jsonl \
+  --manifest-unseen-temp artifacts/mdcath_manifest_1000dom_temp/val_t450.jsonl \
+  --manifest-seen artifacts/mdcath_manifest_1000dom_temp/train_not450.jsonl \
+  --manifest-seen-t450 artifacts/mdcath_manifest_1000dom_temp/train_t450.jsonl \
+  --device cuda --max-windows-per-temp 12 --n-samples 8 --horizons 1 2 4 8 \
+  --out artifacts/eval_temperature_generalization_cond_full.json
+# cond_dim=0 对照（§6.4）
+python -m scripts.eval_temperature_generalization \
+  --ensemble-ckpt artifacts/stage_ensemble_1000dom/checkpoint_best.pt \
+  --stage-a-ckpt artifacts/stage_a_disp_relpos/checkpoint_latest.pt \
+  --b1a-ckpt artifacts/stage_b1a_relpos_anchored_1000dom/checkpoint_best.pt \
+  --manifest artifacts/mdcath_manifest_1000dom_temp/val_not450.jsonl \
+  --manifest-unseen-temp artifacts/mdcath_manifest_1000dom_temp/val_t450.jsonl \
+  --manifest-seen artifacts/mdcath_manifest_1000dom_temp/train_not450.jsonl \
+  --manifest-seen-t450 artifacts/mdcath_manifest_1000dom_temp/train_t450.jsonl \
+  --device cuda --max-windows-per-temp 12 --n-samples 8 --horizons 1 2 4 8 \
+  --out artifacts/eval_temperature_generalization_cond0.json
+```
+
+### 9.10 T3 温度泛化：Model 2（§6.5 / §6.6.1 / §7-⑩）→ `results/temperature_generalization_model2_v4g.json`
+
+> ⚠️ **必须加 `--n-rollout-reps 3`**（脚本默认 4）与 `--max-proteins 12`。
+> 产物里 `n_rollout_reps=3`、每格 `n_proteins=12`。
+
+```bash
+# v4g（训练见过 T=450）
+python -m scripts.eval_temperature_generalization_model2 \
+  --ckpt artifacts/fromnone/stage_cb1b_v4g/checkpoint_latest.pt \
+  --manifest-seen-temp artifacts/mdcath_manifest_1000dom_temp/val_not450.jsonl \
+  --manifest-unseen-temp artifacts/mdcath_manifest_1000dom_temp/val_t450.jsonl \
+  --horizons 1 4 16 --max-proteins 12 --n-rollout-reps 3 --modes correct wrong none \
+  --out results/temperature_generalization_model2_v4g.json
+# 温度留出 ckpt（训练不含 T=450；§6.6.1 的 Δskill 列）
+python -m scripts.eval_temperature_generalization_model2 \
+  --ckpt artifacts/fromnone/stage_cb1b_temp_v2/checkpoint_latest.pt \
+  --manifest-seen-temp artifacts/mdcath_manifest_1000dom_temp/val_not450.jsonl \
+  --manifest-unseen-temp artifacts/mdcath_manifest_1000dom_temp/val_t450.jsonl \
+  --horizons 1 4 16 --max-proteins 12 --n-rollout-reps 3 --modes correct wrong none \
+  --out results/temperature_generalization_model2_tempsplit.json
+```
+
+### 9.12 标准评测（每次评测都必须带：分温度 + T3 机制矩阵 + T2A）
+
+> 2026-10-24 起，**任何** LASP CA dynamics checkpoint 的评测都走同一条命令，
+> 使 §2.6（T2A，BioEmu 口径）与 §2.9（T3 温度泛化）**不再可选**。
+
+```bash
+bash run_scripts/run_lasp_standard_eval.sh <tag> <ckpt_best> [<ckpt_best> ...]
+# 例：
+bash run_scripts/run_lasp_standard_eval.sh round2 \
+  artifacts/lasp_full_v1/dynamics_seed42/checkpoint_best.pt \
+  artifacts/lasp_full_v1/dynamics_seed43/checkpoint_best.pt \
+  artifacts/lasp_full_v1/dynamics_seed44/checkpoint_best.pt
+```
+
+每个 checkpoint 产出两类结果（各自独立进程，可指定 GPU）：
+
+| 产物 | 内容 |
+|---|---|
+| `<name>.ensemble.json` | 200 窗口 × 12 样本的统一 BioEmu2 协议系综指标（7 项）+ 几何；位置指标由 suite 提供 |
+| `<name>.suite.json` | 分温度扫描、**correct/wrong/none** 机制矩阵、**T2A**（coverage / free-energy MAE / population MAE·TV·JSD） |
+
+```bash
+# 等价的底层调用（suite 单个 checkpoint 时直接用它）
+python -m scripts.eval_lasp_ca_suite --checkpoint CK --out OUT.json --t2a \
+  --modes correct wrong none --wrong-temp 320 \
+  --proteins-per-temp 12 --anchors-per-trajectory 2 --n-samples 12 \
+  --horizons 1 4 16 64 --max-residues 96
+python -m scripts.report_lasp_ca_suite OUT_DIR/*.suite.json --out OUT_DIR/suite_report.json
+```
+
+**两条硬性防退化约束（写进代码 + 回归测试）：**
+
+1. **wrong 温度不得等于观测温度**。默认 `--wrong-temp 320` 恰好等于 mdCATH 最低温，
+   若不设防，T\*=320 的 wrong 臂会**逐位复现** correct 臂，该格机制检验无效。
+   现改为自动替换为最远 mdCATH 温度（450），并在每个窗口记录
+   `temperature_used_k`。已在飞行中的退化格用
+   `python -m scripts.merge_lasp_ca_suite` 以补跑单元格替换（aggregate /
+   by_horizon 由合并后的逐窗口行**重算**，不留旧平均）。
+2. **T2A 用预裁剪数组 + `mask=None`**。全长 mask 与已压缩数组长度不匹配，
+   现在直接抛错，防止错误的特征选择。
+
+**范围与噪声配对**：当前扫描的五个温度均在训练中出现，不能据此声称未见温度外推；
+完整 seen/unseen-protein 矩阵仍需独立实验。Round 1 使用旧版含 mode 的随机种子，
+三臂噪声不同；Round 2 及后续 `window_seed()` 只由窗口身份（protein/trajectory/anchor/horizon）决定，
+**不含 mode**，因此 correct/wrong/none 三臂抽取**同一噪声**、只差喂给模型的温度
+（温度同时进入 drift 与噪声尺度，共享噪声是真实的方差缩减）。
+
+**bioemu2 没有温度输入**：安装包源码中 `temperature` 出现 **0** 次，
+`propagate` / `propagate_with_embeddings` 均不接受温度参数。故
+correct/wrong/none 消融**只对本文模型可定义**；bioemu2 只做分温度 + T2A：
+
+```bash
+bash run_scripts/run_bioemu2_t2a_samples.sh    # 5 温度并行，每温度 160 窗口，--save-samples
+python -m scripts.t2a_from_samples --samples DIR --manifest ... --out bioemu2_t2a.json
+```
+
+bioemu2 侧取每温度**前 8 个蛋白**（已验证是 12 蛋白集合的子集）× 5 副本 × 1 anchor × 4 horizons
+= 每温度 160 窗口。LASP 必须另跑同样的 8 蛋白 / 1 anchor 协议并核对完整窗口身份、
+残基 mask 与参考构造，才可直接比较；12 蛋白 / 2 anchor 汇总不能直接替代。
+`oracle` 参考半分诊断使用不同的聚类参考，不是严格上限，不能据其归一化模型分数。
+
+### 9.11 训练（复现 ckpt 用；不是评测）
+
+```bash
+bash run_scripts/run_ensemble_1000dom.sh       # Model 1 的 Gaussian 系综头
+bash run_scripts/run_ensemble_temp_1000dom.sh  # cond_dim=2 温度条件头
+bash run_scripts/run_fromnone_temp_v2.sh       # Model 2 温度留出重训
 ```
 
 ---
@@ -609,12 +885,16 @@ python -m scripts.paired_walk_metrics --mode hs \
 
 1. **主链（T1）**：Model 1 主链为 Cα+理想几何拼出，**肽键/ω 不自洽**（肽键 validity 0.029、ω_trans 0.79）；要真正逐残基自洽需训练 **frame + torsion 头**（计划文档 T1.2 option B）。
 2. **MSM 状态预测（T2）**：1 ns 帧间隔下**转变检测 F1 低**（0.13–0.27）；下一步可缩短有效 lag / 用更多 anchor / 更长轨迹提升转变样本量。
-3. **位置精度（共同短板）**：模型 1 rollout Kabsch **8.39 Å** 差于 persistence **3.87 Å**；模型 2 `root_mean_w2` 短时标（1 ns）失败（位移过小）。**分布形态（RMSF-r/W2/接触）已稳赢，位置精度待攻。**
+3. **位置精度（共同短板）**：模型 1 rollout Kabsch **8.39 Å** 差于 persistence **3.87 Å**；模型 2 `root_mean_w2` 短时标（1 ns）失败（位移过小）。
+   ⚠️ **"分布形态已稳赢"只在历史口径（对 persistence / MDGen）成立**——**同 harness 对 bioemu2 我们实际上输 19:4**
+   （主报告 §13.2）。真实状况是：**锚定位置精度我们领先，分布形态 bioemu2 领先**，不能笼统说"已稳赢"。
 4. **温度泛化（T3）**：Model 1 temp-cond head 是**轻头重训**（冻结栈），可进一步在 **encoder 端**注入温度；Model 2 温度留出训练显示**外推代价温和（Δskill ≈ −0.03）但温度输入本身近乎惰性**，需在 encoder/decoder 端**显式注入**温度并在温度扰动下训练以激活 `temperature_proj` 通路，再用 §6.3 矩阵复测。
 5. **覆盖度**：单一 ε 会高估 coverage，报告已附 population TV/JSD + free-energy MAE 作为稳健补充。
 6. **baseline 口径**：MDGen zero-shot 是 **OOD**（10 ps vs 1000 ps/帧）；bioemu2 是**系综采样**而非轨迹推进，短时标输 persistence 属任务口径差异，非模型缺陷。
 7. **接触类 Jaccard 对 delta/近刚体基线退化**——引用时必须附 `n_true/n_pred`。
 8. **协议一致性**：训练用 contiguous、部分评测用 paired 两个协议；只要双方同用评测口径就自洽，若要比 horizon 曲线需统一。
+9. **本文件 §3 各表不可跨行比较**：来自不同 harness / 窗口集 / 时标（详见 §1.2 与 §3.5 警告）。**要同口径比较，用主报告 §13.8 的 T0–T8。**
+10. **Lasp 未接入 T1/T2/T3**：§3.8 只覆盖 7 项系综指标；主链、MSM、温度矩阵目前只对 Model 1（+ Model 2 的温度）做过。这是覆盖缺口，不是负面结果。
 
 ---
 
@@ -625,4 +905,7 @@ python -m scripts.paired_walk_metrics --mode hs \
 | 模型/训练细节（Stage-A / B1a / ensemble / GLE 配方） | [`PROJECT_REPORT_20261021.md`](PROJECT_REPORT_20261021.md) §5/§7 |
 | 复现性（bioemu2 三重非确定性修复） | [`PROJECT_REPORT_20261021.md`](PROJECT_REPORT_20261021.md) §3.5b |
 | Plan A 代码路径 / 失败模式（dense） | [`PROJECT_REPORT_20261021.md`](PROJECT_REPORT_20261021.md) §10 |
+| **五方法同一 harness 横评（结论 + T0–T8 大表）** | [`PROJECT_REPORT_20261021.md`](PROJECT_REPORT_20261021.md) **§13 / §13.8** |
+| **温度留出 / 时间尺度 / rollout 的多尺度对比** | [`PROJECT_REPORT_20261021.md`](PROJECT_REPORT_20261021.md) §13.8（T3–T6） |
 | **全部评测指标定义 + 结果（本文件）** | 本文 §1–§10 |
+| **本文件 §9 的可执行复现命令（15 条，已逐条校验）** | 本文 §9.1–§9.11 |
