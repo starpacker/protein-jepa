@@ -5,25 +5,64 @@ latent-state prediction on **mdCATH** (5 temperatures: 320 / 348 / 379 / 413 / 4
 
 ---
 
-## 📌 Start here — the two canonical documents
+## 📌 Start here — the two canonical documents (evaluation reference)
 
 | # | Document | What it is |
 |---|---|---|
 | 1 | **[`EVALUATION_METHODS_AND_COMMANDS_20261021.md`](EVALUATION_METHODS_AND_COMMANDS_20261021.md)** | **The authoritative evaluation methods + reproduction commands + full results reference.** §1.2 lists **every evaluated method** (Model 1 / Model 2 / Lasp-final / H+S / MDGen / bioemu2 + persistence & oracle), §2 defines *every* metric (CA-RMSD / Kabsch, RMSF & RMSF-r, Root-Mean / Variance / MD-PCA W2, contact Jaccard, energy scores, CA geometry validity, backbone N/CA/C/O stereochemistry, BioEmu-style static + MSM dynamics, order-aware trajectory metrics, temperature generalization) with units/direction/code, §9 gives **15 verified runnable commands** (one per result table), and §3–§7 carry all result tables. Every number carries its `n` + sampling budget; static vs. dynamics metrics are separated. |
 | 2 | **[`PROJECT_REPORT_20261021.md`](PROJECT_REPORT_20261021.md)** | **Full self-contained project report** — models, training recipes, results vs. persistence / MDGen / bioemu2, and limitations. |
 
-> Its plan / companion protocol is [`NEXT_STEP_EVALUATION_3TASKS_20261021.md`](NEXT_STEP_EVALUATION_3TASKS_20261021.md).
+> Its plan / companion protocol lives in `archive/docs_20261031/`.
 
 Everything else in the repo is either **code** (below) or **archived history** (`archive/`, see [Repository layout](#repository-layout)).
 
 ---
 
-## Secondary documents (read in this order)
+## ⭐ Current framework — LASP correct-framework rebuild (2026-10-31)
 
-- [`STAGE_A_AND_GLE.md`](STAGE_A_AND_GLE.md) — map of the **current-best code** for the two live model families (**Stage A** JEPA encoder + **GLE / from-none** latent Langevin dynamics) and the code that joins them.
-- [`STAGE_B_HS_RESULTS_20261021.md`](STAGE_B_HS_RESULTS_20261021.md) — the Stage-A + GLE join ("Stage B H+S") result.
-- [`EVALUATION_PLAN.md`](EVALUATION_PLAN.md) — the authoritative evaluation protocol and acceptance criteria.
-- [`REPAIR_PROGRESS.md`](REPAIR_PROGRESS.md) — 2026-10-17+ repair status and pilot evidence.
+This is the **baseline for further work**, replacing the frozen SOTA as the
+reference implementation. It keeps the SOTA dynamics and fixes the bath so the
+memory variable `S` actually enters the trajectory.
+
+| Document | What it is |
+|---|---|
+| [`LASP_CORRECT_FRAMEWORK_PLAN_20261031.md`](LASP_CORRECT_FRAMEWORK_PLAN_20261031.md) | Design, pre-registered criteria, tooling. |
+| [`RESULTS_LASP_CORRECT_FRAMEWORK_20261031.md`](RESULTS_LASP_CORRECT_FRAMEWORK_20261031.md) | Kalman sign fix, exact `S₀` posterior, memory bound, 9-arm ablation, verdict. |
+
+State of the art it must beat: the frozen SOTA ensemble in
+`results/sota_frozen_20261024_backup/` (never re-evaluated; kept as the yardstick).
+
+What is fixed relative to the old SOTA:
+
+- the Kalman gain sign (`K = −P·B_hᵀ·V⁻¹`; the covariance was fine, the mean was not);
+- `S₀` is a full Kalman posterior over the history (`s0_mode=exact`), not an
+  untrained amortised GRU, and not a "drive-only" recursion that is 76–95% off;
+- the bath is trained at a scale where `S` moves the trajectory
+  (`--coupling-scale 0.1 --gamma-scale 2e-5 --gamma-floor 2e-6`).
+
+Known limitation, measured: history carries only **2–4%** linearly-predictable
+memory beyond `H₀`, so `exact` vs `prior` does not separate on the primary
+metrics, and the retrained arms do **not** beat the frozen SOTA on
+`rmsf_corr` / `rmsf_mae` / `root_mean_w2`.  They do win on `md_pca_w2`.
+See the results document for the full verdict and the next-step options.
+
+Reproduce:
+
+```bash
+export PYTHONPATH=/tmp/lasp_stability_deps:.
+bash run_scripts/drive_lasp_s0_arms.sh        # 9-arm training grid
+bash run_scripts/run_lasp_s0_arms_eval.sh     # standard-200 ensemble metrics
+bash run_scripts/analyze_lasp_s0_arms.sh      # paired + 3-seed verdicts
+```
+
+## Secondary documents
+
+The 2026-10 Stage-A / GLE / Stage-B reports referenced by earlier revisions of
+this file (`STAGE_A_AND_GLE.md`, `STAGE_B_HS_RESULTS_20261021.md`,
+`EVALUATION_PLAN.md`, `REPAIR_PROGRESS.md`,
+`NEXT_STEP_EVALUATION_3TASKS_20261021.md`) are kept in
+`archive/docs_20261031/` — they document the superseded pipeline and are not
+part of the live code.
 
 Historical evaluation reports do **not** establish forecasting skill. New B1b training
 uses history-only autonomous H+S predictions; future H is a detached latent target.
