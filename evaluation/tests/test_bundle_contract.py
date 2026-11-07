@@ -9,6 +9,36 @@ from protein_jepa_frame.utils.contracts import build_representation_contract,bui
 from evaluation.loaders import build_bundle,_training_provenance,sha256_file
 
 
+@pytest.mark.parametrize('relative_positions', [False, True])
+def test_encoder_loader_preserves_relative_position_architecture(tmp_path, relative_positions):
+    from evaluation.loaders import load_encoder_stage_a
+    cfg = StageAV2Config(latent_dim=16, num_factors=2, encoder_depth=1, num_heads=2,
+                        predictor_depth=1, predictor_heads=2, predictor_spatial_depth=1,
+                        dropout=0., relative_position_features=relative_positions)
+    stage = StageAV2(cfg).eval()
+    checkpoint = tmp_path / 'encoder.pt'
+    torch.save(dict(encoder=stage.context_encoder.state_dict(),stage_a_v2_config=asdict(cfg)), checkpoint)
+    encoder, loaded_cfg = load_encoder_stage_a(checkpoint, 'cpu', {})
+    assert loaded_cfg.relative_position_features == relative_positions
+    coords = torch.randn(1, 1, 5, 4, 3)
+    mask = torch.ones(1, 1, 5, dtype=torch.bool)
+    aa = torch.zeros(1, 5, dtype=torch.long)
+    ri = torch.arange(5)[None]
+    with torch.no_grad():
+        torch.testing.assert_close(encoder(coords,mask,aa,ri,aa),
+                                   stage.context_encoder(coords,mask,aa,ri,aa), atol=0, rtol=0)
+
+
+def test_encoder_loader_rejects_contracted_architecture_mismatch(tmp_path):
+    from evaluation.loaders import load_encoder_stage_a
+    a, _, _ = checkpoints(tmp_path)
+    ck = torch.load(a, weights_only=False)
+    ck['stage_a_v2_config']['relative_position_features'] = False
+    torch.save(ck, a)
+    with pytest.raises(ValueError, match='architecture conflicts'):
+        load_encoder_stage_a(a, 'cpu', {})
+
+
 def checkpoints(tmp_path):
     torch.manual_seed(31)
     ac=StageAV2Config(latent_dim=16,num_factors=2,encoder_depth=1,num_heads=2,

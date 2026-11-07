@@ -1,14 +1,17 @@
-"""Train autonomous GLE against a fixed geometric CA representation.
+"""Train autonomous GLE with a fixed or teacher-constrained CA representation.
 
 True futures supply training targets only. Rollout starts from the observed
 anchor and optionally its observed history. Checkpoints embed the component
 weights and kernel configuration; no external mutable component is needed.
 """
 import argparse
+import copy
 from dataclasses import asdict
 import json
+import math
 from pathlib import Path
 import time
+import tempfile
 from protein_jepa_frame.training.lasp_run_state import step_batch,rng_state,restore_rng,budget_subset
 from protein_jepa_frame.training.train_utils import _lr_scale
 import torch
@@ -22,7 +25,30 @@ from protein_jepa_frame.training.train_utils import _move_batch,_set_reproducibi
 from protein_jepa_frame.training.train_stage_b1a import _extract_backbone_frames
 from protein_jepa_frame.models.ca_component_bundle import CAComponentBundle
 from protein_jepa_frame.models.stage_b1b import StageB1b,StageB1bConfig
+from protein_jepa_frame.training.train_lasp_calibration import teacher_terms
 from evaluation.ensemble_metrics_ext import _align_to
+from evaluation.geometry import kabsch_align
+
+
+def _observed_readout_weight(args,train_encoder):
+    weight=float(getattr(args,'observed_readout_weight',0.))
+    if not math.isfinite(weight) or weight<0:
+        raise ValueError('--observed-readout-weight must be finite and nonnegative')
+    if weight and not train_encoder:
+        raise ValueError('--observed-readout-weight > 0 requires --train-encoder')
+    return weight
+
+
+def _validate_resume_arguments(args,recorded):
+    recorded=dict(recorded)
+    # Absence in a legacy checkpoint means the term was disabled; it cannot
+    # silently acquire a positive weight on resume.
+    recorded.setdefault('observed_readout_weight',0.)
+    for key,value in recorded.items():
+        if key=='noise_kernel' and value is None:value='gaussian'
+        if key=='noise_cutoff' and value is None:value=10.
+        if key!='resume' and getattr(args,key)!=value:
+            raise ValueError(f'resume argument differs: {key}')
 
 
 def energy_score(samples,target):
@@ -33,6 +59,40 @@ def energy_score(samples,target):
     if len(samples)<2:raise ValueError('energy score requires >=2 samples')
     pair=torch.pdist(samples).mean()/scale
     return cross-.5*pair
+
+
+def temporal_observable(ca, mask, pairs, cutoff=8.0):
+    """Fixed differentiable geometry features for the multi-lag joint target.
+
+    ``ca`` is [M, L, 3] CA (one time point, full padded length), ``mask`` the
+    [L] boolean validity mask, ``pairs`` a [P,2] tensor of nonlocal valid-pair
+    indices.  Returns [M, 2P+1] with
+      * internal nonlocal pair distances (upper-triangular, |i-j|>=3 or cross-chain),
+      * nonlocal soft-contact occupancies sigmoid((cutoff - d)/0.5),
+      * global conformational scale (radius of gyration over valid residues, scalar).
+    The observable is the same for every lag, so concatenating lags gives the
+    joint vector Phi = [phi(X_1), phi(X_4), phi(X_16)].
+    """
+    dist = torch.cdist(ca, ca)                       # [M, L, L]
+    d = dist[:, pairs[:, 0], pairs[:, 1]]            # [M, P]
+    occ = torch.sigmoid((cutoff - d) / 0.5)          # [M, P]
+    v = ca[:, mask, :]
+    rg = (v - v.mean(dim=1, keepdim=True)).square().sum(-1).mean(-1).sqrt()  # [M]
+    return torch.cat((d, occ, rg[:, None]), dim=-1)  # [M, 2P+1]
+
+
+def joint_temporal_score(generated_cas, target_cas, mask, pairs):
+    """Multi-lag joint Energy Score.
+
+    ``generated_cas`` and ``target_cas`` are lists (one per lag) of [M,L,3] and
+    [T,L,3] CA tensors.  Each lag's observable is concatenated into one joint
+    vector, then a single energy score is taken over the joint vectors -- so the
+    three time points of one trajectory are scored jointly, not as independent
+    per-lag ensemble errors.
+    """
+    gen = torch.cat([temporal_observable(ca, mask, pairs) for ca in generated_cas], dim=-1)
+    tgt = torch.cat([temporal_observable(ca, mask, pairs) for ca in target_cas], dim=-1)
+    return energy_score(gen, tgt)
 
 
 def displacement_scales(anchor_h, target_h, anchor_x, target_x, mask):
@@ -164,37 +224,130 @@ def contact_probability_loss(predicted,target,objective='mae'):
 
 
 class CADynamics(torch.nn.Module):
-    def __init__(self,component,device,init_kernel=None,bath_dim=8,history_conditioning=False,noise_mix=0.,noise_length=8.,collective_mobility=False,noise_kernel=None,noise_cutoff=None,s0_mode=None):
+    def __init__(self,component,device,init_kernel=None,bath_dim=8,history_conditioning=False,noise_mix=0.,noise_length=8.,collective_mobility=None,noise_kernel=None,noise_cutoff=None,s0_mode=None):
         super().__init__()
-        self.bundle=CAComponentBundle(component,device)
         self.history_conditioning=history_conditioning
         self.noise_mix=noise_mix;self.noise_length=noise_length
-        self.collective_mobility=collective_mobility
         if init_kernel:
             ck=torch.load(init_kernel,map_location='cpu',weights_only=False)
             config=StageB1bConfig(**ck['kernel_config'])
-            # A checkpoint must be evaluated with the kernel it was trained under.
-            # Leaving the flag unset inherits the recorded kernel instead of
-            # silently reverting a trained arm to the default.
+            # Preserve checkpoint transition semantics. Older checkpoints without
+            # this field used the non-collective sampler.
             recorded=ck.get('args',{})
+            if collective_mobility is None:
+                collective_mobility=recorded.get('collective_mobility',False)
             if noise_kernel is None:noise_kernel=recorded.get('noise_kernel','gaussian')
             if noise_cutoff is None:noise_cutoff=recorded.get('noise_cutoff',10.)
         else:
             config=StageB1bConfig(bath_dim=bath_dim,tail_init=.01,max_step_norm=10.,max_gamma_step=1.)
+            if collective_mobility is None:
+                collective_mobility=True
         if noise_kernel is None:noise_kernel='gaussian'
         if noise_cutoff is None:noise_cutoff=10.
+        # Restore the entire representation paired with the dynamics, including
+        # decoder weights, projection settings and calibration metadata. This
+        # also makes resumption independent of a mutable --component file.
+        embedded=ck.get('component_checkpoint') if init_kernel else None
+        if embedded is not None:
+            self.component_source=embedded
+            with tempfile.TemporaryDirectory(prefix='lasp_component_') as directory:
+                path=Path(directory)/'component.pt'
+                torch.save(embedded,path)
+                self.bundle=CAComponentBundle(str(path),device)
+        else:
+            # The bundle owns loading its component. Training reads its source
+            # metadata only when saving; lightweight alternative bundle classes
+            # need not implement the checkpoint file interface themselves.
+            self.component_source=None
+            self.bundle=CAComponentBundle(component,device)
         if noise_kernel not in ('gaussian','elastic'):
             raise ValueError(f'unknown noise kernel {noise_kernel!r}')
         if not noise_cutoff>0:raise ValueError('noise cutoff must be positive')
         self.noise_kernel=noise_kernel;self.noise_cutoff=noise_cutoff
+        self.collective_mobility=collective_mobility
         self.kernel=StageB1b(config).to(device)
         if init_kernel:self.kernel.load_state_dict(ck['kernel'],strict=True)
         # Restore the trained S_0 source so evaluation cannot silently use a
         # different prior than the checkpoint saw.
         if s0_mode is None:s0_mode=ck.get('args',{}).get('s0_mode','gru') if init_kernel else 'gru'
-        if s0_mode not in ('gru','exact','prior'):
+        if s0_mode not in ('gru','exact','exact_spatial','prior'):
             raise ValueError(f'unknown s0_mode {s0_mode!r}')
         self.kernel.s0_mode=s0_mode
+        self.train_encoder=False
+        self.target_encoder=None
+
+    def enable_encoder_training(self):
+        """Keep a fixed target basis while learning from autonomous forecasts.
+
+        The teacher is the calibrated starting encoder, not future input to
+        the sampler. The geometric decoder remains fixed so an apparent gain
+        cannot be obtained by changing the readout at the same time.
+        """
+        self.train_encoder=True
+        self.target_encoder=copy.deepcopy(self.bundle.encoder).eval()
+        self.target_encoder.requires_grad_(False)
+        self.bundle.encoder.requires_grad_(True)
+        self.kernel.bath.detach_conditioning=False
+
+    def train(self,mode=True):
+        super().train(mode)
+        # Preserve the deterministic frame representation used at deployment.
+        # eval() controls dropout, not whether encoder gradients are computed.
+        self.bundle.eval()
+        if getattr(self,'target_encoder',None) is not None:
+            self.target_encoder.eval()
+        return self
+
+    def component_checkpoint(self,source):
+        """Snapshot the live encoder along with the existing decoder contract."""
+        checkpoint=copy.deepcopy(source)
+        checkpoint['encoder']={k:v.detach().cpu().clone() for k,v in self.bundle.encoder.state_dict().items()}
+        return checkpoint
+
+    def representation_retention(self,batch):
+        # Retention sees only observed frames. Future supervision stays in the
+        # detached teacher target and the coordinate forecast losses.
+        observed=batch['coords'][:,:4]
+        b,t,l=observed.shape[:3]
+        mask=batch['residue_mask'][:,:4].all(1)
+        expand=lambda x:x[:,None].expand(b,t,l).reshape(b*t,l)
+        rm=mask[:,None].expand(b,t,l).reshape(b*t,l)
+        inputs=(observed.reshape(b*t,1,l,4,3),rm[:,None],
+                *[expand(batch[k]) for k in ('aatype','residue_index','chain_id')])
+        student=self.bundle.encoder(*inputs,token_mask=rm[:,None])[:,0].reshape(b,t,l,-1)
+        with torch.no_grad():
+            teacher=self.target_encoder(*inputs,token_mask=rm[:,None])[:,0].reshape(b,t,l,-1)
+        return teacher_terms(student,teacher,mask)
+
+    def observed_readout_retention(self,batch):
+        """Observed CA vector MSE (Angstrom^2), matching the readout diagnostic.
+
+        Decode the first three observed H states relative to the fourth anchor
+        through the fixed decoder and its existing bond projection. Both H
+        paths retain encoder gradients; labels use only the observed anchor
+        gauge. Each clip averages residues/frames before the batch average.
+        """
+        observed=batch['coords'][:,:4]
+        mask=batch['residue_mask'][:,:4].all(1)
+        b,t,l=observed.shape[:3]
+        if t!=4 or bool((mask.sum(-1)<4).any()):
+            raise ValueError('observed readout retention needs four frames and >=4 valid residues')
+        expand=lambda value,n:value[:,None].expand(b,n,*value.shape[1:]).reshape(b*n,*value.shape[1:])
+        metadata=[batch[k] for k in ('aatype','residue_index','chain_id')]
+        h=self.bundle.encode(observed.reshape(b*t,l,4,3),expand(mask,t),
+                             *[expand(value,t) for value in metadata]).reshape(b,t,l,-1)
+        rotation,anchor=_extract_backbone_frames(observed[:,-1])
+        prediction=self.bundle.decode_ca(h[:,:3].reshape(b*3,l,-1),expand(h[:,3],3),
+            *[expand(value,3) for value in metadata],expand(rotation,3),expand(anchor,3),
+            expand(mask,3)).reshape(b,3,l,3)
+        values=[]
+        for index in range(b):
+            m=mask[index]
+            with torch.no_grad():
+                truth=torch.stack([kabsch_align(frame[:,1],anchor[index],m)
+                                   for frame in observed[index,:3]])
+            values.append((prediction[index,:,m]-truth[:,m]).square().sum(-1).mean())
+        return torch.stack(values).mean()
 
     def anchor_kernel(self,anchor_ca,mask,temperature_k=None):
         """Cholesky factor of the anchor-conditioned spatial noise kernel."""
@@ -209,38 +362,64 @@ class CADynamics(torch.nn.Module):
         mask=batch['residue_mask'].all(1)
         expand=lambda x:x[:,None].expand(b,t,l).reshape(b*t,l)
         with torch.no_grad():
-            h=self.bundle.encode(coords.reshape(b*t,l,4,3),mask[:,None].expand(b,t,l).reshape(b*t,l),
-                *[expand(batch[k]) for k in ('aatype','residue_index','chain_id')])
+            if getattr(self,'target_encoder',None) is None:
+                h=self.bundle.encode(coords.reshape(b*t,l,4,3),mask[:,None].expand(b,t,l).reshape(b*t,l),
+                    *[expand(batch[k]) for k in ('aatype','residue_index','chain_id')])
+            else:
+                rm=mask[:,None].expand(b,t,l).reshape(b*t,l)
+                h=self.target_encoder(coords.reshape(b*t,1,l,4,3),rm[:,None],
+                    *[expand(batch[k]) for k in ('aatype','residue_index','chain_id')],token_mask=rm[:,None])[:,0]
         return h.reshape(b,t,l,-1),mask
 
     def sample(self,observed,mask,aa,ri,ci,temp,steps,n_samples,generator=None,grad_steps=None):
         # observed [B,K,L,4,3]; only observed input, no future or target argument.
         b,k,l=observed.shape[:3]
-        with torch.no_grad():h=self.bundle.encode(observed[:,-1],mask,aa,ri,ci)
+        encoder_grad=torch.is_grad_enabled() and self.training and getattr(self,'train_encoder',False)
+        with torch.set_grad_enabled(encoder_grad):
+            h=self.bundle.encode(observed[:,-1],mask,aa,ri,ci)
         repeat=lambda x:x[:,None].expand(b,n_samples,*x.shape[1:]).reshape(b*n_samples,*x.shape[1:])
         start=repeat(h);rm=repeat(mask)
-        history=None;dt=None
+        history=None;dt=None;history_once=None;dt_once=None
         if self.history_conditioning:
             # Use the same final four observed frames at train and evaluation time.
             frames=observed[:,-4:];n=frames.shape[1]
             expand=lambda x:x[:,None].expand(b,n,*x.shape[1:]).reshape(b*n,*x.shape[1:])
-            with torch.no_grad():
-                history=self.bundle.encode(frames.reshape(b*n,l,4,3),expand(mask),
+            with torch.set_grad_enabled(encoder_grad):
+                history_once=self.bundle.encode(frames.reshape(b*n,l,4,3),expand(mask),
                     expand(aa),expand(ri),expand(ci)).reshape(b,n,l,-1)
-            history=repeat(history)
-            dt=torch.full((b*n_samples,n),self.kernel.cfg.step_ps,device=start.device)
-        factor=None
+            history=repeat(history_once)
+            dt_once=torch.full((b,n),self.kernel.cfg.step_ps,device=start.device)
+            dt=repeat(dt_once)
+        factor=None;factor_once=None
         if getattr(self,'noise_mix',0.):
-            factor=repeat(self.anchor_kernel(observed[:,-1,:,1],mask))
+            factor_once=self.anchor_kernel(observed[:,-1,:,1],mask)
+            factor=repeat(factor_once)
         # Training differentiates through -grad U, requiring attention double backward.
         # Fused CUDA SDPA kernels do not implement that derivative.
         # temperature=None omits the explicit temperature input (T3 'none' ablation).
         temp_tensor=None if temp is None else repeat(temp[:,None]).flatten()
         with sdpa_kernel(SDPBackend.MATH):
+            initial_bath=None
+            if getattr(self.kernel,'s0_mode','gru')=='exact_spatial':
+                if history_once is None or not self.collective_mobility:
+                    raise ValueError('exact_spatial requires observed history and collective mobility')
+                # Ensemble members share the same observed window. Filter once
+                # per window, then draw independent samples with the FULL bath
+                # factor. Repeating the filter would multiply its dense bath
+                # covariance memory and backward cost by n_samples.
+                mean,chol=self.kernel.initial_bath_state(
+                    history_once,dt_once,temp,mask,seq_feature=h,
+                    noise_factor=factor_once,create_graph=self.training)
+                eps=torch.randn((b,n_samples,mean.shape[1]*mean.shape[2]),
+                    device=start.device,dtype=start.dtype,generator=generator)
+                centered=torch.einsum('bij,bmj->bmi',chol,eps).reshape(
+                    b,n_samples,*mean.shape[1:])
+                initial_bath=(mean[:,None]+centered).reshape(b*n_samples,*mean.shape[1:])
             traj=self.kernel.rollout(start,rm,temp_tensor,steps,
                  H_hist=history,dt_hist=dt,seq_feature=start,generator=generator,
+                 S0=initial_bath,
                  detach=not self.training,grad_steps=grad_steps,noise_factor=factor,
-                 collective_mobility=getattr(self,'collective_mobility',False))
+                 collective_mobility=self.collective_mobility)
         prediction_kind=getattr(self,'prediction_kind','endpoint')
         if prediction_kind not in ('endpoint','time_mixture'):
             raise ValueError(f'unknown prediction_kind: {prediction_kind}')
@@ -262,11 +441,103 @@ class CADynamics(torch.nn.Module):
         ca=self.bundle.decode_ca(endpoint,start,repeat(aa),repeat(ri),repeat(ci),repeat(R),repeat(anchor),rm)
         return ca.reshape(b,n_samples,l,3),endpoint.reshape(b,n_samples,l,-1)
 
+    def sample_temporal(self,observed,mask,aa,ri,ci,temp,lags,n_samples,generator=None,grad_steps=None):
+        """Roll out one continuous trajectory to max(lags) and decode CA at each lag.
+
+        Mirrors ``sample`` (same encoder/history/bath-initialisation), but instead
+        of a single endpoint it returns the decoded CA at every requested lag as a
+        list of [b, n_samples, L, 3] tensors sharing one H/S rollout.  This is the
+        sampling backbone for the multi-lag joint Energy Score (target='temporal').
+        """
+        b,k,l=observed.shape[:3]
+        encoder_grad=torch.is_grad_enabled() and self.training and getattr(self,'train_encoder',False)
+        with torch.set_grad_enabled(encoder_grad):
+            h=self.bundle.encode(observed[:,-1],mask,aa,ri,ci)
+        repeat=lambda x:x[:,None].expand(b,n_samples,*x.shape[1:]).reshape(b*n_samples,*x.shape[1:])
+        start=repeat(h);rm=repeat(mask)
+        history=None;dt=None;history_once=None;dt_once=None
+        if self.history_conditioning:
+            frames=observed[:,-4:];n=frames.shape[1]
+            expand=lambda x:x[:,None].expand(b,n,*x.shape[1:]).reshape(b*n,*x.shape[1:])
+            with torch.set_grad_enabled(encoder_grad):
+                history_once=self.bundle.encode(frames.reshape(b*n,l,4,3),expand(mask),
+                    expand(aa),expand(ri),expand(ci)).reshape(b,n,l,-1)
+            history=repeat(history_once)
+            dt_once=torch.full((b,n),self.kernel.cfg.step_ps,device=start.device)
+            dt=repeat(dt_once)
+        factor=None;factor_once=None
+        if getattr(self,'noise_mix',0.):
+            factor_once=self.anchor_kernel(observed[:,-1,:,1],mask)
+            factor=repeat(factor_once)
+        temp_tensor=None if temp is None else repeat(temp[:,None]).flatten()
+        steps=max(lags)
+        with sdpa_kernel(SDPBackend.MATH):
+            initial_bath=None
+            if getattr(self.kernel,'s0_mode','gru')=='exact_spatial':
+                if history_once is None or not self.collective_mobility:
+                    raise ValueError('exact_spatial requires observed history and collective mobility')
+                mean,chol=self.kernel.initial_bath_state(
+                    history_once,dt_once,temp,mask,seq_feature=h,
+                    noise_factor=factor_once,create_graph=self.training)
+                eps=torch.randn((b,n_samples,mean.shape[1]*mean.shape[2]),
+                    device=start.device,dtype=start.dtype,generator=generator)
+                centered=torch.einsum('bij,bmj->bmi',chol,eps).reshape(
+                    b,n_samples,*mean.shape[1:])
+                initial_bath=(mean[:,None]+centered).reshape(b*n_samples,*mean.shape[1:])
+            traj=self.kernel.rollout(start,rm,temp_tensor,steps,
+                 H_hist=history,dt_hist=dt,seq_feature=start,generator=generator,
+                 S0=initial_bath,
+                 detach=not self.training,grad_steps=grad_steps,noise_factor=factor,
+                 collective_mobility=self.collective_mobility)
+        R,anchor=_extract_backbone_frames(observed[:,-1])
+        cas=[]
+        for lag in lags:
+            endpoint=traj[:,lag]
+            ca=self.bundle.decode_ca(endpoint,start,repeat(aa),repeat(ri),repeat(ci),
+                                     repeat(R),repeat(anchor),rm)
+            cas.append(ca.reshape(b,n_samples,l,3))
+        return cas
+
     def losses(self,batch,horizon,args,generator):
+        observed_readout_weight=_observed_readout_weight(args,getattr(self,'train_encoder',False))
         # 4 history frames + horizon true future, all at 1ns spacing.
         observed=batch['coords'][:,:4]
         h,mask=self.encode_clip(batch)
-        ca,generated=self.sample(observed,mask,*[batch[k] for k in ('aatype','residue_index','chain_id')],
+        # Future validity affects scoring only; forecasts receive the mask
+        # available from the observed history, exactly as at evaluation.
+        observed_mask=batch['residue_mask'][:,:4].all(1)
+        if args.target=='temporal':
+            # Multi-lag joint Energy Score: one continuous rollout, decode at each
+            # requested lag, and score the concatenated observable vector against
+            # the same-lag true MD observables jointly.
+            lags=tuple(int(v) for v in args.temporal_lags)
+            if horizon<max(lags):
+                # Roll out to max(lags) regardless of the horizon slot.
+                horizon=max(lags)
+            cas=self.sample_temporal(observed,observed_mask,*[batch[k] for k in ('aatype','residue_index','chain_id')],
+                 batch['temperature_k'],lags,args.n_samples,generator,args.grad_steps)
+            temporal_loss=cas[0].new_zeros(())
+            n_batches=0
+            for b in range(len(cas[0])):
+                m=mask[b];anchor=observed[b,-1,:,1]
+                truth=batch['coords'][b,3:,:,1]
+                with torch.no_grad():truth=_align_to(truth,anchor,m)
+                # True CA at each lag: frame index 3+lag (0-based, after 4 history frames).
+                target_cas=[truth[lag-1:lag] for lag in lags]      # each [1,L,3]
+                gen_cas=[ca[b] for ca in cas]                       # each [n_samples,L,3]
+                # Build nonlocal pair index for the temporal observable.
+                pairs=m[:,None]&m[None,:]
+                sep=(batch['residue_index'][b,:,None]-batch['residue_index'][b,None,:]).abs()
+                same=batch['chain_id'][b,:,None]==batch['chain_id'][b,None,:]
+                pairs=pairs&((sep>=3)|~same)
+                pairs=pairs&torch.triu(torch.ones_like(pairs),diagonal=1)
+                if not pairs.any():raise ValueError('no valid nonlocal residue pairs')
+                pair_idx=pairs.nonzero(as_tuple=False)
+                temporal_loss=temporal_loss+joint_temporal_score(gen_cas,target_cas,m,pair_idx)
+                n_batches+=1
+            temporal_loss=temporal_loss/max(1,n_batches)
+            return dict(temporal_es=temporal_loss,loss=temporal_loss)
+        ca,generated=self.sample(observed,observed_mask,*[batch[k] for k in ('aatype','residue_index','chain_id')],
              batch['temperature_k'],horizon,args.n_samples,generator,args.grad_steps)
         latent_loss=ca.new_zeros(());coord_loss=latent_loss;contact_loss=latent_loss;rmsf_loss=latent_loss;distance_loss=latent_loss;clash_loss=latent_loss;mode_loss=latent_loss;mode_distribution_loss=latent_loss
         for b in range(len(ca)):
@@ -309,6 +580,12 @@ class CADynamics(torch.nn.Module):
         b=len(ca)
         terms=dict(latent_es=latent_loss/b,coord_es=coord_loss/b,contact=contact_loss/b,rmsf=rmsf_loss/b,distance_es=distance_loss/b,clash=clash_loss/b,slow_mode_scale=mode_loss/b,slow_mode_distribution=mode_distribution_loss/b)
         terms['loss']=args.latent_weight*terms['latent_es']+terms['coord_es']+args.contact_weight*terms['contact']+args.rmsf_weight*terms['rmsf']+args.distance_weight*terms['distance_es']+args.clash_weight*terms['clash']+args.mode_weight*terms['slow_mode_scale']+getattr(args,'mode_distribution_weight',0.)*terms['slow_mode_distribution']
+        if getattr(self,'train_encoder',False):
+            terms['teacher'],terms['teacher_delta']=self.representation_retention(batch)
+            terms['loss']=terms['loss']+args.teacher_weight*terms['teacher']+args.teacher_delta_weight*terms['teacher_delta']
+            if observed_readout_weight:
+                terms['observed_readout_mse']=self.observed_readout_retention(batch)
+                terms['loss']=terms['loss']+observed_readout_weight*terms['observed_readout_mse']
         return terms
 
 
@@ -334,11 +611,19 @@ def main():
     p.add_argument('--component',required=True);p.add_argument('--output',required=True)
     p.add_argument('--init-kernel');p.add_argument('--bath-dim',type=int,default=8)
     p.add_argument('--history-conditioning',action='store_true')
+    p.add_argument('--train-encoder',action='store_true',
+                   help='feed autonomous forecast gradients into H, with a frozen target encoder and decoder')
+    p.add_argument('--encoder-lr-scale',type=float,default=.1)
+    p.add_argument('--teacher-weight',type=float,default=1.)
+    p.add_argument('--teacher-delta-weight',type=float,default=.1)
+    p.add_argument('--observed-readout-weight',type=float,default=0.,
+                   help='joint-only observed CA vector MSE weight; keeps the fixed decoder readout of the first four frames')
     p.add_argument('--noise-mix',type=float,default=0.)
     p.add_argument('--noise-length',type=float,default=8.)
     p.add_argument('--noise-kernel',choices=['gaussian','elastic'],default=None)
     p.add_argument('--noise-cutoff',type=float,default=None)
-    p.add_argument('--collective-mobility',action='store_true')
+    p.add_argument('--collective-mobility',action=argparse.BooleanOptionalAction,default=None,
+                   help='use the shared-displacement transition required by exact S_0 inference (default: on for new runs)')
     # Bath physical scales.  The defaults reproduce the historical kernel; the
     # audit showed that at these values C^T M C << Gamma, so S is driven by its
     # own thermostat noise and carries no information about H.  Exposing them
@@ -347,7 +632,8 @@ def main():
     p.add_argument('--gamma-scale',type=float,default=None)
     p.add_argument('--gamma-floor',type=float,default=None)
     # Source of the initial bath state when history conditioning is on.
-    p.add_argument('--s0-mode',choices=['gru','exact','prior'],default='gru')
+    p.add_argument('--s0-mode',choices=['gru','exact','exact_spatial','prior'],default=None,
+                   help='initial bath inference (default: inherit warm start/resume, otherwise gru)')
     p.add_argument('--manifest',default='artifacts/mdcath_manifest_full/train.jsonl')
     p.add_argument('--val-manifest',default='artifacts/mdcath_manifest_full/val.jsonl')
     p.add_argument('--steps',type=int,default=300);p.add_argument('--horizons',type=int,nargs='+',default=[1,4,16,64])
@@ -362,13 +648,61 @@ def main():
     p.add_argument('--mode-weight',type=float,default=0.)
     p.add_argument('--mode-distribution-weight',type=float,default=0.)
     p.add_argument('--seed',type=int,default=42)
-    p.add_argument('--target',choices=['endpoint','path_mixture'],default='endpoint')
-    a=p.parse_args();torch.set_num_threads(4);_set_reproducibility(a.seed,False)
+    p.add_argument('--target',choices=['endpoint','path_mixture','temporal'],default='endpoint')
+    p.add_argument('--temporal-lags',type=int,nargs='+',default=[1,4,16],
+                   help='lags (ns) scored jointly by the temporal target')
+    a=p.parse_args()
+    _observed_readout_weight(a,a.train_encoder)
+    if a.s0_mode is None:
+        if a.resume:
+            source_args=json.loads((Path(a.output)/'run.json').read_text())['args']
+        elif a.init_kernel:
+            source_args=torch.load(a.init_kernel,map_location='cpu',weights_only=False).get('args',{})
+        else:
+            source_args={}
+        a.s0_mode=source_args.get('s0_mode','gru')
+    if a.collective_mobility is None:
+        if a.resume:
+            prior_args=json.loads((Path(a.output)/'run.json').read_text())['args']
+            a.collective_mobility=prior_args.get('collective_mobility',False)
+        elif a.init_kernel:
+            init_ck=torch.load(a.init_kernel,map_location='cpu',weights_only=False)
+            a.collective_mobility=init_ck.get('args',{}).get('collective_mobility',False)
+        else:
+            a.collective_mobility=True
+    if a.target=='temporal':
+        # The temporal target needs the true MD path to cover every requested lag,
+        # so the loader horizon is pinned to the longest lag and the schedule uses
+        # that single horizon.
+        a.temporal_lags=sorted(set(int(v) for v in a.temporal_lags))
+        if any(v<1 for v in a.temporal_lags):
+            raise ValueError('--temporal-lags must be positive integer lags')
+        a.horizons=[max(a.temporal_lags)]
+    torch.set_num_threads(4);_set_reproducibility(a.seed,False)
+    if a.train_encoder:
+        if not a.history_conditioning:
+            raise ValueError('--train-encoder requires --history-conditioning for H+S feedback')
+        if a.grad_steps<max(a.horizons):
+            raise ValueError('--train-encoder requires --grad-steps >= max(horizons) to retain the H/S initial-state gradient')
+        if a.teacher_weight<=0 or a.teacher_delta_weight<=0 or a.encoder_lr_scale<=0:
+            raise ValueError('joint encoder training requires positive teacher and encoder learning-rate weights')
+    if a.s0_mode in ('exact','exact_spatial'):
+        if not a.history_conditioning:
+            raise ValueError(f"s0_mode={a.s0_mode!r} requires --history-conditioning")
+        if not a.collective_mobility:
+            raise ValueError(f"s0_mode={a.s0_mode!r} requires collective mobility")
+        if a.s0_mode=='exact' and a.noise_mix != 0.:
+            raise ValueError("s0_mode='exact' requires --noise-mix 0 for the diagonal-noise Kalman posterior")
     audit=validate_manifest_split(a.manifest,a.val_manifest)
     out=Path(a.output);out.mkdir(parents=True,exist_ok=True)
     if (out/'metrics.jsonl').exists() and not a.resume:raise FileExistsError(out)
     if a.resume and not a.stateless_data:raise ValueError('resume requires stateless data')
-    model=CADynamics(a.component,'cuda',a.init_kernel,a.bath_dim,a.history_conditioning,a.noise_mix,a.noise_length,a.collective_mobility,a.noise_kernel,a.noise_cutoff).to('cuda')
+    kernel_source=str(out/'checkpoint_latest.pt') if a.resume else a.init_kernel
+    model=CADynamics(a.component,'cuda',kernel_source,a.bath_dim,a.history_conditioning,a.noise_mix,a.noise_length,a.collective_mobility,a.noise_kernel,a.noise_cutoff).to('cuda')
+    # Persist the effective inherited kernel, not nullable CLI placeholders.
+    # Evaluation must reconstruct the same anchor-conditioned covariance.
+    a.noise_kernel=model.noise_kernel
+    a.noise_cutoff=model.noise_cutoff
     # Record any physical-scale override in the kernel config so the saved
     # checkpoint stays self-describing and eval cannot silently use defaults.
     for name in ('coupling_scale','gamma_scale','gamma_floor'):
@@ -378,7 +712,15 @@ def main():
             setattr(model.kernel.bath,name,float(value))
     # S_0 source recorded on the module (and in run.json via vars(a)).
     model.kernel.s0_mode=a.s0_mode
-    opt=torch.optim.AdamW(model.kernel.parameters(),lr=a.lr,weight_decay=.01)
+    if a.train_encoder:model.enable_encoder_training()
+    groups=[dict(params=list(model.kernel.parameters()),lr=a.lr,lr_scale=1.)]
+    if a.train_encoder:
+        groups.append(dict(params=list(model.bundle.encoder.parameters()),lr=a.lr*a.encoder_lr_scale,lr_scale=a.encoder_lr_scale))
+    parameters=[p for group in groups for p in group['params']]
+    opt=torch.optim.AdamW(groups,lr=a.lr,weight_decay=.01)
+    component_source=model.component_source
+    if component_source is None:
+        component_source=torch.load(a.component,map_location='cpu',weights_only=False)
     train={h:make_loader(a,a.manifest,h,True) for h in a.horizons}
     val={h:make_loader(a,a.val_manifest,h,False) for h in a.horizons}
     iters={h:iter(dl) for h,dl in train.items()}
@@ -399,17 +741,20 @@ def main():
         return dict(by_horizon=rows,loss=sum(r['loss'] for r in rows.values())/len(rows))
     def save(tag,step,metrics):
         torch.save(dict(checkpoint_kind='lasp_ca_dynamics',kernel=model.kernel.state_dict(),
-            kernel_config=asdict(model.kernel.cfg),component_checkpoint=torch.load(a.component,map_location='cpu',weights_only=False),
+            kernel_config=asdict(model.kernel.cfg),component_checkpoint=model.component_checkpoint(component_source),
             args=vars(a),step=step,validation=metrics,optimizer=opt.state_dict(),
+            target_encoder=model.target_encoder.state_dict() if a.train_encoder else None,
             rng_state=rng_state(),sampling_rng=generator.get_state(),best_loss=best),out/f'checkpoint_{tag}.tmp')
         (out/f'checkpoint_{tag}.tmp').replace(out/f'checkpoint_{tag}.pt')
     generator=torch.Generator(device='cuda').manual_seed(a.seed)
     start_step=0
     if a.resume:
         ck=torch.load(out/'checkpoint_latest.pt',map_location='cpu',weights_only=False)
-        for key,value in ck['args'].items():
-            if key!='resume' and getattr(a,key)!=value:raise ValueError(f'resume argument differs: {key}')
+        _validate_resume_arguments(a,ck['args'])
         model.kernel.load_state_dict(ck['kernel'],strict=True);opt.load_state_dict(ck['optimizer'])
+        if a.train_encoder:
+            model.bundle.encoder.load_state_dict(ck['component_checkpoint']['encoder'],strict=True)
+            model.target_encoder.load_state_dict(ck['target_encoder'],strict=True)
         best=ck['best_loss'];start_step=ck['step'];restore_rng(ck['rng_state'])
         generator.set_state(ck['sampling_rng'].cpu())
         record(dict(resumed_from=start_step))
@@ -424,14 +769,22 @@ def main():
             try:batch=next(iters[h])
             except StopIteration:iters[h]=iter(train[h]);batch=next(iters[h])
         scale=_lr_scale(step-1,a.steps,a.warmup) if a.cosine else min(1.,step/max(1,a.warmup))
-        for group in opt.param_groups:group['lr']=a.lr*scale
+        for group in opt.param_groups:group['lr']=a.lr*scale*group.get('lr_scale',1.)
         model.train();model.bundle.eval();opt.zero_grad(set_to_none=True)
         terms=model.losses(_move_batch(batch,'cuda'),h,a,generator)
         if not torch.isfinite(terms['loss']):raise RuntimeError('nonfinite training loss')
-        terms['loss'].backward();norm=torch.nn.utils.clip_grad_norm_(model.kernel.parameters(),1.)
+        terms['loss'].backward()
+        encoder_norm=None
+        if a.train_encoder and (step==1 or step%10==0):
+            gradients=[p.grad.detach().double().norm() for p in model.bundle.encoder.parameters() if p.grad is not None]
+            encoder_norm=float(torch.stack(gradients).norm()) if gradients else 0.
+        norm=torch.nn.utils.clip_grad_norm_(parameters,1.)
         if not torch.isfinite(norm):raise RuntimeError('nonfinite gradient')
         opt.step()
-        if step==1 or step%10==0:record(dict(step=step,horizon=h,seconds=time.time()-start,grad_norm=float(norm),train={k:float(v.detach()) for k,v in terms.items()}))
+        if step==1 or step%10==0:
+            row=dict(step=step,horizon=h,seconds=time.time()-start,grad_norm=float(norm),train={k:float(v.detach()) for k,v in terms.items()})
+            if encoder_norm is not None:row['encoder_grad_norm']=encoder_norm
+            record(row)
         if step%a.val_every==0 or step==a.steps:
             metrics=validate();record(dict(step=step,val=metrics))
             if metrics['loss']<best:best=metrics['loss'];save('best',step,metrics)

@@ -33,7 +33,7 @@ def main():
     p.add_argument('--horizons',type=int,nargs='+',default=[1,4,16,64])
     # Override the checkpoint's S_0 source for a no-update probe.  Default None
     # keeps the trained source, so a normal evaluation never silently changes it.
-    p.add_argument('--s0-mode',choices=['gru','exact','prior'],default=None)
+    p.add_argument('--s0-mode',choices=['gru','exact','exact_spatial','prior'],default=None)
     # Override the bath scale to separate "the scale hurt" from "the retraining
     # hurt".  Default None keeps the checkpoint's own scale.
     p.add_argument('--coupling-scale',type=float,default=None)
@@ -109,7 +109,9 @@ def main():
         reference_kind='future_path_mixture',optimizer_steps=0,test_opened=False,
         checkpoint_sha256=hashlib.sha256(Path(a.checkpoint).read_bytes()).hexdigest(),
         source_hashes={str(path):hashlib.sha256(path.read_bytes()).hexdigest() for path in (
-            Path(__file__),Path('protein_jepa_frame/training/train_lasp_ca_dynamics.py'))},
+            Path(__file__),Path('protein_jepa_frame/training/train_lasp_ca_dynamics.py'),
+            Path('protein_jepa_frame/models/stage_b1b/model.py'),
+            Path('protein_jepa_frame/models/correlated_bath_posterior.py'))},
         checkpoint=a.checkpoint,args=vars(a),n_samples=a.n_samples,n_windows=len(rows),
         n_proteins=len({r['protein'] for r in rows}),per_window=rows)
     Path(a.out).write_text(json.dumps(result,indent=2))

@@ -17,6 +17,7 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from scripts.debug_kalman_stepwise import build
+from protein_jepa_frame.models.stage_b1b.model import StageB1bConfig, StaticBathParams
 
 
 def _setup(dS=3, dH=4, L=2, h=0.5, k=0.5, seed=7):
@@ -96,6 +97,8 @@ def test_matches_hand_recursion():
 def test_posterior_matches_monte_carlo():
     """Filter many real sampler draws; the empirical S at the anchor must match."""
     model, D_v, G_v, C = _setup(dS=3, dH=4, L=1, h=0.5, k=0.5, seed=11)
+    # Strong coupling makes omitted observations or a wrong gain sign visible.
+    model.bath.C_val = 3.0 * C
     B, K = 1, 4
     mask = torch.ones(B, 1, dtype=torch.bool)
     sf = torch.zeros(B, 1, 4, dtype=torch.float64)
@@ -117,27 +120,192 @@ def test_posterior_matches_monte_carlo():
                                      collective_mobility=True)
             Hs.append(H.clone())
             Ss.append(S.clone())
-    # Condition on the observed H path being exactly the joint's mean path (0).
-    # Under a joint Gaussian, the conditional mean is linear in the observed H,
-    # so we can estimate the regression coefficients and compare to the filter.
-    X = torch.cat([h[:, 0] for h in Hs[:-1]], 1)            # [n, (K-1)*4]
+    # Include every observed transition, especially the final anchor H_{K-1}.
+    # H_0 is a fixed zero here, so including it would give singular regressors.
+    X = torch.cat([h[:, 0] for h in Hs[1:]], 1)             # [n, (K-1)*4]
     Y = Ss[-1][:, 0]                                        # [n, 3]
     Xc = X - X.mean(0)
     Yc = Y - Y.mean(0)
-    # Regress Y on X: beta [4(K-1), 3].  E[Y | X=x] = mean_Y + (x-mean_X) @ beta,
-    # so the conditional mean at the observed path x = 0 is used below.
+    # Nonzero observed paths test the gain direction as well as covariance.
+    # Under this joint Gaussian, E[Y | X=x] = mean_Y + (x-mean_X) @ beta.
     beta = torch.linalg.lstsq(Xc, Yc).solution              # [4(K-1), 3]
-    mdata = Y.mean(0) - X.mean(0) @ beta
+    observed_indices = torch.tensor([13, 37, 101])
+    observed = torch.stack([h[observed_indices] for h in Hs], dim=1)
+    mdata = Y.mean(0) + (X[observed_indices] - X.mean(0)) @ beta
     resid = Yc - Xc @ beta
     Pdata = resid.T @ resid / n
 
-    dt = torch.full((B, K), 0.5, dtype=torch.float64)
-    # Observed path at the joint mean = the all-zero path.
+    dt = torch.full((len(observed_indices), K), 0.5, dtype=torch.float64)
     m_model, Lc = model.exact_bath_posterior(
-        torch.zeros(B, K, 1, 4, dtype=torch.float64), dt, None, mask)
+        observed, dt, None, mask.expand(len(observed_indices), -1))
     P_model = Lc @ Lc.transpose(-1, -2)
-    assert torch.allclose(m_model[0, 0], mdata, atol=2e-2), (m_model[0, 0], mdata)
+    assert torch.allclose(m_model[:, 0], mdata, atol=2e-2), (m_model[:, 0], mdata)
     assert torch.allclose(P_model[0, 0], Pdata, atol=2e-2), (P_model[0, 0], Pdata)
+
+
+class _TrainableQuadratic(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.curvature = torch.nn.Parameter(torch.tensor(0.7, dtype=torch.float64))
+
+    def forward(self, H, residue_mask, temperature_k=None):
+        return 0.5 * self.curvature * (H.square() * residue_mask[..., None]).sum()
+
+
+@pytest.mark.parametrize('path', ['posterior', 'rollout', 'microstep'])
+def test_exact_training_gradients_match_finite_differences(path):
+    """Posterior forces must retain both energy and encoder/history gradients."""
+    model = build(1, 1, 1, 0.5, 0.7, torch.tensor([0.3]), torch.tensor([0.2]),
+                  torch.tensor([[0.8]])).double()
+    model.energy = _TrainableQuadratic()
+    model.s0_mode = 'exact'
+    history = torch.tensor([0.6, 0.9, -0.2, 1.1], dtype=torch.float64).reshape(
+        1, 4, 1, 1).requires_grad_()
+    dt = torch.full((1, 4), 0.5, dtype=torch.float64)
+    mask = torch.ones(1, 1, dtype=torch.bool)
+
+    def objective():
+        if path == 'posterior':
+            return model.exact_bath_posterior(
+                history, dt, None, mask, create_graph=True)[0].sum()
+        rollout = model.rollout if path == 'rollout' else model.rollout_microstep_v1
+        trajectory = rollout(
+            history[:, -1], mask, None, 2, H_hist=history, dt_hist=dt,
+            collective_mobility=True, detach=False,
+            generator=torch.Generator().manual_seed(9))
+        return trajectory[:, -1].sum()
+
+    grad_energy, grad_history = torch.autograd.grad(
+        objective(), (model.energy.curvature, history))
+    eps = 1e-5
+    with torch.no_grad():
+        model.energy.curvature.add_(eps)
+    plus = float(objective().detach())
+    with torch.no_grad():
+        model.energy.curvature.sub_(2 * eps)
+    minus = float(objective().detach())
+    with torch.no_grad():
+        model.energy.curvature.add_(eps)
+    numerical_energy = grad_energy.new_tensor((plus - minus) / (2 * eps))
+    assert numerical_energy.abs() > 1e-3
+    torch.testing.assert_close(grad_energy, numerical_energy, atol=2e-8, rtol=1e-5)
+
+    numerical_history = torch.empty_like(history)
+    for k in range(history.shape[1]):
+        with torch.no_grad():
+            history[0, k, 0, 0].add_(eps)
+        plus = float(objective().detach())
+        with torch.no_grad():
+            history[0, k, 0, 0].sub_(2 * eps)
+        minus = float(objective().detach())
+        with torch.no_grad():
+            history[0, k, 0, 0].add_(eps)
+        numerical_history[0, k, 0, 0] = (plus - minus) / (2 * eps)
+    torch.testing.assert_close(grad_history, numerical_history, atol=2e-8, rtol=1e-5)
+
+    # Explicit graph retention only changes derivatives, never posterior values.
+    diagnostic = model.exact_bath_posterior(history, dt, None, mask)
+    differentiable = model.exact_bath_posterior(history, dt, None, mask, create_graph=True)
+    for first, second in zip(diagnostic, differentiable):
+        torch.testing.assert_close(first, second, atol=0, rtol=0)
+
+
+def test_bath_anchor_gradient_is_opt_in_and_matches_finite_differences():
+    torch.manual_seed(73)
+    bath = StaticBathParams(StageB1bConfig(
+        latent_dim=2, bath_dim=2, coupling_scale=0.3)).double()
+    anchor = torch.tensor([[[0.2, -0.5], [0.8, 0.1]]],
+                          dtype=torch.float64, requires_grad=True)
+    temperature = torch.tensor([379.0], dtype=torch.float64)
+
+    def coefficients(x):
+        return torch.cat([value.flatten() for value in bath(x, temperature)])
+
+    frozen = coefficients(anchor)
+    assert torch.autograd.grad(frozen.sum(), anchor, allow_unused=True)[0] is None
+    bath.detach_conditioning = False
+    torch.testing.assert_close(coefficients(anchor), frozen, atol=0, rtol=0)
+    assert torch.autograd.gradcheck(coefficients, (anchor,), eps=1e-6,
+                                    atol=1e-6, rtol=1e-4)
+
+
+def test_exact_rollout_requires_its_assumed_transition():
+    model, _, _, _ = _setup(dS=2, dH=4, L=2)
+    model.s0_mode = 'exact'
+    history = torch.randn(1, 2, 2, 4, dtype=torch.float64)
+    dt = torch.full((1, 2), 0.5, dtype=torch.float64)
+    mask = torch.ones(1, 2, dtype=torch.bool)
+    anchor = history[:, -1]
+
+    with pytest.raises(ValueError, match='collective_mobility=True'):
+        model.rollout(anchor, mask, None, 1, H_hist=history, dt_hist=dt)
+
+    correlated = torch.tensor([[[1.0, 0.25], [0.25, 1.0]]], dtype=torch.float64)
+    factor = torch.linalg.cholesky(correlated)
+    with pytest.raises(ValueError, match='identity spatial noise covariance'):
+        model.rollout(anchor, mask, None, 1, H_hist=history, dt_hist=dt,
+                      collective_mobility=True, noise_factor=factor)
+
+    path = model.rollout(anchor, mask, None, 1, H_hist=history, dt_hist=dt,
+                         collective_mobility=True,
+                         generator=torch.Generator().manual_seed(13))
+    assert path.shape == (1, 2, 2, 4)
+    assert torch.isfinite(path).all()
+
+
+@pytest.mark.parametrize('path,collective,microsteps,integrator', [
+    ('rollout', False, 1, 'explicit'),
+    ('rollout', True, 1, 'explicit'),
+    ('microstep', True, 1, 'explicit'),
+    ('microstep', True, 4, 'explicit'),
+    ('microstep', True, 4, 'coupled_midpoint_v1'),
+])
+def test_explicit_bath_state_bypasses_exact_posterior_restrictions(
+        path, collective, microsteps, integrator):
+    model, _, _, _ = _setup(dS=2, dH=4, L=2)
+    anchor = torch.randn(1, 2, 4, dtype=torch.float64)
+    bath = torch.randn(1, 2, 2, dtype=torch.float64)
+    mask = torch.ones(1, 2, dtype=torch.bool)
+    covariance = torch.tensor([[[1.0, 0.4], [0.4, 1.0]]], dtype=torch.float64)
+    factor = torch.linalg.cholesky(covariance)
+    rollout = model.rollout if path == 'rollout' else model.rollout_microstep_v1
+    kwargs = ({} if path == 'rollout'
+              else dict(microsteps=microsteps, integrator=integrator))
+
+    def sample(mode, noise_factor):
+        model.s0_mode = mode
+        rng = torch.Generator().manual_seed(71)
+        # No observed history is needed because S0 is supplied directly.
+        trajectory = rollout(
+            anchor, mask, None, 3, S0=bath, return_bath=True,
+            collective_mobility=collective, noise_factor=noise_factor,
+            generator=rng, **kwargs)
+        return trajectory, rng.get_state()
+
+    exact, exact_rng = sample('exact', factor)
+    prior, prior_rng = sample('prior', factor)
+    for actual, expected in zip(exact, prior):
+        assert torch.isfinite(actual).all()
+        torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+    assert torch.equal(exact_rng, prior_rng)
+    torch.testing.assert_close(exact[1][:, 0], bath, atol=0, rtol=0)
+    uncorrelated, _ = sample('exact', None)
+    assert not torch.allclose(exact[0][:, -1], uncorrelated[0][:, -1])
+
+
+def test_explicit_bath_keeps_microstep_physical_constraints():
+    model, _, _, _ = _setup(dS=2, dH=4, L=2)
+    model.s0_mode = 'exact'
+    anchor = torch.zeros(1, 2, 4, dtype=torch.float64)
+    bath = torch.zeros(1, 2, 2, dtype=torch.float64)
+    mask = torch.ones(1, 2, dtype=torch.bool)
+
+    with pytest.raises(ValueError, match='microstep_v1 requires collective_mobility=True'):
+        model.rollout_microstep_v1(anchor, mask, None, 1, S0=bath)
+    model.cfg.bath_coupling = 'force'
+    with pytest.raises(ValueError, match='microstep_v1 requires velocity bath coupling'):
+        model.rollout_microstep_v1(
+            anchor, mask, None, 1, S0=bath, collective_mobility=True)
 
 
 if __name__ == '__main__':

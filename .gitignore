@@ -2,6 +2,10 @@ __pycache__/
 *.py[cod]
 .pytest_cache/
 artifacts/
+
+# extracted / reference data dumps (reproducible from upstream sources)
+bioemu_extract/
+evaluation/reference_data/
 .venv/
 *.egg-info/
 *.pt

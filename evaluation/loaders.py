@@ -165,6 +165,7 @@ def _infer_encoder_flags(state: dict) -> dict:
     Handles the two lineages we have on disk, whose *saved config dicts are
     unreliable* (edited after training):
       * geom_proj.weight in-dim 12 => orientation_features=True (else 6)
+      * relpos_proj.weight present => relative_position_features=True
       * struct_recon_head.0.weight in-dim => encoder feature width used at train
         time (only relevant for loading StageAV2 strictly; not for the encoder).
     """
@@ -173,6 +174,7 @@ def _infer_encoder_flags(state: dict) -> dict:
     gp = s.get("geom_proj.weight")
     if gp is not None:
         flags["orientation_features"] = bool(gp.shape[1] == 12)
+    flags["relative_position_features"] = "relpos_proj.weight" in s
     return flags
 
 
@@ -199,6 +201,7 @@ def _load_encoder_from_state(state: dict, cfg: StageAV2Config, device) -> nn.Mod
         dropout=cfg.dropout,
         max_residues=cfg.max_residues,
         orientation_features=cfg.orientation_features,
+        relative_position_features=cfg.relative_position_features,
         identity_embed_scale=cfg.identity_embed_scale,
     ).to(device)
     enc.load_state_dict(_extract_encoder_state(state), strict=True)
@@ -222,6 +225,10 @@ def load_encoder_stage_a(ckpt_path: str, device, provenance: dict) -> tuple[nn.M
     # cannot enter the new training config; its output contract is explicit below.
     cfg = StageAV2Config(**{**_filter_kwargs(StageAV2Config, cfg_raw), "delta_target": True})
     flags = _infer_encoder_flags(state)
+    if ck.get('representation_contract') or ck.get('prediction_contract'):
+        for name,value in flags.items():
+            if name in cfg_raw and cfg_raw[name] != value:
+                raise ValueError(f'encoder architecture conflicts with saved contract config: {name}')
     for k, v in flags.items():
         setattr(cfg, k, v)
     enc = _load_encoder_from_state(state, cfg, device)

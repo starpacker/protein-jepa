@@ -31,6 +31,7 @@ def model():
     result.bundle = Bundle()
     result.kernel = Kernel()
     result.history_conditioning = False
+    result.collective_mobility = False
     return result.eval()
 
 
