@@ -87,7 +87,7 @@
 
 ### 1.5 几何约定（LOCKED，`evaluation/geometry.py` 单一来源）
 
-全 evaluation 包**不重实现 Kabsch**；所有指标经同一实现，保证“报出的数字只有一个含义”。`common_anchor_rmsd` = 由**真值**拟合的 anchor→target 变换（所有样本共享同一 gauge，无泄漏）；`aligned_rmsd` = 去质心 Kabsch 最小 RMSD。
+全 evaluation 包的约定是**不重实现 Kabsch**；`common_anchor_rmsd` = 由**真值**拟合的 anchor→target 变换（所有样本共享同一 gauge，无泄漏）；`aligned_rmsd` = 去质心 Kabsch 最小 RMSD。**2026-11-01 审计例外：T1 v1 实际存在独立 Kabsch 实现且不符合其 RMSD 命名，见 §2.5；不能据此段为旧 T1 表背书。新增 v2 的 shape 对齐调用共享 `evaluation.geometry.kabsch_align`。**
 
 ---
 
@@ -151,9 +151,11 @@
 
 > 这些是 **CA-only 有效性诊断**（键长带、clash cutoff 是固定诊断约定），**不替代**完整主链立体化学 → 见 §2.5。
 
-### 2.5 主链原子级指标（T1，`evaluation/backbone_metrics.py`）
+### 2.5 主链原子级指标（T1；历史 v1 与 2026-11-01 v2 分列）
 
-> 输入主链张量 `bb [.., L, 4, 3]`（顺序 N, CA, C, O）。原子摆放由 **vendored 官方 OpenFold** 完成。
+> 输入主链张量 `bb [.., L, 4, 3]`（顺序 N, CA, C, O）。预测摆放可由 **vendored 官方 OpenFold** 完成；评分真值必须是**真实 MD 的 N/CA/C/O**，不能用真实 CA 的重新 lift 替代。
+
+**历史 v1 定义表保留如下，供追溯旧命名，不代表实现已经满足表内定义。** `evaluation/backbone_metrics.py` 的“RMSD”实际先独立全主链 Kabsch，再取原子欧氏距离的算术均值；它不是共同 anchor gauge 下的均方根误差。旧 φ/ψ 配对错位一个残基，clash 的链/序号条件错误地使用 AND，且仅检查 CA；旧 suite 仅取每窗第一个预测样本的几何。旧结果和旧代码保留，不能与 v2 数值直接比较。
 
 | 指标 | 定义 | 单位 | 方向 | 代码 |
 |---|---|---|---|---|
@@ -166,7 +168,22 @@
 | **peptide C(i)–N(i+1) valid** | 肽键 C–N 距离有效性 | frac | ↑ | 同上 |
 | **backbone clash frac** | 非局域主链 clash 比例 | frac | ↓ | 同上 |
 
-**理想参考几何**（OpenFold 文献值）：`IDEAL_BOND = {N_CA:1.458, CA_C:1.525, C_N:1.329, C_O:1.231}`（Å）。
+**历史统一几何参考**：`IDEAL_BOND = {N_CA:1.458, CA_C:1.525, C_N:1.329, C_O:1.231}`（Å）。这些统一常数及容差属于旧诊断约定，不等于 OpenFold 对所有残基的完整参考分布。
+
+**2026-11-01 新版基础指标**：[`evaluation/backbone_metrics_v2.py`](evaluation/backbone_metrics_v2.py)，`schema_version=backbone_metrics_v2`。每个样本均计算完整几何并保留 `per_sample`；`mean` 是样本等权平均，计数另存 `totals`，后续仍需按蛋白聚合与估计不确定度。
+
+| v2 输出 | 定义 / 范围 | 单位 |
+|---|---|---|
+| `coordinate_rmsd_angstrom`、`coordinate_rmsd_N/CA/C/O_angstrom` | `sqrt(mean(sum_xyz(error²)))`；调用方只用真实 future CA→observed anchor CA 拟合变换，并将其用于**全部真实主链原子**；预测保留 anchor gauge，主指标不拟合预测 | Å |
+| `shape_kabsch_rmsd_angstrom`、`shape_rmsd_N/CA/C/O_angstrom` | 每样本独立全主链 Kabsch 后的真 RMS；各原子类型共用该次对齐，与主指标分列 | Å |
+| `bond_*_mean_angstrom`、`angle_*_mean_deg` | N–CA、CA–C、C–O、C–N 及 N–CA–C、CA–C–N、C–N–CA；按实际所需原子、链边界和序号 gap 掩码 | Å / ° |
+| `*_legacy_valid_frac` | 明示沿用历史键长/键角窗口的诊断比例，不新增验收阈值 | frac |
+| `ramachandran_box_diagnostic_frac` | **同一残基**的 φ/ψ 落入历史矩形框；需左右两条肽键有效。没有正式残基类别统计参考，**不是 MolProbity allowed** | frac |
+| `omega_trans_diagnostic_frac` | 实际 CA–C–N–CA 二面角满足历史 `abs(ω)>150°`；另报偏离 trans 的均值与有效数 | frac / ° |
+| `ca_nonlocal_clash_frac` | 同链序号差≥3 **或**跨链的唯一 CA 对，距离<2.5 Å；这是 CA 诊断，**没有评估全主链或全原子 clash** | frac |
+| `openfold_*_mean_abs_z` | 提供 aatype 时，使用 vendored OpenFold 的逐残基均值/标准差及 next-PRO C–N 参考；连续绝对 z 偏差，不设新 z 阈值 | 无量纲 |
+
+有效原子含 NaN/Inf 会失败；被掩码原子的非有限值排除。键角/二面角退化计数单列；无有效观测返回 `None`。测试见 [`tests/test_backbone_metrics_v2.py`](tests/test_backbone_metrics_v2.py)（36 项 CPU 数值测试通过）。这补齐了可信基础指标，**不等于 T1 已完成**；正式 Ramachandran 统计参考、全主链原子 clash 与当前模型的完整对照评测仍有缺口。
 
 ### 2.6 静态/平衡系综指标（T2A，BioEmu 口径，`evaluation/states_metrics.py`）
 
@@ -405,6 +422,9 @@
 ## 4. TASK 1 — OpenFold 主链（backbone）原子重建
 
 ### 4.1 做了什么
+
+> 以下 T1.1–T1.5 是历史实现记录。2026-11-01 审计确认：Model 1 已有 learned frame/torsion decoder；CA-only Model 2 的 deterministic lift 是另一条路径。原子坐标由 OpenFold 摆放不能单独证明学得了完整主链。
+
 - **T1.1** 把冻结点态解码器**已有的** OpenFold atom37 输出（`backbone_direct`/`atom37_coords`/`torsions`）**透出**到 `EnsembleProducer` 与 `HSEnsembleProducer`，返回新键 `backbone_samples [B,n,L,4,3]`、`atom37_samples`、`torsion_samples`，**不改**原有 `ca_samples` 键。
 - **T1.2** Model 2（只输出 Cα）通过 `openfold_ca_lifter.lift_ca_to_backbone`（**原子摆放仍由 OpenFold 完成**：group-0 理想 offsets + `Rigid.make_transform_from_reference` + `frames_to_atom37`）得到主链，**无需重训**。
 - **T1.3** 新模块 `evaluation/backbone_metrics.py`（指标定义见 §2.5）。
@@ -414,6 +434,8 @@
 ### 4.2 结果（Model 1，mdCATH-1000dom val，30 批 × batch 2 = 60 窗口，n_samples=8，horizon=1 ns）
 
 > ✅ **口径修正**：真值 backbone 现为**真实 MD 的 N/CA/C/O**（此前误用 Cα 重新 lift 的理想几何，导致 oracle 的肽键 validity 也显示 0，属评测 bug，已修）。
+
+> **2026-11-01 二次审计：下表为保留的 v1 历史数值和列名，未重算、未修改历史 JSON。** 上述真值修正没有解决 §2.5 的 RMSD 定义、φ/ψ 配对、clash 掩码和只计首样本几何问题。下表不能当作当前 v2 成绩或完整 T1 验收。
 
 | 指标 | model | persistence | oracle（真值） |
 |---|---|---|---|
@@ -430,10 +452,16 @@
 | Ramachandran allowed ↑ | 0.710 | **0.949** | 0.949 |
 | ω trans ↑ | 0.794 | **0.995** | 0.997 |
 
-**读法（诚实）：**
+**读法（2026-11-01 审计纠正）：**
+
 - **CA 列无损**：`backbone_samples[...,1,:] == ca_samples` 由测试与导出断言双重保证。
-- 模型主链**内部几何是“理想化”的**（键长/键角 validity = 1.000，因 OpenFold 摆放用文献理想值），这与真实 MD 的热涨落（validity 0.73–0.84）不同——**这是特征不是 bug**：模型预测系综**平均几何**，真实 MD 每帧有热噪声。
-- **短板**：模型预测的**肽键 C–N 距离**（均值 2.73 Å）**超出 1.33±0.05 Å 容差**（validity 仅 0.029），且 **ω 只有 79% trans**（真值 99.7%）——说明**主链不是逐残基自洽的**，因 Model 1 backbone 由 Cα 系综 + 理想几何拼出，缺跨残基连续约束。**这是 Task 1 指出的真实改进点**（需要真正的 torsion/backbone 头，而非 lifter）。
+- 模型主链的部分**残基内部几何由 OpenFold 理想参数固定**，故旧表中键长/键角 validity = 1.000 与真实 MD 热涨落不同。这只能说明摆放约束，不能由此推出原文所称“模型预测系综平均几何”，也不能证明相邻残基连续。
+- **历史几何短板保留**：肽键 C–N 均值 2.73 Å、旧容差下 validity 0.029、ω trans 约 79% 是严重链连续性问题的线索；旧 suite 只计首样本，完整数值需 v2 对所有样本重新评估。
+- **纠正原文成因**：原文称“Model 1 backbone 由 Cα 系综 + 理想几何拼出，需要真正的 torsion/backbone 头”，与代码及检查点不符。`StageBOracleDecoder.decode_structure` 调用的 `StructureDecoder` 已学习局部位置、quaternion 旋转和 torsion，再从预测的 R/t/torsion 经 OpenFold 输出 N/CA/C/O。`artifacts/stage_b1a_relpos_anchored_1000dom/checkpoint_best.pt`（step 6000）保存了这些头的权重；实际缺口是独立残基 frames 的跨残基连续约束，原 B1a 目标没有显式 C–N/键角/clash 连续性项。预测的 φ/ω 也不自动保证相邻 frames 的实际 φ/ω。
+- **当前 LASP 接线边界**：`CAComponentBundle` 只输出 CA；`CADynamics.sample` 返回 CA 和 generated raw H。将 CA 送入 `lift_ca_to_backbone` 可产生可评分的 N/CA/C/O，但必须标为 **CA ideal-lift readout**，不是新训练的主链头。将当前 H 接旧 B1a 只能先作为**旧 learned readout 的兼容性诊断**：校准后 encoder 已变化，latent 维度相同不能保证兼容，旧 B1a 输出 CA 也未必等于当前 CA。不能仅替换旧输出的 CA 列来拼接主链。
+- **lifter 的额外限制**：它不接收 chain/gap/mask，需由新调用方逐有效连续链段调用；端点/共线 triplet 使用 identity frame fallback，存在旋转等变性例外。默认 torsion 与理想残基内部几何均不保证肽键闭合，应报告端点/退化影响。
+
+最小可训练路线是先冻结当前 encoder、动力学和 CA readout，用真实 MD N/CA/C/O 监督新的 orientation/O-torsion readout，位置锚定当前 CA，并加入实际跨残基连续性约束；旧 B1a 可作为待检验初始化。先以真实 future H 做**oracle 校准诊断**，再用 generated H 训练/评估读出迁移；未来 H 不得进入预测输入。固定 CA 若本身不支持可实现的主链几何，还需联合约束 CA，不能据 oracle 重建改善宣称长程预测改善。
 
 ### 4.3 产物
 - `results/backbone_suite_model1_1000dom.json`（+ `artifacts/` 同名副本）
@@ -729,6 +757,8 @@ OUT=results/lasp_final_vs_model1_bioemu2.json \
 
 ### 9.7 T1 主链（§4 / §7-⑨）→ `results/backbone_suite_model1_1000dom.json`
 
+> 历史 v1 复现命令，保留用于追溯。它不会调用 v2，不能用于新版 T1 验收；新实验须使用新输出目录，勿覆盖下述冻结结果。
+
 > `--batches 30 --batch-size 2` → 60 窗口（与 §4.2 表头一致）。
 
 ```bash
@@ -883,7 +913,7 @@ bash run_scripts/run_fromnone_temp_v2.sh       # Model 2 温度留出重训
 
 ## 10. 局限与下一步（诚实）
 
-1. **主链（T1）**：Model 1 主链为 Cα+理想几何拼出，**肽键/ω 不自洽**（肽键 validity 0.029、ω_trans 0.79）；要真正逐残基自洽需训练 **frame + torsion 头**（计划文档 T1.2 option B）。
+1. **主链（T1，2026-11-01 纠正）**：原文“Model 1 主链为 Cα+理想几何拼出、尚需 frame + torsion 头”不成立：已训练 B1a 有这两类头，短板是跨残基连续性及其与当前 H 的兼容性。旧肽键 validity 0.029、ω_trans 0.79 保留为 v1 历史线索；新 v2 修复基础指标后仍需真实 MD、逐样本完整对照。CA ideal-lift 只能作为标注清楚的读出诊断；无正式统计 Ramachandran 与全主链原子 clash，**T1 尚未完成**。
 2. **MSM 状态预测（T2）**：1 ns 帧间隔下**转变检测 F1 低**（0.13–0.27）；下一步可缩短有效 lag / 用更多 anchor / 更长轨迹提升转变样本量。
 3. **位置精度（共同短板）**：模型 1 rollout Kabsch **8.39 Å** 差于 persistence **3.87 Å**；模型 2 `root_mean_w2` 短时标（1 ns）失败（位移过小）。
    ⚠️ **"分布形态已稳赢"只在历史口径（对 persistence / MDGen）成立**——**同 harness 对 bioemu2 我们实际上输 19:4**
@@ -894,7 +924,7 @@ bash run_scripts/run_fromnone_temp_v2.sh       # Model 2 温度留出重训
 7. **接触类 Jaccard 对 delta/近刚体基线退化**——引用时必须附 `n_true/n_pred`。
 8. **协议一致性**：训练用 contiguous、部分评测用 paired 两个协议；只要双方同用评测口径就自洽，若要比 horizon 曲线需统一。
 9. **本文件 §3 各表不可跨行比较**：来自不同 harness / 窗口集 / 时标（详见 §1.2 与 §3.5 警告）。**要同口径比较，用主报告 §13.8 的 T0–T8。**
-10. **Lasp 未接入 T1/T2/T3**：§3.8 只覆盖 7 项系综指标；主链、MSM、温度矩阵目前只对 Model 1（+ Model 2 的温度）做过。这是覆盖缺口，不是负面结果。
+10. **历史覆盖缺口与当前 T1 边界**：§3.8 当时只覆盖 7 项系综指标，原记“Lasp 未接入 T1/T2/T3”。后续 CA 标准评测已增加 §9.12 的 T2A/温度矩阵；这不补齐 T1。2026-11-01 已完成主链基础指标 v2 与200窗 CA→主链读出诊断（§12）：真实 CA 的 ideal lift 仍有约2.61 Å的跨残基 C–N 距离，不能宣布 learned backbone、完整立体化学或全指标目标达成。
 
 ---
 
@@ -909,3 +939,83 @@ bash run_scripts/run_fromnone_temp_v2.sh       # Model 2 温度留出重训
 | **温度留出 / 时间尺度 / rollout 的多尺度对比** | [`PROJECT_REPORT_20261021.md`](PROJECT_REPORT_20261021.md) §13.8（T3–T6） |
 | **全部评测指标定义 + 结果（本文件）** | 本文 §1–§10 |
 | **本文件 §9 的可执行复现命令（15 条，已逐条校验）** | 本文 §9.1–§9.11 |
+
+## 12. 2026-11-01 新增诊断版本（不改历史表格）
+
+[主链与有序路径报告](RESULTS_BACKBONE_AND_PATHS_20261101.md)记录新的实际结果、来源与限制；[四臂报告](RESULTS_HS_JOINT_20261101.md)记录固定500步的 H 读出保持消融。它们均为开发验证，不是独立确认。所有命令必须使用新输出路径，runner 拒绝覆盖已有结果/协议/快照。
+
+### 12.1 主链读出 v2
+
+```bash
+PYTHONPATH=/tmp/lasp_stability_deps:. OMP_NUM_THREADS=2 MKL_NUM_THREADS=2 \
+python -m scripts.eval_ca_backbone_diagnostic \
+  --checkpoint artifacts/hs_joint_20261101/spatial_probe_v1/spatial_exact.pt \
+  --out results/hs_joint_20261101/backbone_v2/reproduction_new.json \
+  --device cuda:0 --max-windows 200 --torch-threads 2
+```
+
+实际成功工件为 [`spatial_exact_allres200_v2.json`](results/hs_joint_20261101/backbone_v2/spatial_exact_allres200_v2.json)：50蛋白、200窗、每窗12预测样本、8种预测/oracle/reference读出。主 RMSD 在观察 anchor 坐标系按平方误差开根号计算，另存 Kabsch shape 诊断；所有样本参与几何统计。只有 oracle 分支使用未来 H，真实标签不进入预测。
+
+数据集编号 `ACDEFGHIKLMNPQRSTVWYX` 与 OpenFold 化学编号 `ARNDCQEGHILKMFPSTWYVX` 不同；新 lift/化学指标显式转换，已训练 embedding 仍使用其原编号。旧 B1a 作为历史对照保留原 placement 语义。UNK 使用已有 GLY 主链模板，不删除观察有效的未知残基；类型相关 z 参考另报有效计数。详见[化学边界审计](docs/RESIDUE_TYPE_AUDIT_20261101.md)。这既不修复旧 checkpoint 的训练，也没有补齐正式 Ramachandran、全主链/全原子 clash 或与 BioEmu2 的新 T1 对照。
+
+### 12.2 连续有序路径 v2
+
+```bash
+PYTHONPATH=/tmp/lasp_stability_deps:. OMP_NUM_THREADS=2 MKL_NUM_THREADS=2 \
+python -m scripts.eval_ca_ordered_paths \
+  --checkpoint artifacts/hs_joint_20261101/spatial_probe_v1/spatial_exact.pt \
+  --out results/hs_joint_20261101/ordered_paths/reproduction_standard200_new.json \
+  --device cuda:0 --torch-threads 2
+
+# 独立的192 ns面板；不混入standard200
+PYTHONPATH=/tmp/lasp_stability_deps:. OMP_NUM_THREADS=2 MKL_NUM_THREADS=2 \
+python -m scripts.eval_ca_ordered_paths \
+  --checkpoint artifacts/hs_joint_20261101/spatial_probe_v1/spatial_exact.pt \
+  --out results/hs_joint_20261101/ordered_paths/reproduction_long192_new.json \
+  --device cuda:0 --horizons 192 --torch-threads 2
+```
+
+默认50蛋白×4 horizons=200窗；192 ns使用独立50窗，均为每窗12条连续 H/S 路径。4窗 smoke 需显式 `--max-windows 4`。每个窗口只调用一次采样器，固定观察 anchor，保留一次采样的 S₀ 及连续状态；未来真值不用于重编码、重置或初始化。
+
+`trajectory_metrics_v2.py` 的 joint U-energy score 对整个未来路径计算；不能与旧逐时刻 marginal energy 的均值混称。每条路径分别计算 ACF/MSD，成员边界不拼接。真实 MD 每窗只有一条，单条 reference 的 U-score 为 null。reverse/shuffle 仅是顺序诊断，会改变时间边际并可能改变终点；不能据它们证明 S 的增量价值。短轨迹 ACF 与内部距离 MSD 不直接给出平衡松弛时间或原子扩散常数。这里仍没有 MSM/T2B、配对温度泛化或 BioEmu2 动力学优越性的完成证据。
+
+### 12.3 固定 CA 的 learned backbone 受控读出实验
+
+[预注册](docs/BACKBONE_READOUT_PILOT_V2_20261101.md)固定500个不同训练蛋白、两组各500步和同一个零更新初始化。仅训练独立 N/CA/C/O 读出头；原始 H、CA 头及 H/S 动力学冻结。coordinate 组最小化实际 N/C/O 坐标误差，geometry 组另加显式 PSF 连接的四项 v3 几何损失。系数仅用前32个训练窗口的初始参数梯度计算；不使用验证指标选择权重或 checkpoint。
+
+`backbone_topology_v2.py` 保留完整残基 UID 和 PSF 肽键边，恢复明确的 His 别名化学身份，同时逐位保留旧 encoder/embedding 的 aa、residue_index、chain_id。几何边不再由丢失插入码的整数编号推断；历史 v2 指标仍保留，并标明它与实际 PSF 图不一致的窗口。
+
+已保存缓存为 `results/hs_joint_20261101/backbone_repair/readout_train500_v2.pt` 与 `readout_val200_v2.pt`。训练与验证蛋白无交集；验证缓存每窗只读取8个观察帧，先用既有采样器生成全部12个预测成员，再读取未来标签。oracle H/CA 为明确标注的未来信息诊断，不进入 forecast。完整窗口、来源与逐位一致性核验见[缓存复验](results/hs_joint_20261101/backbone_repair/readout_caches_v2_verification.json)。
+
+```bash
+PYTHONPATH=/tmp/lasp_stability_deps:. OMP_NUM_THREADS=2 MKL_NUM_THREADS=2 \
+python -m scripts.eval_backbone_readout_pilot \
+  --cache results/hs_joint_20261101/backbone_repair/readout_val200_v2.pt \
+  --init-checkpoint artifacts/hs_joint_20261101/backbone_repair_v2/initial.pt \
+  --coordinate-checkpoint artifacts/hs_joint_20261101/backbone_repair_v2/coordinate/checkpoint_latest.pt \
+  --geometry-checkpoint artifacts/hs_joint_20261101/backbone_repair_v2/geometry/checkpoint_latest.pt \
+  --out results/hs_joint_20261101/backbone_repair_v2/reproduction_readout200_new.json \
+  --device cuda:0 --torch-threads 2
+```
+
+评测包含14条路径：三个头各自的 oracle/forecast、初始化与geometry头的六个固定oracle CA的 H 替换对照，以及真实MD persistence/target。所有预测成员都评分；CA须与输入逐位相同，指标使用CPU float64。主要坐标指标是逐成员实际 N/C/O RMSD，另保留完整主链 RMSD；不能将N/C/O主指标与此前四原子RMSD直接比较。按蛋白配对bootstrap的95%区间为单seed开发集上的边际探索结果，无多重比较校正。v3宽松软约束不是完整T1、全原子clash或MolProbity标准；本实验也不构成新的BioEmu2比较。
+
+补充[固定 CA 可闭合性诊断](results/hs_joint_20261101/backbone_repair_v2/fixed_ca_capacity.json)使用三角不等式和官方残基模板半径，为 C–N 太长侧的损失给出下界；单独登记后仅消费冻结缓存，不使用主评测结果。64 ns forecast 中满足该充分不可行条件的边比例为等蛋白平均0.4653%，其余边不能据零下界认证为可行。该诊断忽略角度、过近距离和碰撞约束，并使用预先固定的浮点误差裕量；它不是完整几何最优值、T1门槛或对允许移动CA的架构的限制。
+
+### 12.4 无参数局部frame搬运与相同预算读出
+
+当前simplified IPA只使用当前CA的两两距离，忽略输入R。[新协议](docs/BACKBONE_TRANSPORT_PILOT_V1_20261101.md)用显式PSF图≤2-hop的观察/当前CA做中心残基锚定proper Kabsch，以 `Q @ observed_R` 提供当前局部方向；退化时保留observed frame。它不移动CA、不增加可训练参数，也不使用target atoms/mask。训练与§12.3 coordinate臂共用初始化、500窗顺序、seed和优化器，仅替换frame seed；固定500步latest。
+
+实际200窗、50蛋白、全部12 forecast成员的overall NCO RMSD从oracle1.661962→1.442264 Å、forecast4.632646→4.575603 Å；forecast C–N软损失从.600562→.259931 Å。四个horizon的NCO配对区间均支持改善，但forecast clash变化区间跨0，且NCO仍差于persistence3.488854 Å。所有150个预登记区间均为单seed、重复开发集的边际探索性结果；完整表格及训练集几何容量诊断见[报告§6](RESULTS_BACKBONE_AND_PATHS_20261101.md#6-局部-frame-搬运相同500步预算的新读出实验)。该实验未改变CA级BioEmu2指标，不能宣布完整T1或总体目标完成。
+
+复现使用独立新评估入口，输出必须取新路径：
+
+```bash
+export PYTHONPATH=/tmp/lasp_stability_deps:.
+python -m scripts.eval_backbone_transport_pilot \
+  --checkpoint artifacts/hs_joint_20261101/backbone_transport_v1/coordinate/checkpoint_latest.pt \
+  --out results/hs_joint_20261101/backbone_transport_v1/reproduction200_new.json \
+  --device cuda:0
+```
+
+入口要求800个旧observed control的骨架哈希及数值严格复现，因此保持原GPU推理环境。首版评估因live tuple与历史JSON list的容器差异误拒绝，原失败记录保留；[v2修订](docs/BACKBONE_TRANSPORT_EVAL_SERIALIZATION_V2_20261101.md)仅统一JSON表示，不放宽数值容忍。[成功结果](results/hs_joint_20261101/backbone_transport_v1/evaluation200_v2.json)、[执行记录](results/hs_joint_20261101/backbone_transport_v1/evaluation_v2_run.execution.json)、[独立统计与来源核验](results/hs_joint_20261101/backbone_transport_v1/independent_statistics_verification.json)均已保存。全量回归756 passed、1 skipped；不会读取test、重跑BioEmu2或覆盖受保护历史结果。

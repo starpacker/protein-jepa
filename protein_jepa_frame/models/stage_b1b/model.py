@@ -13,11 +13,13 @@ Stop-grad contract (2.2):
   History posterior r_psi is trainable.
   R = 2*h*D (derived from D and h, NOT a separate learnable parameter).
 
-Per-residue independent bath (2.1):
+Legacy per-residue independent bath (2.1):
   Covariances are block-diagonal in L: each residue carries its own bath state
   S in R^{dS} with its own (dS x dS) covariance P.  The H transition noise R is
   diagonal in dH per residue.  This keeps the Kalman recursion O(L * dS^3)
   instead of O((L*dH)^3).
+  The opt-in exact_spatial initializer instead retains a full (L*dS)^2 bath
+  covariance for collective spatial mobility; diagnostic Kalman NLL is unchanged.
 
 Notation:
   L  = residues (padded to max_residues),  dH = H latent dim,  dS = bath dim
@@ -105,14 +107,13 @@ class StageB1bConfig:
     #     on the 1000dom kernel: |C|_F/|D| = 4.2, i.e. a 15.4x mobility boost;
     #     |H| per residue runs 11 -> 3,969 over 64 one-ns steps.
     #
-    #   "velocity" (FDT-correct):
+    #   "velocity" (legacy non-collective transition):
     #       p  = f - C*S,                H' = H + h*D*p + sqrt(2hD) xi
-    #       S' = S - h*Gamma*S + C^T*dH + sqrt(2hGamma) xi_S
-    #     The bath is driven by the realised displacement dH rather than by the
-    #     force, so it is anti-correlated with (H - H0) and acts as genuine
-    #     friction; h*C*S is O(1) rather than O(|H|).  The fluctuation term is
-    #     placed on H (the conservative FDT placement when D is singular), which
-    #     keeps R = 2hD / W = 2hGamma exactly as the Kalman observer assumes.
+    #       S' = S + C^T*(h*D*p) - h*Gamma*S + sqrt(2hGamma) xi_S
+    #     Here the bath is driven only by deterministic H drift; the H noise is
+    #     not shared with S.  This branch is retained for old-checkpoint
+    #     reproducibility and is not the transition filtered by
+    #     exact_bath_posterior().  New exact-S0 runs use collective_mobility.
     #     Measured: |H| 11 -> 18 and a 6.27 per-residue step against a true 6.87.
     # The default is "velocity": a checkpoint that predates this option carries
     # "force" in its saved kernel_config and therefore still loads with its
@@ -270,6 +271,10 @@ class StaticBathParams(nn.Module):
         self.coupling_scale = float(cfg.coupling_scale)
         self.gamma_scale = float(cfg.gamma_scale)
         self.gamma_floor = float(cfg.gamma_floor)
+        # Joint representation training may differentiate coefficients through
+        # the observed anchor. The anchor still stays fixed during the rollout;
+        # enabling this gradient does not make mobility depend on evolving H.
+        self.detach_conditioning = True
 
         # Condition encoder: (sequence feature, temperature) -> hidden
         self.cond_proj = nn.Linear(d, hid)
@@ -310,7 +315,8 @@ class StaticBathParams(nn.Module):
         """
         B, L, _ = seq_feature.shape
         device, dtype = seq_feature.device, seq_feature.dtype
-        cond = self._cond(seq_feature.detach(), temperature_k, B, L, device, dtype)
+        condition = seq_feature.detach() if self.detach_conditioning else seq_feature
+        cond = self._cond(condition, temperature_k, B, L, device, dtype)
 
         D = self.diffusion_scale * F.softplus(self.d_net(cond) + _INV_SOFTPLUS_1)  # ~scale at init
         if not self.cfg.use_bath:
@@ -417,7 +423,8 @@ class StageB1b(nn.Module):
 
     The encoder is NOT owned here: the training/eval script applies the frozen
     Stage A V2 encoder through the frozen B1a normalizer and passes H already
-    stop_grad'ed.  All covariance algebra is per-residue (block diagonal in L).
+    stop_grad'ed.  The legacy covariance paths are per-residue. The opt-in
+    ``exact_spatial`` initializer retains the full cross-residue bath covariance.
     """
 
     def __init__(self, cfg: StageB1bConfig) -> None:
@@ -430,6 +437,7 @@ class StageB1b(nn.Module):
         # Source of S_0 when an observed history is supplied to rollout:
         #   'gru'   -- amortised history network (the historical default),
         #   'exact' -- closed-form Kalman posterior (exact_bath_posterior),
+        #   'exact_spatial' -- full bath posterior for spatial collective mobility,
         #   'prior' -- unit-variance prior, i.e. ignore the history.
         # Set per run by the trainer so a checkpoint stays self-describing via
         # the recorded args; an unknown value is a hard error, never a silent
@@ -539,6 +547,28 @@ class StageB1b(nn.Module):
         if integrator == "coupled_midpoint_v1":
             if not self.cfg.use_bath or self.cfg.force_clip is not None:
                 raise ValueError("coupled midpoint requires a bath and an unclipped energy force")
+        # An explicit bath state bypasses posterior inference. Its rollout may
+        # use any transition supported by this sampler's physical constraints.
+        if S0 is None and getattr(self, "s0_mode", "gru") == "exact":
+            if H_hist is None:
+                raise ValueError("s0_mode='exact' requires an observed H history")
+            if not collective_mobility:
+                raise ValueError("s0_mode='exact' requires collective_mobility=True")
+            if integrator != "explicit" or microsteps != 1:
+                raise ValueError("s0_mode='exact' requires the single-step explicit sampler transition")
+            if noise_factor is not None:
+                covariance = noise_factor @ noise_factor.transpose(-1, -2)
+                identity = torch.eye(covariance.shape[-1], device=covariance.device,
+                                     dtype=covariance.dtype).expand_as(covariance)
+                if not torch.allclose(covariance, identity, atol=1e-6, rtol=1e-6):
+                    raise ValueError("s0_mode='exact' requires identity spatial noise covariance")
+        if S0 is None and getattr(self, "s0_mode", "gru") == "exact_spatial":
+            if not self.cfg.use_bath:
+                raise ValueError("s0_mode='exact_spatial' requires a bath")
+            if H_hist is None:
+                raise ValueError("s0_mode='exact_spatial' requires an observed H history")
+            if integrator != "explicit" or microsteps != 1:
+                raise ValueError("s0_mode='exact_spatial' requires the single-step explicit sampler transition")
         if seq_feature is None:
             seq_feature = H0
         B, L, dH = H0.shape
@@ -567,9 +597,10 @@ class StageB1b(nn.Module):
             else:
                 m0, chol0 = self.initial_bath_state(
                     H_hist, dt_hist, temperature_k, residue_mask,
-                    seq_feature=seq_feature)
+                    seq_feature=seq_feature, create_graph=not detach,
+                    noise_factor=noise_factor)
                 eps = torch.randn(m0.shape, device=H0.device, dtype=H0.dtype, generator=generator)
-                S = m0 + torch.einsum("blij,blj->bli", chol0, eps)
+                S = self._bath_posterior_draw(m0, chol0, eps)
 
         # These are deliberately outside the time loop: mobility and coupling
         # are fixed by the observed anchor for the entire physical path.
@@ -718,7 +749,7 @@ class StageB1b(nn.Module):
 
     def exact_bath_posterior(
         self, H_hist, dt_hist, temperature_k, residue_mask, seq_feature=None,
-        initial_mean=None, initial_var=None,
+        initial_mean=None, initial_var=None, create_graph: bool = False,
     ):
         """Exact p(S_0 | H_hist) as a Kalman filter over the sampler dynamics.
 
@@ -755,6 +786,9 @@ class StageB1b(nn.Module):
           dt_hist: [B, K] interval in ps between frame k and k+1 (last unused).
           seq_feature: [B, L, dH] anchor feature for the static bath params.
             Defaults to H_hist[:, -1], which is the rollout anchor.
+          create_graph: retain force derivatives through both energy parameters
+            and observed H for joint training. False preserves the lightweight
+            diagnostic path; differentiable rollouts pass True.
 
         Returns:
           (m0, chol0) with shapes [B, L, dS] and [B, L, dS, dS]; chol0 is lower
@@ -785,7 +819,8 @@ class StageB1b(nn.Module):
             h_k = dt_hist[:, k].view(B, 1, 1).to(dtype)           # [B,1,1]
             dH = H_hist[:, k + 1] - H_hist[:, k]                  # [B,L,dH]
             Hk = H_hist[:, k]
-            f = self.compute_forces(Hk, residue_mask, temperature_k, create_graph=False)
+            f = self.compute_forces(Hk, residue_mask, temperature_k,
+                                    create_graph=create_graph)
 
             # Observation: z = dH - h D f = C_obs S + noise, C_obs = -h D C.
             # h_k is [B,1,1]; promote to [B,1,1,1] to broadcast against C's 4D.
@@ -819,8 +854,101 @@ class StageB1b(nn.Module):
         rm = residue_mask.unsqueeze(-1).to(dtype)
         return m * rm, chol * rm.unsqueeze(-1)
 
+    def exact_spatial_bath_posterior(
+        self, H_hist, dt_hist, temperature_k, residue_mask, seq_feature=None,
+        noise_factor=None, create_graph: bool = False,
+    ):
+        """Full bath posterior for anchor-fixed collective Euler mobility.
+
+        This conditions the same shared-displacement transition as
+        ``sample_step(..., collective_mobility=True)`` with
+        ``M = sqrt(D) (K kron I_dH) sqrt(D)`` and
+        ``K = noise_factor @ noise_factor.T`` (identity when omitted).
+        D/C/Gamma and K stay fixed at the observed anchor; forces are evaluated
+        at each observed H. History intervals have the existing exact API's
+        shape [B,K_frames], with the last entry unused.
+
+        Returns mean [B,L,dS] and FULL lower factor [B,L*dS,L*dS], both in
+        residue-major order. Valid residues are packed independently per batch;
+        padded mean entries and factor rows/columns are zero. Multiply the
+        factor by a flattened [B,L*dS] normal draw, never sample residues
+        independently. The prior at the oldest frame is N(0,I). No numerical
+        jitter is added, including cfg.jitter used by the historical exact mode.
+        create_graph retains force/history derivatives; coefficient gradients
+        additionally follow bath.detach_conditioning's existing opt-in contract.
+        """
+        from protein_jepa_frame.models.correlated_bath_posterior import correlated_bath_filter_step
+
+        if not self.cfg.use_bath:
+            raise ValueError("exact_spatial_bath_posterior requires a bath")
+        if self.cfg.bath_coupling != "velocity":
+            raise ValueError("exact_spatial_bath_posterior requires velocity bath coupling")
+        if H_hist.ndim != 4 or H_hist.shape[1] < 1:
+            raise ValueError("H_hist must be [B,K,L,dH] with nonempty history")
+        B, frames, L, dH = H_hist.shape
+        if dH != self.cfg.latent_dim or residue_mask.shape != (B, L):
+            raise ValueError("history dimensions and residue_mask must match the model")
+        if residue_mask.dtype != torch.bool or residue_mask.device != H_hist.device:
+            raise ValueError("residue_mask must be boolean on the history device")
+        if not residue_mask.any(-1).all():
+            raise ValueError("each history must contain at least one valid residue")
+        if dt_hist is None or dt_hist.shape != (B, frames):
+            raise ValueError("dt_hist must be [B,K] matching H_hist")
+        intervals = dt_hist[:, :frames - 1]
+        if not torch.isfinite(intervals).all() or not (intervals > 0).all():
+            raise ValueError("history intervals must be finite and positive")
+        device, dtype = H_hist.device, H_hist.dtype
+        if seq_feature is None:
+            seq_feature = H_hist[:, -1]
+        if seq_feature.shape != (B, L, dH):
+            raise ValueError("seq_feature must match the fixed history anchor shape")
+        D, C, Gamma = self.bath(seq_feature, temperature_k)
+        if noise_factor is None:
+            spatial = torch.eye(L, device=device, dtype=dtype).expand(B, L, L)
+        else:
+            if (noise_factor.shape != (B, L, L) or noise_factor.dtype != dtype
+                    or noise_factor.device != device or not torch.isfinite(noise_factor).all()):
+                raise ValueError("noise_factor must be finite [B,L,L] on the history dtype/device")
+            spatial = noise_factor @ noise_factor.transpose(-1, -2)
+        forces = [self.compute_forces(H_hist[:, k], residue_mask, temperature_k,
+                                     create_graph=create_graph) for k in range(frames - 1)]
+        dS = self.cfg.bath_dim
+        means, factors = [], []
+        for b in range(B):
+            indices = residue_mask[b].nonzero(as_tuple=True)[0]
+            count = len(indices)
+            covariance = spatial[b:b + 1][:, indices][:, :, indices]
+            # Only the valid covariance must be SPD. A padded covariance may be
+            # singular, and noise sources at padded indices can drive valid H.
+            _, info = torch.linalg.cholesky_ex(covariance)
+            if (info != 0).any():
+                raise ValueError("valid spatial covariance must be positive definite")
+            mean = H_hist.new_zeros(1, count, dS)
+            factor = torch.eye(count * dS, device=device, dtype=dtype)[None]
+            packed_D, packed_C, packed_Gamma = [value[b:b + 1][:, indices]
+                                                for value in (D, C, Gamma)]
+            for k in range(frames - 1):
+                displacement = (H_hist[b:b + 1, k + 1] - H_hist[b:b + 1, k])[:, indices]
+                mean, factor = correlated_bath_filter_step(
+                    mean, factor, displacement, forces[k][b:b + 1][:, indices],
+                    packed_D, packed_C, packed_Gamma, covariance,
+                    dt_hist[b, k].to(device=device, dtype=dtype), validate=True)
+            flat_indices = (indices[:, None] * dS + torch.arange(dS, device=device)).flatten()
+            means.append(H_hist.new_zeros(L, dS).index_copy(0, indices, mean[0]))
+            factors.append(H_hist.new_zeros(L * dS, L * dS).index_put(
+                (flat_indices[:, None], flat_indices[None, :]), factor[0]))
+        return torch.stack(means), torch.stack(factors)
+
+    @staticmethod
+    def _bath_posterior_draw(mean, factor, noise):
+        """Reparameterize either a legacy block factor or a full spatial factor."""
+        if factor.ndim == 3:
+            return mean + (factor @ noise.flatten(1).unsqueeze(-1)).reshape_as(mean)
+        return mean + torch.einsum("blij,blj->bli", factor, noise)
+
     def initial_bath_state(
         self, H_hist, dt_hist, temperature_k, residue_mask, seq_feature=None,
+        create_graph: bool = False, noise_factor=None,
     ):
         """Return (m_0, chol_0) for the bath prior at the rollout anchor.
 
@@ -829,12 +957,18 @@ class StageB1b(nn.Module):
 
           'gru'   -- amortised history network (historical default),
           'exact' -- closed-form Kalman posterior (exact_bath_posterior),
+          'exact_spatial' -- full spatial bath factor [B,L*dS,L*dS],
           'prior' -- unit-variance prior, history ignored.
         """
         mode = getattr(self, "s0_mode", "gru")
+        if mode == "exact_spatial":
+            return self.exact_spatial_bath_posterior(
+                H_hist, dt_hist, temperature_k, residue_mask, seq_feature=seq_feature,
+                noise_factor=noise_factor, create_graph=create_graph)
         if mode == "exact":
             return self.exact_bath_posterior(
-                H_hist, dt_hist, temperature_k, residue_mask, seq_feature=seq_feature)
+                H_hist, dt_hist, temperature_k, residue_mask, seq_feature=seq_feature,
+                create_graph=create_graph)
         if mode == "gru":
             return self.history_posterior(H_hist, dt_hist, temperature_k, residue_mask)
         if mode == "prior":
@@ -1059,6 +1193,26 @@ class StageB1b(nn.Module):
         Returns stacked H trajectory [B, n_steps+1, L, dH].
         """
         cfg = self.cfg
+        # These restrictions belong to exact posterior inference; an explicit
+        # S0 already specifies the initial condition and needs no posterior.
+        if S0 is None and getattr(self, "s0_mode", "gru") == "exact":
+            if H_hist is None:
+                raise ValueError("s0_mode='exact' requires an observed H history")
+            if not collective_mobility:
+                raise ValueError("s0_mode='exact' requires collective_mobility=True")
+            if noise_factor is not None:
+                covariance = noise_factor @ noise_factor.transpose(-1, -2)
+                identity = torch.eye(covariance.shape[-1], device=covariance.device,
+                                     dtype=covariance.dtype).expand_as(covariance)
+                if not torch.allclose(covariance, identity, atol=1e-6, rtol=1e-6):
+                    raise ValueError("s0_mode='exact' requires identity spatial noise covariance")
+        if S0 is None and getattr(self, "s0_mode", "gru") == "exact_spatial":
+            if not cfg.use_bath:
+                raise ValueError("s0_mode='exact_spatial' requires a bath")
+            if H_hist is None:
+                raise ValueError("s0_mode='exact_spatial' requires an observed H history")
+            if not collective_mobility:
+                raise ValueError("s0_mode='exact_spatial' requires collective_mobility=True")
         if seq_feature is None:
             seq_feature = H0
         S = None
@@ -1074,9 +1228,10 @@ class StageB1b(nn.Module):
                 else:
                     m0, chol0 = self.initial_bath_state(
                         H_hist, dt_hist, temperature_k, residue_mask,
-                        seq_feature=seq_feature)
+                        seq_feature=seq_feature, create_graph=not detach,
+                        noise_factor=noise_factor)
                 eps = torch.randn(m0.shape, device=H0.device, dtype=H0.dtype, generator=generator)
-                S = m0 + torch.einsum("blij,blj->bli", chol0, eps)
+                S = self._bath_posterior_draw(m0, chol0, eps)
 
         traj = [H0]
         bath_traj = [S] if S is not None else None

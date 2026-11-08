@@ -38,6 +38,7 @@ def test_history_sampler_uses_only_last_four_observed_frames():
             return anchor+generated[:,:,:3]-anchor_h[:,:,:3]
     model=CADynamics.__new__(CADynamics);nn.Module.__init__(model)
     model.bundle=Bundle();model.history_conditioning=True
+    model.collective_mobility=False;model.noise_mix=0.;model.noise_length=8.
     model.kernel=StageB1b(StageB1bConfig(energy_depth=1,bath_dim=2))
     observed=torch.randn(1,8,6,4,3)
     mask=torch.ones(1,6,dtype=torch.bool);aa=torch.zeros(1,6,dtype=torch.long)

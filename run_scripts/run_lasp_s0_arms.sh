@@ -53,7 +53,7 @@ run_job() {
   CUDA_VISIBLE_DEVICES="$gpu" python -u -m protein_jepa_frame.training.train_lasp_ca_dynamics \
     --component artifacts/lasp_full_v1/representation/checkpoint_best.pt \
     --output "$out" \
-    --collective-mobility --noise-mix .8 --noise-length 8 \
+    --collective-mobility --noise-mix 0 --noise-length 8 \
     --history-conditioning --s0-mode "$arm" \
     --coupling-scale 0.1 --gamma-scale 2e-5 --gamma-floor 2e-6 \
     --steps "$STEPS" --train-windows 0 --stateless-data --cosine --warmup 1500 \
